@@ -2,18 +2,20 @@ import QtQuick
 import qs.Ui
 import qs.Commons
 
-// A word you can press: "Replace", "Cancel", "Fix", "Admin ›", "Pause 5m".
-// Rests transparent (or on restFill with `filled`, the chip), takes the hover
-// fill under the keyboard cursor or the pointer (the hub has one cursor, the
-// mouse moves it) and shrinks to pressScale while pressed. `cursorRow` and
-// `cursorItem` name its stop in Model.focusRows; empty for a button the
-// keyboard does not reach.
+// A word you can press: "Replace", "Cancel", "Pin all", "Admin ›", "Pause
+// blocking 5m". Rests transparent (or on restFill with `filled`), takes the
+// hover fill under the keyboard cursor or the pointer (the hub has one
+// cursor, the mouse moves it) and shrinks to pressScale while pressed. A
+// quiet one is dim and comes up to `hotColor` under the cursor or pointer.
+// `cursorRow` and `cursorItem` name its stop in Model.focusRows; empty for a
+// button the keyboard does not reach.
 CursorSurface {
   id: btn
 
   required property var hub
   property string text: ""
   property color textColor: hub.fg
+  property color hotColor: textColor
   property string cursorRow: ""
   property int cursorItem: 0
   property bool filled: false
@@ -42,7 +44,7 @@ CursorSurface {
     textFormat: Text.PlainText
     renderType: Text.NativeRendering
     text: btn.text
-    color: btn.textColor
+    color: btn.hasCursor || area.containsMouse ? btn.hotColor : btn.textColor
     font.family: btn.hub.fontFamily
     font.pixelSize: btn.size
     font.weight: btn.weight

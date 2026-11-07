@@ -14,8 +14,10 @@ import "Model.js" as Model
 //   stdin    "open\n" while any panel is open, "closed\n" when the last closes,
 //            which sets the backend's cadence; sent again after a restart
 //   exit     restarted after 1 s, 2 s, 5 s, 10 s, then 30 s; the counter starts
-//            over when a snapshot arrives. Silence for `silenceMs` (three
-//            heartbeats) is a hung child and is terminated and restarted.
+//            over only once a child has lived 30 s, so one that starts,
+//            speaks and dies keeps climbing. Silence for `silenceMs` (three
+//            heartbeats) is a hung child: it is sent SIGTERM, and SIGKILL if
+//            it is still there 5 s later, and the watchdog is armed again.
 //
 // The child's `seq` counts from its own start, so the last applied seq is
 // forgotten whenever a new child starts.
@@ -37,6 +39,8 @@ Item {
   property bool down: false
 
   property int attempt: 0
+  // When the current child was started, for the uptime the backoff counts.
+  property double startedAt: 0
   property var openers: []
   readonly property int silenceMs: 35000
   readonly property int graceMs: 4000
@@ -45,6 +49,7 @@ Item {
     if (watch.running) return
     seq = -1
     live = false
+    startedAt = Date.now()
     watch.command = [bin, "watch"]
     watch.running = true
     startGuard.restart()
@@ -54,6 +59,7 @@ Item {
   function scheduleRestart() {
     live = false
     silence.stop()
+    killTimer.stop()
     startGuard.stop()
     if (!restart.running) {
       restart.interval = Model.backoffMs(attempt)
@@ -84,7 +90,7 @@ Item {
     var r = Model.parseStateLine(line, seq)
     if (r.kind === "bad") return
     silence.restart()
-    attempt = 0
+    attempt = Model.restartAttempt(attempt, Date.now() - startedAt)
     live = true
     down = false
     downTimer.stop()
@@ -122,7 +128,20 @@ Item {
   Timer {
     id: silence
     interval: svc.silenceMs
-    onTriggered: if (watch.running) watch.signal(15)
+    onTriggered: {
+      // A hung child: ask, then insist, and keep watching either way.
+      if (watch.running) {
+        watch.signal(15)
+        killTimer.restart()
+      }
+      silence.restart()
+    }
+  }
+
+  Timer {
+    id: killTimer
+    interval: 5000
+    onTriggered: if (watch.running) watch.signal(9)
   }
 
   Timer {

@@ -116,6 +116,15 @@ pub fn state_dir() -> PathBuf {
     }
 }
 
+/// Refuse core dumps and same-user memory reads of this process. Called by
+/// the verbs that handle secrets.
+pub fn harden_process() {
+    // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes plain integers.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+}
+
 /// `$XDG_RUNTIME_DIR/qnet/sid`, where the Pi-hole session id is kept so a
 /// restart can reuse a session the previous process could not log out of.
 pub fn sid_path() -> Option<PathBuf> {

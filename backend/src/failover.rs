@@ -6,16 +6,25 @@
 //!   * failover is eligible (enabled, Pi-hole configured, the active profile
 //!     is in Pi-hole mode),
 //!   * the link has been up with the same connection for LINK_STABLE_MS,
-//!   * FAILS_TO_ENGAGE consecutive probes failed,
+//!   * the probes have been failing continuously for FAIL_WINDOW_MS (and at
+//!     least two in a row, so one slow probe never counts),
 //!   * the gateway answered a DNS probe at the same time (so a dead Wi-Fi
 //!     card or an unplugged cable is never mistaken for a Pi-hole outage).
 //!
 //! Recover after GOODS_TO_RECOVER consecutive good probes sent straight to
 //! the Pi-hole. A link change while failed over clears the state without
 //! touching DNS: a new activation already loads the saved profile.
+//!
+//! After a recovery the next failover is held off for a while (60 s, doubling
+//! for every recovery within the hour, capped at 15 min) so a Pi-hole that
+//! flaps does not make DNS flap with it.
 
-pub const FAILS_TO_ENGAGE: u32 = 3;
+pub const FAILS_TO_ENGAGE: u32 = 2;
+pub const FAIL_WINDOW_MS: u64 = 30_000;
 pub const GOODS_TO_RECOVER: u32 = 3;
+pub const HOLDDOWN_START_MS: u64 = 60_000;
+pub const HOLDDOWN_MAX_MS: u64 = 15 * 60_000;
+pub const HOLDDOWN_RESET_MS: u64 = 60 * 60_000;
 pub const LINK_STABLE_MS: u64 = 10_000;
 pub const RETRY_COOLDOWN_MS: u64 = 30_000;
 
@@ -48,6 +57,8 @@ pub enum Decision {
 #[derive(Debug, Default)]
 pub struct Failover {
     fails: u32,
+    /// When the current run of failures began.
+    fail_since_ms: Option<u64>,
     goods: u32,
     active: bool,
     since: u64,
@@ -56,6 +67,9 @@ pub struct Failover {
     link_since_ms: u64,
     seen_any: bool,
     retry_after_ms: u64,
+    holddown_ms: u64,
+    holddown_until_ms: u64,
+    last_recover_ms: Option<u64>,
 }
 
 impl Failover {
@@ -89,8 +103,19 @@ impl Failover {
         self.active = false;
         self.since = 0;
         self.reason.clear();
-        self.fails = 0;
+        self.reset_fails();
         self.goods = 0;
+    }
+
+    fn reset_fails(&mut self) {
+        self.fails = 0;
+        self.fail_since_ms = None;
+    }
+
+    /// Time until a new failover is allowed after the last recovery.
+    #[cfg(test)]
+    pub fn holddown_ms(&self) -> u64 {
+        self.holddown_ms
     }
 
     pub fn observe(&mut self, o: &Obs) -> Decision {
@@ -101,7 +126,7 @@ impl Failover {
             let had_link = self.link.is_some();
             self.link = o.link.clone();
             self.link_since_ms = o.now_ms;
-            self.fails = 0;
+            self.reset_fails();
             self.goods = 0;
             if self.active && (had_link || o.link.is_none()) {
                 self.clear();
@@ -113,12 +138,12 @@ impl Failover {
                 self.clear();
                 return Decision::Cleared("no longer eligible");
             }
-            self.fails = 0;
+            self.reset_fails();
             return Decision::Idle;
         }
         let stable = o.link.is_some() && o.now_ms.saturating_sub(self.link_since_ms) >= LINK_STABLE_MS;
         if !stable {
-            self.fails = 0;
+            self.reset_fails();
             self.goods = 0;
             return Decision::Idle;
         }
@@ -136,13 +161,16 @@ impl Failover {
         }
 
         if o.pihole_ok {
-            self.fails = 0;
+            self.reset_fails();
             return Decision::Idle;
         }
         self.fails += 1;
+        let since = *self.fail_since_ms.get_or_insert(o.now_ms);
         if self.fails >= FAILS_TO_ENGAGE
+            && o.now_ms.saturating_sub(since) >= FAIL_WINDOW_MS
             && o.gateway_ok == Some(true)
             && o.now_ms >= self.retry_after_ms
+            && o.now_ms >= self.holddown_until_ms
         {
             return Decision::Engage;
         }
@@ -154,7 +182,7 @@ impl Failover {
         self.active = true;
         self.since = unix_now;
         self.reason = reason.to_string();
-        self.fails = 0;
+        self.reset_fails();
         self.goods = 0;
     }
 
@@ -163,8 +191,23 @@ impl Failover {
         self.retry_after_ms = now_ms + RETRY_COOLDOWN_MS;
     }
 
-    /// The caller restored the saved profile.
-    pub fn recovered(&mut self) {
+    /// The caller restored the saved profile. Starts (or lengthens) the
+    /// hold-down before the next failover may happen.
+    pub fn recovered(&mut self, now_ms: u64) {
+        self.clear();
+        self.holddown_ms = match self.last_recover_ms {
+            Some(t) if now_ms.saturating_sub(t) <= HOLDDOWN_RESET_MS && self.holddown_ms > 0 => {
+                (self.holddown_ms * 2).min(HOLDDOWN_MAX_MS)
+            }
+            _ => HOLDDOWN_START_MS,
+        };
+        self.last_recover_ms = Some(now_ms);
+        self.holddown_until_ms = now_ms + self.holddown_ms;
+    }
+
+    /// The failover is over for a reason other than recovery (shutdown with
+    /// the Pi-hole confirmed back): no hold-down.
+    pub fn dropped(&mut self) {
         self.clear();
     }
 
@@ -321,7 +364,7 @@ mod tests {
         let mut got = Decision::Idle;
         for i in 0..3 {
             got = r.f.observe(&Obs {
-                now_ms: t1 + i * 5_000,
+                now_ms: t1 + i * 15_000,
                 link: key(),
                 eligible: true,
                 pihole_ok: false,
@@ -344,7 +387,7 @@ mod tests {
         assert_eq!(r.good(), Decision::Idle);
         assert_eq!(r.good(), Decision::Idle);
         assert_eq!(r.good(), Decision::Recover);
-        r.f.recovered();
+        r.f.recovered(r.t);
         assert!(!r.f.active());
         assert_eq!(r.f.since(), 0);
         assert_eq!(r.f.reason(), "");
@@ -427,5 +470,117 @@ mod tests {
             });
             assert_eq!(d, Decision::Idle, "first 5 s after start");
         }
+    }
+
+    impl Rig {
+        /// One probe `step_ms` after the previous one.
+        fn step(&mut self, step_ms: u64, ok: bool, gw: Option<bool>) -> Decision {
+            self.t += step_ms;
+            self.f.observe(&Obs {
+                now_ms: self.t,
+                link: self.link.clone(),
+                eligible: self.eligible,
+                pihole_ok: ok,
+                gateway_ok: gw,
+            })
+        }
+    }
+
+    #[test]
+    fn trigger_is_thirty_seconds_of_failure_not_a_count() {
+        // Open cadence: a probe every 5 s. Six failures span only 25 s.
+        let mut r = Rig::new();
+        for i in 0..6 {
+            assert_eq!(r.step(5_000, false, Some(true)), Decision::Idle, "failure {i}");
+        }
+        assert_eq!(r.step(5_000, false, Some(true)), Decision::Engage, "30 s after the first");
+    }
+
+    #[test]
+    fn closed_cadence_needs_two_failures_a_minute_apart() {
+        let mut r = Rig::new();
+        assert_eq!(r.step(60_000, false, Some(true)), Decision::Idle, "one failure never engages");
+        assert_eq!(r.step(60_000, false, Some(true)), Decision::Engage);
+    }
+
+    #[test]
+    fn a_success_restarts_the_thirty_second_clock() {
+        let mut r = Rig::new();
+        for _ in 0..5 {
+            r.step(5_000, false, Some(true));
+        }
+        r.step(5_000, true, None);
+        for i in 0..6 {
+            assert_eq!(r.step(5_000, false, Some(true)), Decision::Idle, "again from zero, {i}");
+        }
+        assert_eq!(r.step(5_000, false, Some(true)), Decision::Engage);
+    }
+
+    fn engage_and_recover(r: &mut Rig) {
+        let mut guard = 0;
+        while r.step(15_000, false, Some(true)) != Decision::Engage {
+            guard += 1;
+            assert!(guard < 200, "never engaged");
+        }
+        r.f.engaged(1, "x");
+        r.step(15_000, true, None);
+        r.step(15_000, true, None);
+        assert_eq!(r.step(15_000, true, None), Decision::Recover);
+        r.f.recovered(r.t);
+    }
+
+    #[test]
+    fn hold_down_after_recovery_blocks_an_immediate_second_failover() {
+        let mut r = Rig::new();
+        engage_and_recover(&mut r);
+        assert_eq!(r.f.holddown_ms(), HOLDDOWN_START_MS);
+        // The Pi-hole dies again right away: 45 s of failure is not enough
+        // while the 60 s hold-down runs (it ends 60 s after the recovery).
+        assert_eq!(r.step(15_000, false, Some(true)), Decision::Idle);
+        assert_eq!(r.step(15_000, false, Some(true)), Decision::Idle);
+        assert_eq!(r.step(15_000, false, Some(true)), Decision::Idle);
+        // 60 s after the recovery and 45 s into the failure: allowed.
+        assert_eq!(r.step(15_000, false, Some(true)), Decision::Engage);
+    }
+
+    #[test]
+    fn hold_down_doubles_per_recovery_within_the_hour_and_is_capped() {
+        let mut r = Rig::new();
+        engage_and_recover(&mut r);
+        let mut seen = vec![r.f.holddown_ms()];
+        for _ in 0..8 {
+            // Wait out the hold-down, then fail and recover again.
+            r.t += r.f.holddown_ms();
+            engage_and_recover(&mut r);
+            seen.push(r.f.holddown_ms());
+        }
+        assert_eq!(&seen[..4], &[60_000, 120_000, 240_000, 480_000]);
+        assert_eq!(*seen.last().unwrap(), HOLDDOWN_MAX_MS, "capped at 15 min: {seen:?}");
+        assert!(seen.iter().all(|h| *h <= HOLDDOWN_MAX_MS));
+    }
+
+    #[test]
+    fn an_hour_without_trouble_resets_the_hold_down() {
+        let mut r = Rig::new();
+        engage_and_recover(&mut r);
+        r.t += r.f.holddown_ms();
+        engage_and_recover(&mut r);
+        assert_eq!(r.f.holddown_ms(), 120_000);
+        r.t += HOLDDOWN_RESET_MS + 1_000; // quiet for over an hour
+        engage_and_recover(&mut r);
+        assert_eq!(r.f.holddown_ms(), HOLDDOWN_START_MS, "reset to the first step");
+    }
+
+    #[test]
+    fn dropped_failover_has_no_hold_down() {
+        let mut r = Rig::new();
+        r.f.adopt(1, "x");
+        r.f.dropped();
+        assert!(!r.f.active());
+        let mut got = Decision::Idle;
+        for _ in 0..3 {
+            got = r.step(15_000, false, Some(true));
+        }
+        assert_eq!(got, Decision::Engage);
     }
 }

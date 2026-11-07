@@ -5,7 +5,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub const NM_DEVICE_STATE_ACTIVATED: u32 = 100;
-pub const NM_DEVICE_STATE_DISCONNECTED: u32 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Connectivity {
@@ -513,7 +512,7 @@ pub mod fake {
     use crate::dnsmodel::fixtures as fx;
     use std::sync::Mutex;
 
-    pub use fx::{U_ETH1, U_WIFI};
+    pub use fx::{U_ETH1, U_ETH2, U_WIFI};
 
     pub fn fake_cfg() -> crate::config::Config {
         crate::config::Config {
@@ -538,6 +537,7 @@ pub mod fake {
         pub activation_error: Option<NetError>,
         pub reapply_error: Option<NetError>,
         pub snapshot_error: bool,
+        pub canary_answer: Option<IpAddr>,
     }
 
     pub struct FakeNet {
@@ -597,6 +597,7 @@ pub mod fake {
                     activation_error: None,
                     reapply_error: None,
                     snapshot_error: false,
+                    canary_answer: None,
                 }),
             }
         }
@@ -636,6 +637,25 @@ pub mod fake {
             g.snap.devices[0].active = None;
             g.snap.primary_conn = None;
         }
+        /// A wired link comes up and takes the default route; Wi-Fi stays up.
+        pub fn add_ethernet_primary(&self) {
+            let mut g = self.inner.lock().unwrap();
+            let mut eth = fx::wifi_device(true);
+            eth.path = "/org/freedesktop/NetworkManager/Devices/2".into();
+            eth.iface = "enp8s0".into();
+            eth.ifindex = 2;
+            eth.kind = DeviceKind::Ethernet;
+            eth.wifi = None;
+            eth.speed_mbps = 1000;
+            eth.active = Some(ActiveConn {
+                path: "/org/freedesktop/NetworkManager/ActiveConnection/9".into(),
+                uuid: U_ETH1.into(),
+                id: "Wired connection 1".into(),
+                state: 2,
+            });
+            g.snap.primary_conn = eth.active.as_ref().map(|a| a.path.clone());
+            g.snap.devices.push(eth);
+        }
         pub fn set_resolve_error(&self) {
             self.inner.lock().unwrap().resolve_error = true;
         }
@@ -657,6 +677,13 @@ pub mod fake {
         }
         pub fn link_servers(&self) -> Vec<IpAddr> {
             self.inner.lock().unwrap().link_servers.clone()
+        }
+        /// Make the fake resolver answer the canary with this address.
+        pub fn set_canary_answer(&self, ip: &str) {
+            self.inner.lock().unwrap().canary_answer = Some(ip.parse().unwrap());
+        }
+        pub fn set_dhcp(&self, servers: Vec<IpAddr>) {
+            self.inner.lock().unwrap().dhcp = servers;
         }
         pub fn set_snapshot_error(&self, on: bool) {
             self.inner.lock().unwrap().snapshot_error = on;
@@ -812,6 +839,9 @@ pub mod fake {
             g.calls.push(format!("resolve {name}"));
             if g.resolve_error {
                 return Err(NetError::Timeout("fake: no answer".into()));
+            }
+            if let Some(ip) = g.canary_answer {
+                return Ok(vec![ip]);
             }
             // A blocking resolver answers 0.0.0.0; anyone else the real thing.
             let pihole_only = !g.link_servers.is_empty() && g.link_servers.iter().all(|s| *s == fx::pi());

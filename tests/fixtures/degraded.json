@@ -1,0 +1,1234 @@
+{
+  "type": "state",
+  "seq": 42,
+  "link": {
+    "kind": "wifi",
+    "device": "wlp7s0",
+    "connection": "Redwood",
+    "uuid": "4a0f7e58-2d3c-4b8e-9c61-0d5a1f7e9b21",
+    "ssid": "Redwood",
+    "signal": 72,
+    "band": "5 GHz",
+    "bitrateMbps": 866,
+    "ip4": "192.168.1.242",
+    "gateway": "192.168.1.1",
+    "gatewayMs": 4.2,
+    "connectivity": "full",
+    "portalUrl": ""
+  },
+  "radio": {
+    "wifiEnabled": true,
+    "hwEnabled": true
+  },
+  "networks": [
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/12",
+      "ssid": "Redwood",
+      "hidden": false,
+      "signal": 72,
+      "security": "psk",
+      "known": true,
+      "uuid": "4a0f7e58-2d3c-4b8e-9c61-0d5a1f7e9b21",
+      "active": true,
+      "band": "5 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/21",
+      "ssid": "Home-Guest",
+      "hidden": false,
+      "signal": 35,
+      "security": "psk",
+      "known": true,
+      "uuid": "0c3d9f12-88aa-4e77-b5d1-72f6e0a1c9d3",
+      "active": false,
+      "band": "2.4 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/30",
+      "ssid": "Neighbor-5G",
+      "hidden": false,
+      "signal": 55,
+      "security": "sae",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "5 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/31",
+      "ssid": "CoffeeShop",
+      "hidden": false,
+      "signal": 40,
+      "security": "open",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/32",
+      "ssid": "Uni-8021X",
+      "hidden": false,
+      "signal": 30,
+      "security": "enterprise",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/33",
+      "ssid": "Cafe-OWE",
+      "hidden": false,
+      "signal": 28,
+      "security": "owe",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/34",
+      "ssid": "",
+      "hidden": true,
+      "signal": 22,
+      "security": "psk",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz"
+    }
+  ],
+  "scan": {
+    "running": false,
+    "lastScanAgeS": 12
+  },
+  "dns": {
+    "mode": "pihole",
+    "modeSource": "profile",
+    "servers": [
+      {
+        "addr": "192.168.1.153",
+        "link": "wlp7s0",
+        "current": true,
+        "role": "pihole"
+      }
+    ],
+    "leaks": [],
+    "failover": {
+      "enabled": true,
+      "fallback": "router",
+      "active": false,
+      "since": 0,
+      "reason": ""
+    },
+    "manualOverride": false,
+    "bypassed": false,
+    "resolvedFallback": ""
+  },
+  "pihole": {
+    "configured": true,
+    "address": "192.168.1.153",
+    "adminUrl": "https://192.168.1.153/admin/",
+    "detected": "",
+    "reachable": true,
+    "health": "degraded",
+    "canaryBlocked": true,
+    "latencyMs": 6.4,
+    "blocking": "enabled",
+    "pauseRemainingS": 0,
+    "api": "ok",
+    "historySpanS": 86400,
+    "today": {
+      "total": 1204,
+      "blocked": 164,
+      "percent": 13.6,
+      "selfQueries": 8
+    },
+    "history": [
+      {
+        "t": 1794036600,
+        "total": 42,
+        "blocked": 10
+      },
+      {
+        "t": 1794037200,
+        "total": 36,
+        "blocked": 6
+      },
+      {
+        "t": 1794037800,
+        "total": 28,
+        "blocked": 7
+      },
+      {
+        "t": 1794038400,
+        "total": 33,
+        "blocked": 3
+      },
+      {
+        "t": 1794039000,
+        "total": 44,
+        "blocked": 11
+      },
+      {
+        "t": 1794039600,
+        "total": 38,
+        "blocked": 9
+      },
+      {
+        "t": 1794040200,
+        "total": 38,
+        "blocked": 6
+      },
+      {
+        "t": 1794040800,
+        "total": 48,
+        "blocked": 9
+      },
+      {
+        "t": 1794041400,
+        "total": 44,
+        "blocked": 9
+      },
+      {
+        "t": 1794042000,
+        "total": 48,
+        "blocked": 10
+      },
+      {
+        "t": 1794042600,
+        "total": 48,
+        "blocked": 12
+      },
+      {
+        "t": 1794043200,
+        "total": 45,
+        "blocked": 11
+      },
+      {
+        "t": 1794043800,
+        "total": 46,
+        "blocked": 7
+      },
+      {
+        "t": 1794044400,
+        "total": 39,
+        "blocked": 9
+      },
+      {
+        "t": 1794045000,
+        "total": 39,
+        "blocked": 8
+      },
+      {
+        "t": 1794045600,
+        "total": 55,
+        "blocked": 10
+      },
+      {
+        "t": 1794046200,
+        "total": 65,
+        "blocked": 14
+      },
+      {
+        "t": 1794046800,
+        "total": 72,
+        "blocked": 14
+      },
+      {
+        "t": 1794047400,
+        "total": 59,
+        "blocked": 10
+      },
+      {
+        "t": 1794048000,
+        "total": 64,
+        "blocked": 15
+      },
+      {
+        "t": 1794048600,
+        "total": 58,
+        "blocked": 12
+      },
+      {
+        "t": 1794049200,
+        "total": 48,
+        "blocked": 8
+      },
+      {
+        "t": 1794049800,
+        "total": 46,
+        "blocked": 9
+      },
+      {
+        "t": 1794050400,
+        "total": 73,
+        "blocked": 17
+      },
+      {
+        "t": 1794051000,
+        "total": 81,
+        "blocked": 21
+      },
+      {
+        "t": 1794051600,
+        "total": 67,
+        "blocked": 12
+      },
+      {
+        "t": 1794052200,
+        "total": 69,
+        "blocked": 9
+      },
+      {
+        "t": 1794052800,
+        "total": 61,
+        "blocked": 10
+      },
+      {
+        "t": 1794053400,
+        "total": 67,
+        "blocked": 11
+      },
+      {
+        "t": 1794054000,
+        "total": 63,
+        "blocked": 6
+      },
+      {
+        "t": 1794054600,
+        "total": 75,
+        "blocked": 6
+      },
+      {
+        "t": 1794055200,
+        "total": 74,
+        "blocked": 12
+      },
+      {
+        "t": 1794055800,
+        "total": 68,
+        "blocked": 17
+      },
+      {
+        "t": 1794056400,
+        "total": 56,
+        "blocked": 10
+      },
+      {
+        "t": 1794057000,
+        "total": 89,
+        "blocked": 21
+      },
+      {
+        "t": 1794057600,
+        "total": 76,
+        "blocked": 11
+      },
+      {
+        "t": 1794058200,
+        "total": 80,
+        "blocked": 20
+      },
+      {
+        "t": 1794058800,
+        "total": 56,
+        "blocked": 7
+      },
+      {
+        "t": 1794059400,
+        "total": 71,
+        "blocked": 13
+      },
+      {
+        "t": 1794060000,
+        "total": 68,
+        "blocked": 6
+      },
+      {
+        "t": 1794060600,
+        "total": 56,
+        "blocked": 7
+      },
+      {
+        "t": 1794061200,
+        "total": 84,
+        "blocked": 8
+      },
+      {
+        "t": 1794061800,
+        "total": 64,
+        "blocked": 7
+      },
+      {
+        "t": 1794062400,
+        "total": 70,
+        "blocked": 7
+      },
+      {
+        "t": 1794063000,
+        "total": 100,
+        "blocked": 12
+      },
+      {
+        "t": 1794063600,
+        "total": 74,
+        "blocked": 14
+      },
+      {
+        "t": 1794064200,
+        "total": 61,
+        "blocked": 7
+      },
+      {
+        "t": 1794064800,
+        "total": 88,
+        "blocked": 14
+      },
+      {
+        "t": 1794065400,
+        "total": 84,
+        "blocked": 11
+      },
+      {
+        "t": 1794066000,
+        "total": 62,
+        "blocked": 9
+      },
+      {
+        "t": 1794066600,
+        "total": 93,
+        "blocked": 19
+      },
+      {
+        "t": 1794067200,
+        "total": 79,
+        "blocked": 11
+      },
+      {
+        "t": 1794067800,
+        "total": 82,
+        "blocked": 15
+      },
+      {
+        "t": 1794068400,
+        "total": 71,
+        "blocked": 17
+      },
+      {
+        "t": 1794069000,
+        "total": 99,
+        "blocked": 9
+      },
+      {
+        "t": 1794069600,
+        "total": 97,
+        "blocked": 21
+      },
+      {
+        "t": 1794070200,
+        "total": 79,
+        "blocked": 7
+      },
+      {
+        "t": 1794070800,
+        "total": 91,
+        "blocked": 21
+      },
+      {
+        "t": 1794071400,
+        "total": 57,
+        "blocked": 9
+      },
+      {
+        "t": 1794072000,
+        "total": 92,
+        "blocked": 11
+      },
+      {
+        "t": 1794072600,
+        "total": 77,
+        "blocked": 20
+      },
+      {
+        "t": 1794073200,
+        "total": 68,
+        "blocked": 13
+      },
+      {
+        "t": 1794073800,
+        "total": 73,
+        "blocked": 10
+      },
+      {
+        "t": 1794074400,
+        "total": 92,
+        "blocked": 8
+      },
+      {
+        "t": 1794075000,
+        "total": 71,
+        "blocked": 8
+      },
+      {
+        "t": 1794075600,
+        "total": 82,
+        "blocked": 17
+      },
+      {
+        "t": 1794076200,
+        "total": 64,
+        "blocked": 13
+      },
+      {
+        "t": 1794076800,
+        "total": 48,
+        "blocked": 9
+      },
+      {
+        "t": 1794077400,
+        "total": 63,
+        "blocked": 8
+      },
+      {
+        "t": 1794078000,
+        "total": 75,
+        "blocked": 17
+      },
+      {
+        "t": 1794078600,
+        "total": 49,
+        "blocked": 12
+      },
+      {
+        "t": 1794079200,
+        "total": 79,
+        "blocked": 16
+      },
+      {
+        "t": 1794079800,
+        "total": 59,
+        "blocked": 14
+      },
+      {
+        "t": 1794080400,
+        "total": 50,
+        "blocked": 11
+      },
+      {
+        "t": 1794081000,
+        "total": 56,
+        "blocked": 5
+      },
+      {
+        "t": 1794081600,
+        "total": 40,
+        "blocked": 4
+      },
+      {
+        "t": 1794082200,
+        "total": 56,
+        "blocked": 7
+      },
+      {
+        "t": 1794082800,
+        "total": 70,
+        "blocked": 15
+      },
+      {
+        "t": 1794083400,
+        "total": 42,
+        "blocked": 5
+      },
+      {
+        "t": 1794084000,
+        "total": 52,
+        "blocked": 9
+      },
+      {
+        "t": 1794084600,
+        "total": 60,
+        "blocked": 15
+      },
+      {
+        "t": 1794085200,
+        "total": 43,
+        "blocked": 4
+      },
+      {
+        "t": 1794085800,
+        "total": 37,
+        "blocked": 8
+      },
+      {
+        "t": 1794086400,
+        "total": 49,
+        "blocked": 7
+      },
+      {
+        "t": 1794087000,
+        "total": 48,
+        "blocked": 10
+      },
+      {
+        "t": 1794087600,
+        "total": 56,
+        "blocked": 12
+      },
+      {
+        "t": 1794088200,
+        "total": 43,
+        "blocked": 8
+      },
+      {
+        "t": 1794088800,
+        "total": 42,
+        "blocked": 9
+      },
+      {
+        "t": 1794089400,
+        "total": 35,
+        "blocked": 8
+      },
+      {
+        "t": 1794090000,
+        "total": 43,
+        "blocked": 10
+      },
+      {
+        "t": 1794090600,
+        "total": 44,
+        "blocked": 10
+      },
+      {
+        "t": 1794091200,
+        "total": 28,
+        "blocked": 5
+      },
+      {
+        "t": 1794091800,
+        "total": 24,
+        "blocked": 4
+      },
+      {
+        "t": 1794092400,
+        "total": 24,
+        "blocked": 3
+      },
+      {
+        "t": 1794093000,
+        "total": 34,
+        "blocked": 5
+      },
+      {
+        "t": 1794093600,
+        "total": 31,
+        "blocked": 3
+      },
+      {
+        "t": 1794094200,
+        "total": 29,
+        "blocked": 4
+      },
+      {
+        "t": 1794094800,
+        "total": 26,
+        "blocked": 5
+      },
+      {
+        "t": 1794095400,
+        "total": 34,
+        "blocked": 7
+      },
+      {
+        "t": 1794096000,
+        "total": 20,
+        "blocked": 5
+      },
+      {
+        "t": 1794096600,
+        "total": 25,
+        "blocked": 2
+      },
+      {
+        "t": 1794097200,
+        "total": 29,
+        "blocked": 5
+      },
+      {
+        "t": 1794097800,
+        "total": 25,
+        "blocked": 3
+      },
+      {
+        "t": 1794098400,
+        "total": 27,
+        "blocked": 5
+      },
+      {
+        "t": 1794099000,
+        "total": 24,
+        "blocked": 2
+      },
+      {
+        "t": 1794099600,
+        "total": 18,
+        "blocked": 4
+      },
+      {
+        "t": 1794100200,
+        "total": 15,
+        "blocked": 4
+      },
+      {
+        "t": 1794100800,
+        "total": 15,
+        "blocked": 3
+      },
+      {
+        "t": 1794101400,
+        "total": 25,
+        "blocked": 6
+      },
+      {
+        "t": 1794102000,
+        "total": 20,
+        "blocked": 2
+      },
+      {
+        "t": 1794102600,
+        "total": 18,
+        "blocked": 2
+      },
+      {
+        "t": 1794103200,
+        "total": 16,
+        "blocked": 1
+      },
+      {
+        "t": 1794103800,
+        "total": 15,
+        "blocked": 2
+      },
+      {
+        "t": 1794104400,
+        "total": 16,
+        "blocked": 2
+      },
+      {
+        "t": 1794105000,
+        "total": 14,
+        "blocked": 3
+      },
+      {
+        "t": 1794105600,
+        "total": 19,
+        "blocked": 3
+      },
+      {
+        "t": 1794106200,
+        "total": 21,
+        "blocked": 5
+      },
+      {
+        "t": 1794106800,
+        "total": 19,
+        "blocked": 2
+      },
+      {
+        "t": 1794107400,
+        "total": 13,
+        "blocked": 2
+      },
+      {
+        "t": 1794108000,
+        "total": 21,
+        "blocked": 4
+      },
+      {
+        "t": 1794108600,
+        "total": 14,
+        "blocked": 2
+      },
+      {
+        "t": 1794109200,
+        "total": 17,
+        "blocked": 4
+      },
+      {
+        "t": 1794109800,
+        "total": 22,
+        "blocked": 2
+      },
+      {
+        "t": 1794110400,
+        "total": 15,
+        "blocked": 3
+      },
+      {
+        "t": 1794111000,
+        "total": 14,
+        "blocked": 3
+      },
+      {
+        "t": 1794111600,
+        "total": 19,
+        "blocked": 3
+      },
+      {
+        "t": 1794112200,
+        "total": 23,
+        "blocked": 4
+      },
+      {
+        "t": 1794112800,
+        "total": 22,
+        "blocked": 5
+      },
+      {
+        "t": 1794113400,
+        "total": 24,
+        "blocked": 5
+      },
+      {
+        "t": 1794114000,
+        "total": 24,
+        "blocked": 4
+      },
+      {
+        "t": 1794114600,
+        "total": 27,
+        "blocked": 6
+      },
+      {
+        "t": 1794115200,
+        "total": 18,
+        "blocked": 2
+      },
+      {
+        "t": 1794115800,
+        "total": 28,
+        "blocked": 3
+      },
+      {
+        "t": 1794116400,
+        "total": 21,
+        "blocked": 2
+      },
+      {
+        "t": 1794117000,
+        "total": 25,
+        "blocked": 6
+      },
+      {
+        "t": 1794117600,
+        "total": 27,
+        "blocked": 7
+      },
+      {
+        "t": 1794118200,
+        "total": 24,
+        "blocked": 3
+      },
+      {
+        "t": 1794118800,
+        "total": 32,
+        "blocked": 3
+      },
+      {
+        "t": 1794119400,
+        "total": 25,
+        "blocked": 4
+      },
+      {
+        "t": 1794120000,
+        "total": 26,
+        "blocked": 3
+      },
+      {
+        "t": 1794120600,
+        "total": 38,
+        "blocked": 7
+      },
+      {
+        "t": 1794121200,
+        "total": 37,
+        "blocked": 3
+      },
+      {
+        "t": 1794121800,
+        "total": 31,
+        "blocked": 4
+      },
+      {
+        "t": 1794122400,
+        "total": 20,
+        "blocked": 3
+      }
+    ],
+    "probes": [
+      {
+        "t": 1794122404.1,
+        "ok": true,
+        "ms": 4.2,
+        "blocked": true
+      },
+      {
+        "t": 1794122409.1,
+        "ok": true,
+        "ms": 3,
+        "blocked": true
+      },
+      {
+        "t": 1794122414.1,
+        "ok": true,
+        "ms": 2.9,
+        "blocked": true
+      },
+      {
+        "t": 1794122419.1,
+        "ok": true,
+        "ms": 3.8,
+        "blocked": true
+      },
+      {
+        "t": 1794122424.1,
+        "ok": true,
+        "ms": 3.2,
+        "blocked": true
+      },
+      {
+        "t": 1794122429.1,
+        "ok": true,
+        "ms": 3,
+        "blocked": true
+      },
+      {
+        "t": 1794122434.1,
+        "ok": true,
+        "ms": 2.6,
+        "blocked": true
+      },
+      {
+        "t": 1794122439.1,
+        "ok": true,
+        "ms": 3,
+        "blocked": true
+      },
+      {
+        "t": 1794122444.1,
+        "ok": true,
+        "ms": 2.6,
+        "blocked": true
+      },
+      {
+        "t": 1794122449.1,
+        "ok": true,
+        "ms": 3.5,
+        "blocked": true
+      },
+      {
+        "t": 1794122454.1,
+        "ok": true,
+        "ms": 2.9,
+        "blocked": true
+      },
+      {
+        "t": 1794122459.1,
+        "ok": true,
+        "ms": 3,
+        "blocked": true
+      },
+      {
+        "t": 1794122464.1,
+        "ok": true,
+        "ms": 3.7,
+        "blocked": true
+      },
+      {
+        "t": 1794122469.1,
+        "ok": true,
+        "ms": 3.1,
+        "blocked": true
+      },
+      {
+        "t": 1794122474.1,
+        "ok": true,
+        "ms": 2.5,
+        "blocked": true
+      },
+      {
+        "t": 1794122479.1,
+        "ok": true,
+        "ms": 2.5,
+        "blocked": true
+      },
+      {
+        "t": 1794122484.1,
+        "ok": true,
+        "ms": 2.9,
+        "blocked": true
+      },
+      {
+        "t": 1794122489.1,
+        "ok": true,
+        "ms": 4.1,
+        "blocked": true
+      },
+      {
+        "t": 1794122494.1,
+        "ok": true,
+        "ms": 3.5,
+        "blocked": true
+      },
+      {
+        "t": 1794122499.1,
+        "ok": true,
+        "ms": 3.9,
+        "blocked": true
+      },
+      {
+        "t": 1794122504.1,
+        "ok": true,
+        "ms": 4.1,
+        "blocked": true
+      },
+      {
+        "t": 1794122509.1,
+        "ok": true,
+        "ms": 3.8,
+        "blocked": true
+      },
+      {
+        "t": 1794122514.1,
+        "ok": true,
+        "ms": 3.6,
+        "blocked": true
+      },
+      {
+        "t": 1794122519.1,
+        "ok": true,
+        "ms": 3.9,
+        "blocked": true
+      },
+      {
+        "t": 1794122524.1,
+        "ok": true,
+        "ms": 2.7,
+        "blocked": true
+      },
+      {
+        "t": 1794122529.1,
+        "ok": true,
+        "ms": 2.6,
+        "blocked": true
+      },
+      {
+        "t": 1794122534.1,
+        "ok": true,
+        "ms": 3.8,
+        "blocked": true
+      },
+      {
+        "t": 1794122539.1,
+        "ok": true,
+        "ms": 2.5,
+        "blocked": true
+      },
+      {
+        "t": 1794122544.1,
+        "ok": true,
+        "ms": 3.9,
+        "blocked": true
+      },
+      {
+        "t": 1794122549.1,
+        "ok": true,
+        "ms": 3.7,
+        "blocked": true
+      },
+      {
+        "t": 1794122554.1,
+        "ok": true,
+        "ms": 4,
+        "blocked": true
+      },
+      {
+        "t": 1794122559.1,
+        "ok": true,
+        "ms": 3.4,
+        "blocked": true
+      },
+      {
+        "t": 1794122564.1,
+        "ok": true,
+        "ms": 2.7,
+        "blocked": true
+      },
+      {
+        "t": 1794122569.1,
+        "ok": true,
+        "ms": 3.5,
+        "blocked": true
+      },
+      {
+        "t": 1794122574.1,
+        "ok": true,
+        "ms": 3.9,
+        "blocked": true
+      },
+      {
+        "t": 1794122579.1,
+        "ok": true,
+        "ms": 3.7,
+        "blocked": true
+      },
+      {
+        "t": 1794122584.1,
+        "ok": true,
+        "ms": 4,
+        "blocked": true
+      },
+      {
+        "t": 1794122589.1,
+        "ok": true,
+        "ms": 2.4,
+        "blocked": true
+      },
+      {
+        "t": 1794122594.1,
+        "ok": true,
+        "ms": 3.8,
+        "blocked": true
+      },
+      {
+        "t": 1794122599.1,
+        "ok": true,
+        "ms": 12.4,
+        "blocked": true
+      },
+      {
+        "t": 1794122604.1,
+        "ok": true,
+        "ms": 4.2,
+        "blocked": true
+      },
+      {
+        "t": 1794122609.1,
+        "ok": true,
+        "ms": 2.8,
+        "blocked": true
+      },
+      {
+        "t": 1794122614.1,
+        "ok": true,
+        "ms": 3.7,
+        "blocked": true
+      },
+      {
+        "t": 1794122619.1,
+        "ok": true,
+        "ms": 3,
+        "blocked": true
+      },
+      {
+        "t": 1794122624.1,
+        "ok": true,
+        "ms": 3.7,
+        "blocked": true
+      },
+      {
+        "t": 1794122629.1,
+        "ok": true,
+        "ms": 3.4,
+        "blocked": true
+      },
+      {
+        "t": 1794122634.1,
+        "ok": true,
+        "ms": 3.5,
+        "blocked": true
+      },
+      {
+        "t": 1794122639.1,
+        "ok": true,
+        "ms": 3,
+        "blocked": true
+      },
+      {
+        "t": 1794122644.1,
+        "ok": true,
+        "ms": 3.1,
+        "blocked": true
+      },
+      {
+        "t": 1794122649.1,
+        "ok": true,
+        "ms": 2.6,
+        "blocked": true
+      },
+      {
+        "t": 1794122654.1,
+        "ok": true,
+        "ms": 2.5,
+        "blocked": true
+      },
+      {
+        "t": 1794122659.1,
+        "ok": true,
+        "ms": 4,
+        "blocked": true
+      },
+      {
+        "t": 1794122664.1,
+        "ok": true,
+        "ms": 3.7,
+        "blocked": true
+      },
+      {
+        "t": 1794122669.1,
+        "ok": true,
+        "ms": 3,
+        "blocked": true
+      },
+      {
+        "t": 1794122674.1,
+        "ok": true,
+        "ms": 3.4,
+        "blocked": true
+      },
+      {
+        "t": 1794122679.1,
+        "ok": true,
+        "ms": 3.9,
+        "blocked": true
+      },
+      {
+        "t": 1794122684.1,
+        "ok": true,
+        "ms": 3.5,
+        "blocked": true
+      },
+      {
+        "t": 1794122689.1,
+        "ok": true,
+        "ms": 2.4,
+        "blocked": true
+      },
+      {
+        "t": 1794122694.1,
+        "ok": true,
+        "ms": 3.3,
+        "blocked": true
+      },
+      {
+        "t": 1794122699.1,
+        "ok": true,
+        "ms": 3.3,
+        "blocked": true
+      }
+    ]
+  },
+  "error": ""
+}

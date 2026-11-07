@@ -5,15 +5,22 @@ import qs.Commons
 
 // The connection: its glyph and name, one status line under it, and on the
 // right the QR share and speed-test buttons and, after a clear gap, the Wi-Fi
-// switch. The status line reads "Connected · 5 GHz · 72% · 866 Mb/s"; when
-// the link is limited or behind a portal its first word is urgent, and
-// "Sign in required ›" is a button that opens the portal.
+// switch. The status line reads "Connected · 5 GHz · 61% · 122 Mb/s · gw
+// 4 ms" (the gateway's latency only while the panel measures it); when the
+// link is limited or behind a portal its first word is urgent, and "Sign in
+// required ›" is a button that opens the portal.
+//
+// This is also the connected network's row: a secondary click on it, or
+// Delete or Enter with the cursor on it, drops the Wi-Fi link (its tooltip
+// says so). Everything that sits on the right edge ends on the panel's one
+// right gutter, the switch included.
 Item {
   id: header
 
   required property var hub
   readonly property var info: hub.header
   readonly property var items: hub.headerItems
+  readonly property int connIndex: items.indexOf("conn")
 
   width: parent ? parent.width : 0
   implicitHeight: Math.max(labels.implicitHeight, actions.implicitHeight, glyph.implicitHeight) + Style.space(6)
@@ -33,6 +40,36 @@ Item {
 
   readonly property color glyphColor: info.kind === "nobackend" || info.restricted ? hub.urgent
     : (info.kind === "wifi" || info.kind === "ethernet") ? hub.accent : hub.dim
+
+  // The connection as a row: the cursor's stop and the secondary click.
+  CursorSurface {
+    id: connBox
+    visible: header.info.disconnectable
+    x: header.hub.gutter - Style.space(8)
+    width: labels.x + labels.width - x + Style.space(4)
+    height: parent.height
+    hasCursor: header.connIndex >= 0 && header.hub.has("header", header.connIndex)
+    foreground: header.hub.fg
+    fill: header.hub.hoverFill
+    scale: connMouse.pressed && connMouse.pressedButtons === Qt.RightButton ? header.hub.pressScale : 1
+    Behavior on scale { NumberAnimation { duration: Style.duration(80); easing.type: Easing.OutCubic } }
+
+    MouseArea {
+      id: connMouse
+      anchors.fill: parent
+      enabled: header.info.disconnectable
+      hoverEnabled: true
+      acceptedButtons: Qt.RightButton
+      onPositionChanged: function(mouse) { header.hub.hoverCursor(connMouse, mouse, "header", header.connIndex) }
+      onClicked: header.hub.disconnectNet()
+    }
+
+    PanelToolTip {
+      visible: (connMouse.containsMouse || connBox.hasCursor) && header.info.disconnectable
+      text: header.hub.strings.t("header.disconnectTip")
+      fontFamily: header.hub.fontFamily
+    }
+  }
 
   Text {
     id: glyph
@@ -98,7 +135,7 @@ Item {
           text: {
             if (header.info.status.length === 0) return ""
             var word = header.stateText(header.info.status[0].key)
-            return header.info.portal ? word + " \u203a" : word
+            return header.info.portal ? word + " ›" : word
           }
           color: header.info.urgent ? header.hub.urgent : header.hub.dim
           font.family: header.hub.fontFamily
@@ -126,7 +163,7 @@ Item {
           required property var modelData
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
-          text: " \u00b7 " + extra.modelData.text
+          text: " · " + extra.modelData.text
           color: header.hub.dim
           font.family: header.hub.fontFamily
           font.pixelSize: header.hub.typeSmall
@@ -171,22 +208,15 @@ Item {
     // A clear gap before the one switch.
     Item { width: Style.space(10); height: 1 }
 
-    ToggleSwitch {
-      id: radio
+    Switch {
       anchors.verticalCenter: parent.verticalCenter
+      hub: header.hub
       checked: header.hub.view.radio.wifiEnabled
       enabled: header.hub.view.radio.hwEnabled
-      opacity: enabled ? 1 : header.hub.disabledOpacity
-      foreground: checked ? header.hub.accent : header.hub.fg
       hasCursor: header.hub.has("header", header.items.indexOf("radio"))
+      tipText: checked ? header.hub.strings.t("header.wifiOffTip") : header.hub.strings.t("header.wifiOnTip")
       onHovered: function(on) { if (on) header.hub.setCursor("header", header.items.indexOf("radio")) }
       onToggled: header.hub.toggleRadio()
-
-      PanelToolTip {
-        visible: radio.containsMouse
-        text: radio.checked ? header.hub.strings.t("header.wifiOffTip") : header.hub.strings.t("header.wifiOnTip")
-        fontFamily: header.hub.fontFamily
-      }
     }
   }
 }

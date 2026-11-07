@@ -96,6 +96,15 @@ impl PinVerifier {
         self.mismatch.load(Ordering::SeqCst)
     }
 
+    /// Forget the last verdict. Called at the start of every request so a
+    /// pin mismatch from one attempt can never colour the next one's error.
+    pub fn reset(&self) {
+        self.mismatch.store(false, Ordering::SeqCst);
+        if let Ok(mut g) = self.seen.lock() {
+            *g = None;
+        }
+    }
+
     pub fn seen(&self) -> Option<[u8; 32]> {
         self.seen.lock().ok().and_then(|g| *g)
     }
@@ -527,6 +536,7 @@ impl HttpsClient {
                 return Err(HttpError::Protocol("invalid header".into()));
             }
         }
+        self.verifier.reset();
         let idempotent = method == "GET";
         let deadline = Instant::now() + self.timeout;
         if !idempotent {
@@ -969,5 +979,32 @@ mod tests {
             read_response(&mut r, false, 100).unwrap_err(),
             HttpError::Protocol(_)
         ));
+    }
+
+    #[test]
+    fn pin_mismatch_flag_does_not_stick_to_the_next_request() {
+        let srv = serve(1, |_, _| Some(ok_json("{}")));
+        let mut wrong = srv.fingerprint;
+        wrong[0] ^= 0xFF;
+        let mut c = HttpsClient::new(srv.addr, Some(wrong)).unwrap();
+        assert!(matches!(c.request("GET", "/x", &[], None), Err(HttpError::PinMismatch(_))));
+        srv.handle.join().unwrap();
+        // The server is gone now. This failure is a plain connect error, and
+        // must be reported as one rather than as the earlier mismatch.
+        assert!(matches!(c.request("GET", "/x", &[], None), Err(HttpError::Connect(_))), "stale flag");
+        assert!(!c.verifier.mismatched());
+    }
+
+    #[test]
+    fn verifier_reset_clears_verdict() {
+        let der = der_of_self_signed();
+        let mut pin = leaf_sha256(&der);
+        pin[0] ^= 1;
+        let v = PinVerifier::new(Some(pin));
+        let name = ServerName::try_from("pi.hole").unwrap();
+        assert!(v.verify_server_cert(&CertificateDer::from(der), &[], &name, &[], UnixTime::now()).is_err());
+        assert!(v.mismatched() && v.seen().is_some());
+        v.reset();
+        assert!(!v.mismatched() && v.seen().is_none());
     }
 }

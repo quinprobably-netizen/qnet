@@ -5,7 +5,7 @@
 //! before overwriting manual DNS, active profile only, no-ops) are tested
 //! against a fake and never need the live network.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -105,16 +105,29 @@ impl<'a> Ctx<'a> {
     }
 }
 
-// ---- Undo state ------------------------------------------------------------
+// ---- Undo state and the pinned-network record -----------------------------------
 
+/// `prev-dns/<uuid>.json`: what the profile's DNS settings were before qnet
+/// pinned it (for undo), and the gateway of the network it was pinned on (so
+/// the failover only ever trusts the *same* router as a fallback).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct PrevDns {
     pub uuid: String,
     pub saved_at: u64,
+    #[serde(default)]
     pub ipv4_dns: Vec<String>,
+    #[serde(default)]
     pub ipv4_ignore_auto_dns: bool,
+    #[serde(default)]
     pub ipv6_dns: Vec<String>,
+    #[serde(default)]
     pub ipv6_ignore_auto_dns: bool,
+    /// Gateway recorded when the profile was pinned (or first seen healthy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// The file only carries the gateway; there is no undo state in it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gateway_only: bool,
 }
 
 impl PrevDns {
@@ -124,27 +137,42 @@ impl PrevDns {
             && !self.ipv4_ignore_auto_dns
             && !self.ipv6_ignore_auto_dns
     }
+
+    /// The recorded gateway, if it parses.
+    pub fn gateway_addr(&self) -> Option<Ipv4Addr> {
+        self.gateway.as_deref().and_then(|g| g.parse().ok())
+    }
 }
 
 fn prev_path(dir: &Path, uuid: &str) -> PathBuf {
     dir.join("prev-dns").join(format!("{uuid}.json"))
 }
 
-pub fn save_prev(dir: &Path, uuid: &str, dns: &DnsSettings) -> Result<(), ActionErr> {
+fn write_prev(dir: &Path, prev: &PrevDns) -> Result<(), ActionErr> {
+    let bytes = serde_json::to_vec_pretty(prev).map_err(|e| ActionErr::new("io", e.to_string()))?;
+    util::atomic_write(&prev_path(dir, &prev.uuid), &bytes, 0o600)
+        .map_err(|e| ActionErr::new("io", format!("could not save undo state: {e}")))
+}
+
+/// Save the settings about to be replaced, with the gateway of the network
+/// the pin happens on (None for a profile that is not in use).
+pub fn save_prev(dir: &Path, uuid: &str, dns: &DnsSettings, gateway: Option<Ipv4Addr>) -> Result<(), ActionErr> {
     if !util::is_uuid(uuid) {
         return Err(ActionErr::new("invalid", "bad connection uuid"));
     }
-    let prev = PrevDns {
-        uuid: uuid.to_string(),
-        saved_at: util::unix_secs(),
-        ipv4_dns: dns.v4_dns.iter().map(|a| a.to_string()).collect(),
-        ipv4_ignore_auto_dns: dns.v4_ignore_auto,
-        ipv6_dns: dns.v6_dns.iter().map(|a| a.to_string()).collect(),
-        ipv6_ignore_auto_dns: dns.v6_ignore_auto,
-    };
-    let bytes = serde_json::to_vec_pretty(&prev).map_err(|e| ActionErr::new("io", e.to_string()))?;
-    util::atomic_write(&prev_path(dir, uuid), &bytes, 0o600)
-        .map_err(|e| ActionErr::new("io", format!("could not save undo state: {e}")))
+    write_prev(
+        dir,
+        &PrevDns {
+            uuid: uuid.to_string(),
+            saved_at: util::unix_secs(),
+            ipv4_dns: dns.v4_dns.iter().map(|a| a.to_string()).collect(),
+            ipv4_ignore_auto_dns: dns.v4_ignore_auto,
+            ipv6_dns: dns.v6_dns.iter().map(|a| a.to_string()).collect(),
+            ipv6_ignore_auto_dns: dns.v6_ignore_auto,
+            gateway: gateway.map(|g| g.to_string()),
+            gateway_only: false,
+        },
+    )
 }
 
 pub fn load_prev(dir: &Path, uuid: &str) -> Option<PrevDns> {
@@ -153,6 +181,25 @@ pub fn load_prev(dir: &Path, uuid: &str) -> Option<PrevDns> {
     }
     let t = std::fs::read_to_string(prev_path(dir, uuid)).ok()?;
     serde_json::from_str(&t).ok()
+}
+
+/// Record the gateway for a pinned profile without touching undo state.
+pub fn record_gateway(dir: &Path, uuid: &str, gateway: Ipv4Addr) -> Result<(), ActionErr> {
+    if !util::is_uuid(uuid) {
+        return Err(ActionErr::new("invalid", "bad connection uuid"));
+    }
+    let mut prev = load_prev(dir, uuid).unwrap_or_else(|| PrevDns {
+        uuid: uuid.to_string(),
+        saved_at: util::unix_secs(),
+        ipv4_dns: vec![],
+        ipv4_ignore_auto_dns: false,
+        ipv6_dns: vec![],
+        ipv6_ignore_auto_dns: false,
+        gateway: None,
+        gateway_only: true,
+    });
+    prev.gateway = Some(gateway.to_string());
+    write_prev(dir, &prev)
 }
 
 fn remove_prev(dir: &Path, uuid: &str) {
@@ -167,6 +214,7 @@ struct Active {
     iface: String,
     ifindex: u32,
     uuid: String,
+    gateway: Option<Ipv4Addr>,
     profile: Profile,
 }
 
@@ -191,6 +239,7 @@ fn active_link(ctx: &Ctx<'_>) -> Result<Active, ActionErr> {
         iface: dev.iface.clone(),
         ifindex: dev.ifindex,
         uuid,
+        gateway: dev.gateway,
         profile,
     })
 }
@@ -208,6 +257,8 @@ struct Verified {
     via: Option<String>,
     answers: Vec<String>,
     error: Option<String>,
+    /// The canary came back as 0.0.0.0: a blocking resolver answered.
+    blocked: bool,
 }
 
 /// Wait for resolved to show the expected servers on the link, then send one
@@ -230,13 +281,17 @@ fn verify(ctx: &Ctx<'_>, a: &Active, expect: &dyn Fn(&[IpAddr]) -> bool) -> Veri
     } else {
         Some("systemd-resolved did not pick up the change in time".to_string())
     };
-    let answers = match ctx.be.resolve_hostname(&ctx.canary()) {
-        Ok(a) => a.iter().map(|x| x.to_string()).collect(),
+    let (answers, resolved_ok): (Vec<IpAddr>, bool) = match ctx.be.resolve_hostname(&ctx.canary()) {
+        Ok(a) => (a, true),
         Err(e) => {
             error = Some(format!("test query failed: {}", e.detail()));
-            vec![]
+            (vec![], false)
         }
     };
+    let blocked = !answers.is_empty() && answers.iter().all(|x| x.is_unspecified());
+    if resolved_ok && !blocked && error.is_none() {
+        error = Some("the canary was not blocked: is blocking paused, or is DNS not going through the Pi-hole?".into());
+    }
     let via = ctx
         .be
         .resolver(&[(a.ifindex, a.iface.clone())])
@@ -246,10 +301,31 @@ fn verify(ctx: &Ctx<'_>, a: &Active, expect: &dyn Fn(&[IpAddr]) -> bool) -> Veri
                 .and_then(|l| l.current.or_else(|| l.servers.first().copied()))
         })
         .map(|ip| ip.to_string());
-    Verified { via, answers, error }
+    Verified {
+        via,
+        answers: answers.iter().map(|x| x.to_string()).collect(),
+        error,
+        blocked,
+    }
 }
 
-fn with_verification(mut base: Map<String, Value>, v: Verified) -> Value {
+/// Attach the verification to `base`. With `require_blocked`, `verifiedVia`
+/// appears only when the canary was answered with 0.0.0.0 (and then
+/// `blocked: true`); otherwise there is a `verifyError` instead.
+fn with_verification(mut base: Map<String, Value>, v: Verified, require_blocked: bool) -> Value {
+    if require_blocked {
+        base.insert("blocked".into(), json!(v.blocked));
+        if v.blocked {
+            base.insert("verifiedVia".into(), json!(v.via.unwrap_or_default()));
+        } else {
+            base.insert(
+                "verifyError".into(),
+                json!(v.error.unwrap_or_else(|| "the canary was not blocked".into())),
+            );
+        }
+        base.insert("answers".into(), json!(v.answers));
+        return Value::Object(base);
+    }
     base.insert("verifiedVia".into(), json!(v.via.unwrap_or_default()));
     base.insert("answers".into(), json!(v.answers));
     if let Some(e) = v.error {
@@ -262,9 +338,8 @@ fn obj(pairs: &[(&str, Value)]) -> Map<String, Value> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
 }
 
-fn confirm_err(a: &Active, pihole: Option<IpAddr>, what: &str) -> ActionErr {
-    let servers: Vec<String> = a
-        .profile
+fn confirm_err(profile: &Profile, pihole: Option<IpAddr>, what: &str) -> ActionErr {
+    let servers: Vec<String> = profile
         .dns
         .manual_servers()
         .iter()
@@ -275,11 +350,11 @@ fn confirm_err(a: &Active, pihole: Option<IpAddr>, what: &str) -> ActionErr {
         "confirm",
         format!(
             "{} has DNS servers set by hand ({}) that qnet did not write; {what} would replace them",
-            a.profile.id,
+            profile.id,
             servers.join(", ")
         ),
     );
-    e.extra = Some(json!({ "connection": a.profile.id, "servers": servers }));
+    e.extra = Some(json!({ "connection": profile.id, "servers": servers }));
     e
 }
 
@@ -295,28 +370,37 @@ fn dns_supported(dns: &DnsSettings) -> Result<(), ActionErr> {
 }
 
 /// `qnet dns pihole`: pin the active connection's saved profile to the
-/// Pi-hole and apply it.
+/// Pi-hole and apply it. Success means the canary came back blocked through
+/// the system resolver, and only then is `verifiedVia` reported.
 pub fn dns_pihole(ctx: &Ctx<'_>, force: bool) -> ActionResult {
     let pihole = ctx.pihole()?;
     let a = active_link(ctx)?;
     let servers = link_servers(ctx, &a);
     let mode = detect_mode(true, false, &servers, Some(&a.profile), Some(pihole));
     let expect = move |s: &[IpAddr]| !s.is_empty() && s.iter().all(|x| *x == pihole);
+    let pinned = profile_pinned(&a.profile.dns, pihole);
 
-    if mode == Mode::Pihole {
+    // Already exactly in this mode: pinned, and nothing else in use.
+    if mode == Mode::Pihole && pinned && expect(&servers) {
         let v = verify(ctx, &a, &expect);
+        if v.blocked {
+            if let Some(gw) = a.gateway {
+                let _ = ensure_gateway_recorded(&ctx.state_dir, &a.uuid, gw);
+            }
+        }
         return Ok(with_verification(
             obj(&[("ok", json!(true)), ("noop", json!(true)), ("mode", json!("pihole"))]),
             v,
+            true,
         ));
     }
     dns_supported(&a.profile.dns)?;
     if manual_override(&a.profile.dns, pihole) && !force {
-        return Err(confirm_err(&a, Some(pihole), "pinning the Pi-hole"));
+        return Err(confirm_err(&a.profile, Some(pihole), "pinning the Pi-hole"));
     }
     let mut wrote_profile = false;
-    if !profile_pinned(&a.profile.dns, pihole) {
-        save_prev(&ctx.state_dir, &a.uuid, &a.profile.dns)?;
+    if !pinned {
+        save_prev(&ctx.state_dir, &a.uuid, &a.profile.dns, a.gateway)?;
         ctx.be.set_profile_dns(&a.uuid, &a.profile.dns.pinned_to(pihole))?;
         wrote_profile = true;
     }
@@ -324,6 +408,11 @@ pub fn dns_pihole(ctx: &Ctx<'_>, force: bool) -> ActionResult {
     // something else (a runtime failover): apply the saved profile.
     ctx.be.reapply_saved(&a.iface)?;
     let v = verify(ctx, &a, &expect);
+    if v.blocked && !wrote_profile {
+        if let Some(gw) = a.gateway {
+            let _ = ensure_gateway_recorded(&ctx.state_dir, &a.uuid, gw);
+        }
+    }
     Ok(with_verification(
         obj(&[
             ("ok", json!(true)),
@@ -331,7 +420,16 @@ pub fn dns_pihole(ctx: &Ctx<'_>, force: bool) -> ActionResult {
             ("profileChanged", json!(wrote_profile)),
         ]),
         v,
+        true,
     ))
+}
+
+/// Record the gateway for `uuid` unless one is already on file.
+pub fn ensure_gateway_recorded(dir: &Path, uuid: &str, gw: Ipv4Addr) -> Result<(), ActionErr> {
+    if load_prev(dir, uuid).and_then(|p| p.gateway_addr()).is_some() {
+        return Ok(());
+    }
+    record_gateway(dir, uuid, gw)
 }
 
 /// `qnet dns auto`: back to automatic DNS on the active profile.
@@ -341,7 +439,7 @@ pub fn dns_auto(ctx: &Ctx<'_>, force: bool) -> ActionResult {
     let servers = link_servers(ctx, &a);
     let mode = detect_mode(true, false, &servers, Some(&a.profile), pihole);
     let expect = move |s: &[IpAddr]| match pihole {
-        Some(p) => !s.is_empty() && !s.iter().all(|x| *x == p),
+        Some(p) => !s.is_empty() && !s.contains(&p),
         None => true,
     };
     if mode == Mode::Auto {
@@ -349,6 +447,7 @@ pub fn dns_auto(ctx: &Ctx<'_>, force: bool) -> ActionResult {
         return Ok(with_verification(
             obj(&[("ok", json!(true)), ("noop", json!(true)), ("mode", json!("auto"))]),
             v,
+            false,
         ));
     }
     dns_supported(&a.profile.dns)?;
@@ -359,12 +458,12 @@ pub fn dns_auto(ctx: &Ctx<'_>, force: bool) -> ActionResult {
         .iter()
         .any(|s| Some(*s) != pihole);
     if has_foreign && !force {
-        return Err(confirm_err(&a, pihole, "switching to automatic DNS"));
+        return Err(confirm_err(&a.profile, pihole, "switching to automatic DNS"));
     }
     let prev = load_prev(&ctx.state_dir, &a.uuid);
     // Restoring the saved settings only makes sense when they were
     // automatic; Automatic must mean automatic whatever came before.
-    let restored = prev.as_ref().is_some_and(|p| p.is_automatic());
+    let restored = prev.as_ref().is_some_and(|p| !p.gateway_only && p.is_automatic());
     ctx.be.set_profile_dns(&a.uuid, &a.profile.dns.automatic())?;
     ctx.be.reapply_saved(&a.iface)?;
     if restored {
@@ -378,26 +477,23 @@ pub fn dns_auto(ctx: &Ctx<'_>, force: bool) -> ActionResult {
             ("restoredPrevious", json!(restored)),
         ]),
         v,
+        false,
     ))
 }
 
-/// `qnet dns pin <uuid>`: apply the Pi-hole settings to a saved profile.
-/// An inactive profile is only written; the active one is pinned like
-/// `dns pihole`.
-pub fn dns_pin(ctx: &Ctx<'_>, uuid: &str, force: bool) -> ActionResult {
-    if !util::is_uuid(uuid) {
-        return Err(ActionErr::new("invalid", "not a connection uuid"));
-    }
-    let pihole = ctx.pihole()?;
+fn is_active_uuid(ctx: &Ctx<'_>, uuid: &str) -> Result<bool, ActionErr> {
     let snap = ctx.be.snapshot(false)?;
-    let is_active = snap
+    Ok(snap
         .primary_device()
         .filter(|d| d.is_up())
         .and_then(|d| d.active.as_ref())
-        .is_some_and(|a| a.uuid == uuid);
-    if is_active {
-        return dns_pihole(ctx, force);
-    }
+        .is_some_and(|a| a.uuid == uuid))
+}
+
+/// Pin one saved profile that is not in use: write it, do not apply it.
+/// Returns the result fields; `Ok(None)` for "already pinned".
+fn pin_inactive(ctx: &Ctx<'_>, uuid: &str, force: bool) -> Result<(String, bool), ActionErr> {
+    let pihole = ctx.pihole()?;
     let profile = ctx
         .be
         .profiles()?
@@ -408,36 +504,114 @@ pub fn dns_pin(ctx: &Ctx<'_>, uuid: &str, force: bool) -> ActionResult {
         return Err(ActionErr::new("invalid", "only Wi-Fi and Ethernet profiles can be pinned"));
     }
     if profile_pinned(&profile.dns, pihole) {
-        return Ok(json!({"ok": true, "noop": true, "mode": "pihole", "connection": profile.id}));
+        return Ok((profile.id, false));
     }
     dns_supported(&profile.dns)?;
     if manual_override(&profile.dns, pihole) && !force {
-        let a = Active {
-            iface: String::new(),
-            ifindex: 0,
-            uuid: profile.uuid.clone(),
-            profile: profile.clone(),
-        };
-        return Err(confirm_err(&a, Some(pihole), "pinning the Pi-hole"));
+        return Err(confirm_err(&profile, Some(pihole), "pinning the Pi-hole"));
     }
-    save_prev(&ctx.state_dir, uuid, &profile.dns)?;
+    save_prev(&ctx.state_dir, uuid, &profile.dns, None)?;
     ctx.be.set_profile_dns(uuid, &profile.dns.pinned_to(pihole))?;
+    Ok((profile.id, true))
+}
+
+fn verify_current_link(ctx: &Ctx<'_>) -> Verified {
+    match active_link(ctx) {
+        Ok(a) => verify(ctx, &a, &|_| true),
+        Err(_) => Verified {
+            via: None,
+            answers: vec![],
+            error: Some("no active link to test".into()),
+            blocked: false,
+        },
+    }
+}
+
+/// `qnet dns pin <uuid>`: apply the Pi-hole settings to a saved profile.
+/// An inactive profile is only written; the active one is pinned like
+/// `dns pihole`.
+pub fn dns_pin(ctx: &Ctx<'_>, uuid: &str, force: bool) -> ActionResult {
+    if !util::is_uuid(uuid) {
+        return Err(ActionErr::new("invalid", "not a connection uuid"));
+    }
+    ctx.pihole()?;
+    if is_active_uuid(ctx, uuid)? {
+        return dns_pihole(ctx, force);
+    }
+    let (name, changed) = pin_inactive(ctx, uuid, force)?;
+    if !changed {
+        return Ok(json!({"ok": true, "noop": true, "mode": "pihole", "connection": name}));
+    }
     // The pinned profile is not in use, so the query still goes through
     // whatever the active link uses; report that honestly.
-    let active = active_link(ctx).ok();
-    let v = match &active {
-        Some(a) => verify(ctx, a, &|_| true),
-        None => Verified { via: None, answers: vec![], error: Some("no active link to test".into()) },
-    };
     Ok(with_verification(
         obj(&[
             ("ok", json!(true)),
             ("mode", json!("pihole")),
-            ("connection", json!(profile.id)),
+            ("connection", json!(name)),
             ("applied", json!(false)),
         ]),
-        v,
+        verify_current_link(ctx),
+        false,
     ))
+}
+
+/// `qnet dns pin <uuid> [<uuid>...]`. One uuid behaves exactly like
+/// `dns_pin`. Several are pinned independently (one refusing does not stop
+/// the others) and reported together, with one closing query.
+pub fn dns_pin_many(ctx: &Ctx<'_>, uuids: &[String], force: bool) -> ActionResult {
+    if uuids.len() == 1 {
+        return dns_pin(ctx, &uuids[0], force);
+    }
+    ctx.pihole()?;
+    let mut results: Vec<Value> = Vec::new();
+    let mut failed = 0usize;
+    let mut applied_active = false;
+    for u in uuids {
+        let one: ActionResult = if !util::is_uuid(u) {
+            Err(ActionErr::new("invalid", "not a connection uuid"))
+        } else if is_active_uuid(ctx, u)? {
+            applied_active = true;
+            dns_pihole(ctx, force)
+        } else {
+            pin_inactive(ctx, u, force).map(|(name, changed)| {
+                json!({"ok": true, "connection": name, "noop": !changed, "applied": false})
+            })
+        };
+        match one {
+            Ok(Value::Object(mut o)) => {
+                o.insert("uuid".into(), json!(u));
+                results.push(Value::Object(o));
+            }
+            Ok(other) => results.push(other),
+            Err(e) => {
+                failed += 1;
+                let mut j = e.to_json();
+                if let Some(o) = j.as_object_mut() {
+                    o.insert("uuid".into(), json!(u));
+                }
+                results.push(j);
+            }
+        }
+    }
+    let mut summary = obj(&[("ok", json!(failed == 0)), ("results", json!(results))]);
+    if !applied_active {
+        let v = verify_current_link(ctx);
+        summary.insert("verifiedVia".into(), json!(v.via.unwrap_or_default()));
+        if let Some(e) = v.error {
+            summary.insert("verifyError".into(), json!(e));
+        }
+    }
+    if failed == 0 {
+        Ok(Value::Object(summary))
+    } else {
+        let mut e = ActionErr::new(
+            "partial",
+            format!("{failed} of {} profiles could not be pinned", uuids.len()),
+        );
+        e.extra = Some(json!({ "results": summary.remove("results") }));
+        Err(e)
+    }
 }
 
 // ---- Pi-hole verbs --------------------------------------------------------------
@@ -636,12 +810,15 @@ pub fn portal_url(snap: &NetSnapshot) -> String {
     }
 }
 
+/// A normal (incognito) browser window with a throwaway profile: a captive
+/// portal page is an untrusted web page and should look and behave like one.
 pub fn portal_args(url: &str, dir: &Path) -> Vec<String> {
     vec![
         format!("--user-data-dir={}", dir.display()),
+        "--incognito".into(),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
-        format!("--app={url}"),
+        url.to_string(),
     ]
 }
 
@@ -691,11 +868,12 @@ mod tests {
             v6_ignore_auto: false,
         };
         let u = "21307067-f47b-43ea-8c9c-2c746454b2bb";
-        save_prev(dir.path(), u, &dns).unwrap();
+        save_prev(dir.path(), u, &dns, Some("192.168.1.1".parse().unwrap())).unwrap();
         let p = load_prev(dir.path(), u).unwrap();
         assert_eq!(p.ipv4_dns, vec!["9.9.9.9"]);
         assert!(p.ipv4_ignore_auto_dns && !p.is_automatic());
-        assert!(save_prev(dir.path(), "../evil", &dns).is_err());
+        assert_eq!(p.gateway_addr(), Some("192.168.1.1".parse().unwrap()));
+        assert!(save_prev(dir.path(), "../evil", &dns, None).is_err());
         assert!(load_prev(dir.path(), "../evil").is_none());
         remove_prev(dir.path(), u);
         assert!(load_prev(dir.path(), u).is_none());
@@ -731,8 +909,10 @@ mod tests {
     fn portal_args_are_plain_argv() {
         let a = portal_args("http://x.test/a b;rm", Path::new("/run/user/1000/qnet-portal-ab"));
         assert_eq!(a[0], "--user-data-dir=/run/user/1000/qnet-portal-ab");
-        assert_eq!(a[3], "--app=http://x.test/a b;rm");
-        assert_eq!(a.len(), 4);
+        assert!(a.contains(&"--incognito".to_string()), "a normal incognito window");
+        assert!(!a.iter().any(|x| x.starts_with("--app")), "not an app-mode window");
+        assert_eq!(a.last().unwrap(), "http://x.test/a b;rm");
+        assert_eq!(a.len(), 5);
     }
 
     #[test]
@@ -852,6 +1032,7 @@ mod tests {
                 v6_dns: vec![],
                 v6_ignore_auto: true,
             },
+            None,
         )
         .unwrap();
         let r = dns_auto(&ctx(&be, &cfg, dir.path()), false).unwrap();
@@ -942,6 +1123,175 @@ mod tests {
         let r = dns_auto(&ctx(&be, &cfg, dir.path()), false).unwrap();
         assert_eq!(r["ok"], true);
         assert!(r["verifyError"].as_str().unwrap().contains("test query failed"));
+    }
+
+    #[test]
+    fn dns_pihole_reports_verified_via_only_when_the_canary_was_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        let r = dns_pihole(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        assert_eq!(r["blocked"], true);
+        assert_eq!(r["verifiedVia"], "192.168.1.153");
+        assert!(r.get("verifyError").is_none());
+
+        // The Pi-hole is the resolver in use but answers with a real
+        // address: blocking is off, so this is not "verified".
+        let be = FakeNet::live_machine();
+        be.set_canary_answer("142.250.74.14");
+        let r = dns_pihole(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["blocked"], false);
+        assert!(r.get("verifiedVia").is_none(), "no verifiedVia without a blocked canary: {r}");
+        assert!(r["verifyError"].as_str().unwrap().contains("not blocked"));
+
+        // A failed test query is also an error, not a verification.
+        let be = FakeNet::live_machine();
+        be.set_resolve_error();
+        let r = dns_pihole(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        assert_eq!(r["blocked"], false);
+        assert!(r.get("verifiedVia").is_none());
+        assert!(r["verifyError"].as_str().unwrap().contains("test query failed"));
+    }
+
+    #[test]
+    fn dns_pihole_pins_a_profile_that_only_looks_right_by_dhcp() {
+        // DHCP hands out the Pi-hole and the router; the profile is automatic.
+        // resolved shows the Pi-hole among the servers, so the mode reads
+        // "pihole", but nothing is pinned: tapping Pin must really pin.
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        be.set_profile_dns_direct(U_WIFI, be.profile(U_WIFI).dns.automatic());
+        be.set_dhcp(vec![crate::dnsmodel::fixtures::pi(), crate::dnsmodel::fixtures::gw()]);
+        be.apply_saved_to_link();
+        assert_eq!(be.link_servers().len(), 2);
+        let cfg = fake_cfg();
+        let r = dns_pihole(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        assert!(r.get("noop").is_none(), "{r}");
+        assert_eq!(r["profileChanged"], true);
+        assert_eq!(be.link_servers(), vec![crate::dnsmodel::fixtures::pi()]);
+    }
+
+    #[test]
+    fn the_gateway_is_recorded_when_pinning_and_kept_across_undo_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        dns_auto(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        dns_pihole(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        let prev = load_prev(dir.path(), U_WIFI).unwrap();
+        assert_eq!(prev.gateway_addr(), Some("192.168.1.1".parse().unwrap()));
+        assert!(!prev.gateway_only);
+        assert!(prev.is_automatic(), "undo state still there");
+        // The raw file carries both, in one place.
+        let raw: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("prev-dns").join(format!("{U_WIFI}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["gateway"], "192.168.1.1");
+        assert!(raw.get("gateway_only").is_none());
+    }
+
+    #[test]
+    fn already_pinned_profiles_get_their_gateway_recorded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        // First no-op tap on a pinned profile with no record yet.
+        dns_pihole(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        let prev = load_prev(dir.path(), U_WIFI).unwrap();
+        assert!(prev.gateway_only, "only the gateway is on file; there is no undo state");
+        assert_eq!(prev.gateway_addr(), Some("192.168.1.1".parse().unwrap()));
+        // A gateway-only file is not "previous settings".
+        let r = dns_auto(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        assert_eq!(r["restoredPrevious"], false);
+        // An existing record is never overwritten by ensure_gateway_recorded.
+        ensure_gateway_recorded(dir.path(), U_ETH1, "10.0.0.1".parse().unwrap()).unwrap();
+        ensure_gateway_recorded(dir.path(), U_ETH1, "10.9.9.9".parse().unwrap()).unwrap();
+        assert_eq!(load_prev(dir.path(), U_ETH1).unwrap().gateway_addr(), Some("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn prev_files_from_before_the_gateway_field_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("prev-dns")).unwrap();
+        std::fs::write(
+            dir.path().join("prev-dns").join(format!("{U_WIFI}.json")),
+            r#"{"uuid":"21307067-f47b-43ea-8c9c-2c746454b2bb","saved_at":1,"ipv4_dns":[],"ipv4_ignore_auto_dns":false,"ipv6_dns":[],"ipv6_ignore_auto_dns":false}"#,
+        )
+        .unwrap();
+        let p = load_prev(dir.path(), U_WIFI).unwrap();
+        assert!(p.is_automatic() && p.gateway_addr().is_none() && !p.gateway_only);
+    }
+
+    #[test]
+    fn pin_accepts_several_uuids_and_reports_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        let r = dns_pin_many(&ctx(&be, &cfg, dir.path()), &[U_ETH1.into(), U_ETH2.into()], false).unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["results"].as_array().unwrap().len(), 2);
+        assert_eq!(r["results"][0]["uuid"], U_ETH1);
+        assert_eq!(r["results"][1]["connection"], "Wired connection 2");
+        assert!(crate::dnsmodel::profile_pinned(&be.profile(U_ETH1).dns, crate::dnsmodel::fixtures::pi()));
+        assert!(crate::dnsmodel::profile_pinned(&be.profile(U_ETH2).dns, crate::dnsmodel::fixtures::pi()));
+        assert!(r.get("verifiedVia").is_some());
+        assert!(!be.calls().iter().any(|c| c.starts_with("reapply")), "inactive profiles are never reapplied");
+        assert_eq!(be.calls().iter().filter(|c| c.starts_with("resolve ")).count(), 1, "one closing query");
+    }
+
+    #[test]
+    fn a_partial_pin_still_pins_the_rest_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        // Wired 2 carries hand-set servers: needs --force.
+        be.set_profile_dns_direct(
+            U_ETH2,
+            DnsSettings {
+                v4_method: "auto".into(),
+                v4_dns: vec!["9.9.9.9".parse().unwrap()],
+                v4_ignore_auto: true,
+                v6_method: "auto".into(),
+                v6_dns: vec![],
+                v6_ignore_auto: true,
+            },
+        );
+        let missing = "aaaaaaaa-0000-0000-0000-000000000000".to_string();
+        let e = dns_pin_many(&ctx(&be, &cfg, dir.path()), &[U_ETH1.into(), U_ETH2.into(), missing], false).unwrap_err();
+        assert_eq!(e.code, "partial");
+        let results = e.extra.as_ref().unwrap()["results"].as_array().unwrap().clone();
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[1]["error"], "confirm");
+        assert_eq!(results[2]["error"], "notfound");
+        assert!(crate::dnsmodel::profile_pinned(&be.profile(U_ETH1).dns, crate::dnsmodel::fixtures::pi()));
+        assert_eq!(be.profile(U_ETH2).dns.v4_dns, vec!["9.9.9.9".parse::<Ipv4Addr>().unwrap()], "untouched");
+        let j = e.to_json();
+        assert_eq!(j["ok"], false);
+        assert_eq!(j["results"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn pin_many_includes_the_active_profile_through_the_full_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        let r = dns_pin_many(&ctx(&be, &cfg, dir.path()), &[U_WIFI.into(), U_ETH1.into()], false).unwrap();
+        assert_eq!(r["results"][0]["noop"], true, "the active one is already pinned and in use");
+        assert_eq!(r["results"][0]["blocked"], true);
+        assert!(crate::dnsmodel::profile_pinned(&be.profile(U_ETH1).dns, crate::dnsmodel::fixtures::pi()));
+    }
+
+    #[test]
+    fn single_uuid_pin_keeps_its_old_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        let r = dns_pin_many(&ctx(&be, &cfg, dir.path()), &[U_ETH1.into()], false).unwrap();
+        assert_eq!(r["connection"], "Wired connection 1");
+        assert_eq!(r["applied"], false);
+        assert!(r.get("results").is_none());
     }
 
     // -- Pi-hole verbs ------------------------------------------------------

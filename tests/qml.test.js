@@ -85,14 +85,30 @@ test("durations go through Style.duration, and nothing is eased in or bounced", 
   }
 })
 
-test("durations stay under 300 ms (the spinner turns, it is not an entrance)", () => {
+test("durations stay under 300 ms; only the scan spinner and the head dot's breath are longer", () => {
   for (const f of FILES) {
     for (const m of read(f).matchAll(/Style\.duration\((\d+)\)/g)) {
       const ms = Number(m[1])
       if (f === "components/NetworkList.qml" && ms === 900) continue
+      if (f === "components/DnsHero.qml" && (ms === 1600 || ms === 500)) continue
       assert.ok(ms <= 300, f + " " + ms)
     }
   }
+})
+
+test("the head dot is the only ambient motion on the panel, besides the scan spinner while it scans", () => {
+  const looping = FILES.filter((f) => /Animation\.Infinite/.test(read(f)))
+  assert.deepEqual(looping.sort(), ["components/DnsHero.qml", "components/NetworkList.qml"])
+  const hero = read("components/DnsHero.qml")
+  assert.equal((hero.match(/Animation\.Infinite/g) || []).length, 1, "one loop in the hero")
+  assert.match(hero, /running:[^\n]*!Style\.reduceMotion/, "still when animations are off")
+  assert.match(read("components/NetworkList.qml"), /running:[^\n]*scan\.running[^\n]*!Style\.reduceMotion/)
+})
+
+test("the hero draws no live stroke, no live zone and no rule across the floor", () => {
+  const hero = read("components/DnsHero.qml")
+  assert.doesNotMatch(hero, /pulse|liveW|histW|probeLive/i)
+  assert.doesNotMatch(hero, /Rectangle \{[^}]*height: 1[^}]*\}/s, "no hairline rectangles")
 })
 
 test("one font: no family but the bar's", () => {
@@ -111,7 +127,7 @@ test("sizes come from Style.font or the three panel sizes", () => {
     for (const [i, line] of read(f).split("\n").entries()) {
       for (const m of line.matchAll(/font\.pixelSize:\s*(.+)$/g)) {
         const v = m[1].trim()
-        assert.ok(/(type(Title|Body|Small)|Style\.font\.|Style\.space|fontSize|size\b)/.test(v), f + ":" + (i + 1) + " " + line.trim())
+        assert.ok(/(type(Title|Hero|Body|Small)|Style\.font\.|Style\.space|fontSize|size\b)/.test(v), f + ":" + (i + 1) + " " + line.trim())
       }
     }
   }

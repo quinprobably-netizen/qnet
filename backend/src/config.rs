@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use crate::util;
 
@@ -206,9 +207,9 @@ fn dev_password() -> Option<String> {
 
 /// The Pi-hole app password from the Secret Service. The secret comes back
 /// on stdout; it is never passed on a command line.
-pub fn lookup_password(address: IpAddr) -> Result<String, SecretError> {
+pub fn lookup_password(address: IpAddr) -> Result<Zeroizing<String>, SecretError> {
     if let Some(p) = dev_password() {
-        return Ok(p);
+        return Ok(Zeroizing::new(p));
     }
     let addr = address.to_string();
     let out = crate::proc::run(
@@ -225,8 +226,8 @@ pub fn lookup_password(address: IpAddr) -> Result<String, SecretError> {
     if !out.success() || out.stdout.is_empty() {
         return Err(SecretError::Missing("no app password in the keyring".into()));
     }
-    let s = String::from_utf8(out.stdout).map_err(|_| SecretError::Failed("secret is not UTF-8".into()))?;
-    Ok(s.trim_end_matches(['\n', '\r']).to_string())
+    let s = std::str::from_utf8(&out.stdout).map_err(|_| SecretError::Failed("secret is not UTF-8".into()))?;
+    Ok(Zeroizing::new(s.trim_end_matches(['\n', '\r']).to_string()))
 }
 
 /// Store the app password; the secret is written to `secret-tool` on stdin.

@@ -78,15 +78,44 @@ test("a request is dropped once the backend confirms it", () => {
 })
 
 test("a request nobody confirmed is given up after the timeout", () => {
-  const pend = Model.withPending(Model.emptyPending(), { dns: "auto", connectId: "/org/freedesktop/NetworkManager/AccessPoint/99", pinUuid: "b7e1c0d4-6a52-4c39-8f10-3e9d2a4c5b66" }, NOW_MS)
+  const pend = Model.withPending(Model.emptyPending(), { dns: "auto", pinUuid: "b7e1c0d4-6a52-4c39-8f10-3e9d2a4c5b66" }, NOW_MS)
   const later = Model.reconcilePending(pend, state("leaks"), NOW_MS + Model.PENDING_TTL_MS + 1)
   assert.equal(later.dns, "")
-  assert.equal(later.connectId, "")
   assert.equal(later.pinUuid, "")
   assert.equal(Model.reconcilePending(pend, state("leaks"), NOW_MS + 1000).pinUuid, "b7e1c0d4-6a52-4c39-8f10-3e9d2a4c5b66")
+})
+
+test("a pending connect does not age out: only its own answer or a snapshot ends it", () => {
+  const ap = state("healthy").networks[2].id
+  const pend = Model.withPending(Model.emptyPending(), { connectId: ap }, NOW_MS)
+  const long = Model.reconcilePending(pend, state("healthy"), NOW_MS + 10 * Model.PENDING_TTL_MS)
+  assert.equal(long.connectId, ap, "a 25 s wrong-passphrase wait is not given up on at 12 s")
+  assert.equal(Model.hasPending(long), true, "and it keeps the clock ticking")
+  const joined = state("healthy")
+  joined.networks[2].active = true
+  assert.equal(Model.reconcilePending(pend, joined, NOW_MS + 1000).connectId, "")
+  // a snapshot that shows the SSID connected ends it even if the AP object changed
+  const roamed = state("healthy")
+  roamed.link.ssid = roamed.networks[2].ssid
+  assert.equal(Model.reconcilePending(pend, roamed, NOW_MS + 1000).connectId, "")
+  // the other pending requests still age out around it
+  const mix = Model.withPending(pend, { dns: "auto" }, NOW_MS)
+  const aged = Model.reconcilePending(mix, state("healthy"), NOW_MS + Model.PENDING_TTL_MS + 1)
+  assert.equal(aged.dns, "")
+  assert.equal(aged.connectId, ap)
 })
 
 test("a pin settles when the leak is gone", () => {
   const pend = Model.withPending(Model.emptyPending(), { pinUuid: "b7e1c0d4-6a52-4c39-8f10-3e9d2a4c5b66" }, NOW_MS)
   assert.equal(Model.reconcilePending(pend, state("healthy"), NOW_MS + 1).pinUuid, "")
+})
+
+test("pinning several profiles at once: pending lists them all and settles when none leaks", () => {
+  const ids = "b7e1c0d4-6a52-4c39-8f10-3e9d2a4c5b66 0c3d9f12-88aa-4e77-b5d1-72f6e0a1c9d3"
+  const pend = Model.withPending(Model.emptyPending(), { pinUuid: ids }, NOW_MS)
+  assert.equal(Model.reconcilePending(pend, state("leaks"), NOW_MS + 1).pinUuid, ids)
+  assert.equal(Model.reconcilePending(pend, state("healthy"), NOW_MS + 1).pinUuid, "")
+  const one = state("leaks")
+  one.dns.leaks.shift()
+  assert.equal(Model.reconcilePending(pend, one, NOW_MS + 1).pinUuid, ids, "one profile is still leaking")
 })

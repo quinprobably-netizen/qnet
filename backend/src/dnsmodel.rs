@@ -76,6 +76,8 @@ pub enum Mode {
     /// No link, or the link has no DNS servers (resolved would use its
     /// compiled fallback list): no tile should light.
     None,
+    /// Not decidable yet: a Pi-hole candidate is still being checked.
+    Unknown,
 }
 
 impl Mode {
@@ -86,6 +88,7 @@ impl Mode {
             Mode::Auto => "auto",
             Mode::Custom => "custom",
             Mode::None => "none",
+            Mode::Unknown => "unknown",
         }
     }
 }
@@ -111,14 +114,34 @@ pub fn detect_mode(
     if servers.is_empty() {
         return Mode::None;
     }
+    // The Pi-hole is among the servers: the mode is Pi-hole, and whether
+    // anything else can still answer is `is_bypassed`'s business.
     if let Some(p) = pihole {
-        if servers.iter().all(|s| *s == p) {
+        if servers.contains(&p) {
             return Mode::Pihole;
         }
     }
     match profile {
         Some(p) if p.dns.is_automatic() => Mode::Auto,
         _ => Mode::Custom,
+    }
+}
+
+/// With a Pi-hole configured: can queries on the primary link skip it?
+///
+/// * mode Pi-hole, but other servers are in use alongside it, or the
+///   profile is not pinned (so DHCP or router advertisements may add some);
+/// * mode custom: the Pi-hole is not among the servers at all.
+///
+/// A deliberate Automatic mode, a failover and "no DNS" are states of their
+/// own, not bypasses.
+pub fn is_bypassed(mode: Mode, servers: &[IpAddr], profile: Option<&Profile>, pihole: IpAddr) -> bool {
+    match mode {
+        Mode::Pihole => {
+            servers.iter().any(|s| *s != pihole) || profile.is_none_or(|p| !profile_pinned(&p.dns, pihole))
+        }
+        Mode::Custom => true,
+        Mode::Fallback | Mode::Auto | Mode::None | Mode::Unknown => false,
     }
 }
 
@@ -247,7 +270,7 @@ pub fn detect_leaks(inp: &LeakInput<'_>) -> Vec<Leak> {
         let is_primary = inp.primary_iface == Some(dev.iface.as_str());
         // The user's chosen Automatic/Fallback/None state on the primary link
         // is not a leak; it is the current mode.
-        if is_primary && matches!(inp.mode, Mode::Auto | Mode::Fallback | Mode::None) {
+        if is_primary && matches!(inp.mode, Mode::Auto | Mode::Fallback | Mode::None | Mode::Unknown) {
             continue;
         }
         let Some(link) = inp
@@ -534,9 +557,9 @@ mod tests {
             DnsSettings { v4_dns: vec!["9.9.9.9".parse().unwrap()], v4_ignore_auto: true, ..dns_auto() },
         );
         assert_eq!(detect_mode(true, false, &custom, Some(&custom_prof), Some(pi())), Mode::Custom);
-        // Mixed Pi-hole + router is custom (the router can answer too).
+        // Pi-hole + router: still the Pi-hole mode; `is_bypassed` flags it.
         let mixed = [ip(PI), gw()];
-        assert_eq!(detect_mode(true, false, &mixed, Some(&pinned), Some(pi())), Mode::Custom);
+        assert_eq!(detect_mode(true, false, &mixed, Some(&pinned), Some(pi())), Mode::Pihole);
         // Failover wins over the servers; no link / no servers light nothing.
         assert_eq!(detect_mode(true, true, &router, Some(&pinned), Some(pi())), Mode::Fallback);
         assert_eq!(detect_mode(false, false, &one, Some(&pinned), Some(pi())), Mode::None);
@@ -544,6 +567,8 @@ mod tests {
         // No Pi-hole known: auto or custom only.
         assert_eq!(detect_mode(true, false, &router, Some(&auto), None), Mode::Auto);
         assert_eq!(detect_mode(true, false, &one, Some(&pinned), None), Mode::Custom);
+        assert_eq!(Mode::None.as_str(), "none");
+        assert_eq!(Mode::Unknown.as_str(), "unknown");
         // Unknown profile with servers is custom, not auto.
         assert_eq!(detect_mode(true, false, &router, None, Some(pi())), Mode::Custom);
     }
@@ -775,5 +800,48 @@ mod tests {
         assert_eq!(pihole_candidate(&[ip("127.0.0.53")], Some(gwv4)), None);
         assert_eq!(pihole_candidate(&[ip("fe80::1")], Some(gwv4)), None);
         assert_eq!(pihole_candidate(&[ip("fd00::53")], Some(gwv4)), Some(ip("fd00::53")));
+    }
+
+    #[test]
+    fn bypassed_cases() {
+        let pinned = redwood();
+        let auto = profile(U_WIFI, "Redwood", ProfileKind::Wifi, dns_auto());
+        let (one, mixed, router) = ([ip(PI)], [ip(PI), gw()], [gw()]);
+        // Healthy: pinned, only the Pi-hole.
+        assert!(!is_bypassed(Mode::Pihole, &one, Some(&pinned), pi()));
+        // Pinned but something else is in the server list too.
+        assert!(is_bypassed(Mode::Pihole, &mixed, Some(&pinned), pi()));
+        // DHCP happens to hand out only the Pi-hole, but nothing is pinned.
+        assert!(is_bypassed(Mode::Pihole, &one, Some(&auto), pi()));
+        // Pinned v4 but IPv6 router advertisements may still add servers.
+        let ra = profile(U_WIFI, "Redwood", ProfileKind::Wifi, DnsSettings { v6_ignore_auto: false, ..dns_pinned() });
+        assert!(is_bypassed(Mode::Pihole, &one, Some(&ra), pi()));
+        // No profile known: cannot call it pinned.
+        assert!(is_bypassed(Mode::Pihole, &one, None, pi()));
+        // The Pi-hole is not used at all.
+        assert!(is_bypassed(Mode::Custom, &[ip("9.9.9.9")], Some(&pinned), pi()));
+        // Deliberate Automatic, failover, no DNS, undecided: not a bypass.
+        assert!(!is_bypassed(Mode::Auto, &router, Some(&auto), pi()));
+        assert!(!is_bypassed(Mode::Fallback, &router, Some(&pinned), pi()));
+        assert!(!is_bypassed(Mode::None, &[], Some(&pinned), pi()));
+        assert!(!is_bypassed(Mode::Unknown, &one, Some(&pinned), pi()));
+    }
+
+    #[test]
+    fn mixed_servers_on_a_pinned_active_link_are_still_listed_as_a_leak() {
+        let net = snapshot(vec![wifi_device(true)]);
+        let profiles = vec![redwood()];
+        let res = resolver(vec![link(4, "wlp7s0", &[PI, "192.168.1.1"], true)]);
+        let leaks = detect_leaks(&LeakInput {
+            net: &net,
+            profiles: &profiles,
+            resolver: Some(&res),
+            pihole: pi(),
+            gateways: &[gw()],
+            mode: Mode::Pihole,
+            primary_iface: Some("wlp7s0"),
+        });
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].detail, "also uses 192.168.1.1 (router)");
     }
 }

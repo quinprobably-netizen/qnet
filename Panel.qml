@@ -34,7 +34,6 @@ Panel {
   Commons.Translations { id: tr; directory: Qt.resolvedUrl("i18n") }
   readonly property var strings: tr
   readonly property var glyphs: Model.GLYPH
-  readonly property int leakShown: Model.LEAKS_SHOWN
 
   // ------------------------------------------------------------- tokens
   // One font, the bar's, at the shell's Style.font sizes; the hierarchy is
@@ -43,6 +42,8 @@ Panel {
   readonly property color fg: bar ? bar.foreground : Commons.Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property int typeTitle: Style.font.heading
+  // The hero's state word: a step under the connection's name above it.
+  readonly property int typeHero: Style.font.title
   readonly property int typeBody: Style.font.subtitle
   readonly property int typeSmall: Style.font.bodySmall
   readonly property color accent: Commons.Color.accent
@@ -74,28 +75,31 @@ Panel {
   readonly property var chip: Model.pauseChip(view)
   readonly property var footer: Model.ipFooter(view)
   readonly property var netList: Model.orderNetworks(view.networks)
-  readonly property var leakList: Model.leakLines(view, pending)
+  readonly property var leaks: Model.leakGroups(view, pending)
 
   // The graphs are rebuilt when their data changes, not on every snapshot.
   property var historySeries: null
-  property var probeLive: ({ runs: [], head: null })
-  property int probeTick: 0
+  // The newest probe's verdict, for the head dot at the graph's right edge.
+  property var probeHead: ({ ok: null, ms: null })
+  // Seconds of history the graph holds (it fits its x-axis to that).
+  property real historySpan: 0
   property string historySig: ""
   property string probeSig: ""
 
   function syncSeries(force) {
     var p = rawState.pihole
-    var hs = Model.seriesSignature(p.history)
+    var now = Date.now() / 1000
+    var span = p.historySpanS > 0 ? p.historySpanS : Model.dataSpan(p.history, now)
+    var hs = Model.seriesSignature(p.history) + ":" + span
     if (force || hs !== historySig) {
       historySig = hs
-      historySeries = Model.historySeries(p.history, Date.now() / 1000, Model.MAX_HISTORY)
+      historySpan = span
+      historySeries = Model.historySeries(p.history, now, span)
     }
     var ps = Model.seriesSignature(p.probes)
     if (force || ps !== probeSig) {
       probeSig = ps
-      var last = p.probes.length ? p.probes[p.probes.length - 1].t : Date.now() / 1000
-      probeLive = Model.pulseRuns(p.probes, last)
-      probeTick += 1
+      probeHead = Model.headState(p.probes)
     }
   }
 
@@ -223,7 +227,7 @@ Panel {
   readonly property var rows: Model.focusRows(view, { confirm: confirm.open }, pending, netList)
   readonly property string rowsSig: rows.map(function(r) { return r.id }).join(",")
   readonly property var headerItems: rows[Math.max(0, Model.rowIndex(rows, "header"))].items
-  readonly property var dnsItems: rows[Math.max(0, Model.rowIndex(rows, "dns"))].items
+  readonly property var heroItems: rows[Math.max(0, Model.rowIndex(rows, "hero"))].items
 
   onRowsChanged: {
     var c = Model.settleCursor(rows, cursor, lastRowIndex)
@@ -315,24 +319,28 @@ Panel {
     var item = row.items[Math.min(cursor.item, row.items.length - 1)]
     var id = row.id
     if (id === "header") {
-      if (item === "portal") openPortal()
+      if (item === "conn") disconnectNet()
+      else if (item === "portal") openPortal()
       else if (item === "qr") summonQr()
       else if (item === "speed") summonSpeed()
       else if (item === "radio") toggleRadio()
-    } else if (id === "setup") setup()
-    else if (id.indexOf("leak:") === 0) fixLeak(parseInt(id.substring(5), 10))
+    } else if (id === "hero") {
+      if (item === "setup") setup()
+      else if (item === "pause") togglePause()
+      else if (item === "admin") openAdmin()
+    } else if (id === "bypass") fixBypass()
+    else if (id === "profiles") pinAll()
     else if (id === "confirm") { if (item === "replace") confirmReplace(); else confirmCancel() }
     else if (id === "dns") {
       if (item === "tile:pihole") tapTile("pihole")
       else if (item === "tile:auto") tapTile("auto")
-      else if (item === "pause") togglePause()
-      else if (item === "admin") openAdmin()
     } else if (id === "scan") scan()
     else if (id.indexOf("net:") === 0) activateNet(parseInt(id.substring(4), 10))
     else if (id === "ip") copyIp()
   }
 
   function deleteKey() {
+    if (cursorActive && cursor.row === "header" && headerItems[cursor.item] === "conn") { disconnectNet(); return }
     if (!cursorActive || cursor.row.indexOf("net:") !== 0) return
     var i = parseInt(cursor.row.substring(4), 10)
     var net = netList[i]
@@ -372,10 +380,10 @@ Panel {
     setPending({ dns: verb })
     runCli(argv, {}, function(res) {
       if (res.ok) {
-        // The verification query went through the system resolver: if the
-        // Pi-hole was asked for and something else answered, say so.
-        var other = Model.verifyMismatch(verb, res, view)
-        if (other !== "") setDnsNote("warning", strings.t("dns.answeredBy").arg(other))
+        // `qnet dns pihole` checks with a canary that must come back blocked;
+        // if it did not, say why.
+        var unverified = Model.verifyNote(verb, res)
+        if (unverified !== "") setDnsNote("warning", strings.t("dns.unverified").arg(unverified))
         return
       }
       setPending({ dns: "" })
@@ -427,19 +435,23 @@ Panel {
     }
   }
 
-  function fixLeak(i) {
-    var line = leakList[i]
-    if (!line || !line.action) return
-    if (line.action.verb === "pin") {
-      setPending({ pinUuid: line.action.uuid })
-      runCli(Model.argvPin(bin, line.action.uuid), {}, function(res) {
-        if (res.ok) return
-        setPending({ pinUuid: "" })
-        setDnsNote("urgent", failureText(Model.failure(res)))
-      })
-    } else {
-      runDns("pihole", false)
-    }
+  // This link's queries can skip the Pi-hole: apply it to the link in use.
+  function fixBypass() { runDns("pihole", false) }
+
+  // Saved profiles that are not in use and would bypass the Pi-hole: pin
+  // them all in one go.
+  function pinAll() {
+    var g = leaks.profiles
+    if (!g || !g.pinnable) return
+    var argv = Model.argvPin(bin, g.uuids)
+    if (!argv) return
+    var ids = g.uuids.join(" ")
+    setPending({ pinUuid: ids })
+    runCli(argv, {}, function(res) {
+      if (res.ok) return
+      setPending({ pinUuid: "" })
+      setDnsNote("urgent", failureText(Model.failure(res)))
+    })
   }
 
   function openAdmin() {
@@ -450,7 +462,8 @@ Panel {
   }
 
   function setup() {
-    var argv = Model.argvTerminal("setup", bin, view.pihole.address)
+    // No address: setup asks for it, so a guess never becomes the pinned one.
+    var argv = Model.argvTerminal("setup", bin)
     if (!argv) return
     Quickshell.execDetached(argv)
     close()
@@ -516,8 +529,10 @@ Panel {
     // open or saved network.
     var started = runCli(argv, { secret: passphrase, timeoutMs: 45000 }, function(res) {
       secretRun = null
-      if (res.ok) return
+      // A connect does not age out; its own answer ends it (a snapshot that
+      // shows the network active may have done so already).
       setPending({ connectId: "" })
+      if (res.ok) return
       var f = Model.failure(res)
       if (f.code === "enterprise") { openNmtui(); return }
       if (f.code === "wrongPassword" && !net.known && net.security !== "open" && net.security !== "owe") {
@@ -533,6 +548,7 @@ Panel {
   }
 
   function disconnectNet() {
+    if (view.link.kind !== "wifi" || pending.disconnecting) return
     setPending({ disconnecting: true })
     runCli(Model.argvDown(bin), {}, function(res) {
       if (res.ok) return

@@ -4,13 +4,14 @@ const assert = require("node:assert/strict")
 const { Model, raw, state, NOW_S } = require("./helpers.js")
 
 const FIXTURES = ["healthy", "paused", "fallback", "unreachable", "unconfigured", "leaks", "bypassed",
-  "portal", "offline", "radio-off", "custom", "api-auth", "ethernet", "markup"]
+  "portal", "offline", "radio-off", "custom", "api-auth", "ethernet", "markup", "partial", "ethernet-bypassed",
+  "degraded", "not-blocking", "none", "unknown"]
 
 test("every fixture normalises and keeps SPEC's shape", () => {
   for (const name of FIXTURES) {
     const s = state(name)
     assert.ok(["wifi", "ethernet", "none"].includes(s.link.kind), name)
-    assert.ok(["pihole", "fallback", "auto", "custom"].includes(s.dns.mode), name)
+    assert.ok(["pihole", "fallback", "auto", "custom", "none", "unknown"].includes(s.dns.mode), name)
     assert.ok(Array.isArray(s.networks) && s.networks.length <= Model.MAX_NETWORKS, name)
     assert.ok(s.pihole.history.length <= Model.MAX_HISTORY, name)
     assert.ok(s.pihole.probes.length <= Model.MAX_PROBES, name)
@@ -29,10 +30,14 @@ test("garbage in, a usable empty state out", () => {
   for (const bad of [null, undefined, 7, "x", [], { link: 5, dns: [], pihole: "no", networks: "no" }]) {
     const s = Model.normalizeState(bad)
     assert.equal(s.link.kind, "none")
-    assert.equal(s.dns.mode, "auto")
+    assert.equal(s.dns.mode, "unknown", "nothing is known, so nothing is claimed")
+    assert.equal(s.dns.bypassed, false)
     assert.deepEqual(s.networks, [])
     assert.equal(s.pihole.configured, false)
     assert.equal(s.pihole.api, "unconfigured")
+    assert.equal(s.pihole.health, "unknown")
+    assert.equal(s.pihole.canaryBlocked, null)
+    assert.equal(s.link.gatewayMs, null)
   }
 })
 
@@ -123,6 +128,12 @@ test("seq 0 is a valid first snapshot", () => {
   assert.equal(Model.parseStateLine(JSON.stringify(r), -1).kind, "state")
 })
 
+test("the heartbeat is an hb line: proof of life, never applied", () => {
+  assert.equal(Model.parseStateLine('{"type":"hb","seq":500}', 1).kind, "hb")
+  assert.equal(Model.parseStateLine('{"type":"hb","seq":0}', 99).kind, "hb", "not subject to the seq check")
+  assert.equal(Model.parseStateLine('{"type":"hb"}', -1).kind, "hb")
+})
+
 test("heartbeats and other types are not states; junk is bad", () => {
   assert.equal(Model.parseStateLine('{"type":"heartbeat","seq":500}', 1).kind, "other")
   assert.equal(Model.parseStateLine("not json", 1).kind, "bad")
@@ -145,4 +156,77 @@ test("fixture clock matches the newest history bucket", () => {
   const s = state("healthy")
   const last = s.pihole.history[s.pihole.history.length - 1]
   assert.ok(NOW_S - last.t >= 0 && NOW_S - last.t < 600)
+})
+
+// ---- the round-2 contract ------------------------------------------------
+
+test("dns.mode takes none and unknown; anything else it does not know is unknown", () => {
+  const r = raw("healthy")
+  for (const m of ["pihole", "fallback", "auto", "custom", "none", "unknown"]) {
+    r.dns.mode = m
+    assert.equal(Model.normalizeState(r).dns.mode, m)
+  }
+  r.dns.mode = "dhcp"
+  assert.equal(Model.normalizeState(r).dns.mode, "unknown")
+})
+
+test("bypassed, resolvedFallback, health, canaryBlocked, selfQueries, historySpanS, gatewayMs and detected", () => {
+  const s = state("partial")
+  assert.equal(s.pihole.health, "ok")
+  assert.equal(s.pihole.canaryBlocked, true)
+  assert.equal(s.pihole.historySpanS, 5400)
+  assert.equal(s.pihole.today.selfQueries, 31)
+  assert.equal(s.link.gatewayMs, 4.2)
+  assert.equal(state("ethernet-bypassed").dns.bypassed, true)
+  assert.equal(state("none").dns.resolvedFallback, "9.9.9.9")
+  assert.equal(state("healthy").dns.resolvedFallback, "")
+  assert.equal(state("unconfigured").pihole.detected, "192.168.1.153")
+  assert.equal(state("unconfigured").pihole.address, "", "the address comes only from config")
+  assert.equal(state("degraded").pihole.health, "degraded")
+  assert.equal(state("degraded").pihole.reachable, true, "degraded still answers")
+  assert.equal(state("unknown").pihole.health, "unknown")
+  assert.equal(state("unreachable").pihole.reachable, false)
+})
+
+test("health and reachable agree: health wins when given, reachable stands in when not", () => {
+  const r = raw("healthy")
+  r.pihole.health = "unreachable"
+  r.pihole.reachable = true
+  assert.equal(Model.normalizeState(r).pihole.reachable, false)
+  delete r.pihole.health
+  r.pihole.reachable = false
+  const s = Model.normalizeState(r)
+  assert.equal(s.pihole.health, "unreachable")
+  r.pihole.reachable = true
+  assert.equal(Model.normalizeState(r).pihole.health, "ok")
+})
+
+test("the new fields are bounded", () => {
+  const r = raw("healthy")
+  r.link.gatewayMs = -5
+  r.pihole.canaryBlocked = "yes"
+  r.pihole.historySpanS = 99999999
+  r.pihole.detected = "$(reboot)"
+  r.dns.resolvedFallback = "9.9.9.9; reboot"
+  r.pihole.today.selfQueries = -3
+  const s = Model.normalizeState(r)
+  assert.equal(s.link.gatewayMs, null)
+  assert.equal(s.pihole.canaryBlocked, null)
+  assert.equal(s.pihole.historySpanS, 86400)
+  assert.equal(s.pihole.detected, "")
+  assert.equal(s.dns.resolvedFallback, "")
+  assert.equal(s.pihole.today.selfQueries, 0)
+})
+
+test("the restart counter starts over only after 30 s of uptime", () => {
+  assert.equal(Model.restartAttempt(3, 29999), 3, "a child that spoke and died quickly keeps climbing")
+  assert.equal(Model.restartAttempt(3, 30000), 0)
+  assert.equal(Model.restartAttempt(3, 120000), 0)
+  assert.equal(Model.restartAttempt(0, 10), 0)
+  assert.equal(Model.restartAttempt(-2, 10), 0)
+})
+
+test("Model.js carries no raw bidi or control characters", () => {
+  const src = require("fs").readFileSync(require("path").join(__dirname, "..", "Model.js"), "utf8")
+  assert.doesNotMatch(src, /[\u202a-\u202e\u2066-\u2069\u200e\u200f\u0000-\u0008\u000b\u000c\u000e-\u001f]/)
 })

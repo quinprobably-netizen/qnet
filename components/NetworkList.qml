@@ -12,7 +12,7 @@ Column {
   id: list
 
   required property var hub
-  readonly property real rowHeight: Style.space(40)
+  readonly property real rowHeight: Style.space(36)
   readonly property real maxHeight: rowHeight * hub.listRows
   property alias flick: flick
 

@@ -1,0 +1,6 @@
+# Keep build output out of the plugin tree: the shell reloads the plugin on
+# every file change under ~/.config/omarchy/plugins/. The path is relative to
+# this file's parent (backend/), i.e. ~/.cache/qnet/target. install.sh sets
+# CARGO_TARGET_DIR itself (honouring XDG_CACHE_HOME), which wins over this.
+[build]
+target-dir = "../../../../../.cache/qnet/target"

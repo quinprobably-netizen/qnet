@@ -7,8 +7,9 @@ use std::net::IpAddr;
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::dnsmodel::{self, classify, detect_leaks, detect_mode, LeakInput};
+use crate::dnsmodel::{self, classify, detect_leaks, detect_mode, is_bypassed, LeakInput, Mode};
 use crate::failover::Failover;
+use crate::ledger::Ledger;
 use crate::net::*;
 use crate::pihole::{Blocking, BlockingState, Bucket, Summary};
 use crate::util::round1;
@@ -32,6 +33,12 @@ pub struct ApiView {
     pub history: Vec<Bucket>,
     /// Blocking state from the API with the unix time it was read.
     pub blocking: Option<(Blocking, f64)>,
+    /// Our own queries (total, blocked) as of the moment `today` was read.
+    /// Subtracting the live tally instead would make the numbers dip between
+    /// polls, since the Pi-hole's reading does not know about newer probes.
+    pub own_today: (u64, u64),
+    /// The tally as of the moment `history` was read.
+    pub own_history: Ledger,
 }
 
 impl ApiView {
@@ -41,6 +48,8 @@ impl ApiView {
             today: None,
             history: vec![],
             blocking: None,
+            own_today: (0, 0),
+            own_history: Ledger::default(),
         }
     }
     pub fn configured() -> Self {
@@ -62,9 +71,18 @@ pub struct Inputs<'a> {
     pub resolver: Option<&'a ResolverSnapshot>,
     pub cfg: &'a Config,
     /// Configured address, or an auto-detected one that has been seen
-    /// blocking the canary.
+    /// blocking the canary. Drives roles, modes and leaks; it is *not* what
+    /// is shown as `pihole.address`.
     pub pihole: Option<IpAddr>,
+    /// A LAN Pi-hole seen blocking the canary while none is configured.
+    pub detected: Option<IpAddr>,
+    /// A candidate exists but no probe has answered for it yet.
+    pub detect_pending: bool,
     pub probes: &'a VecDeque<ProbeRec>,
+    /// Latest upstream-resolution check: Some(false) means SERVFAIL/timeout.
+    pub upstream_ok: Option<bool>,
+    /// Gateway ICMP round trip, only while the panel is open.
+    pub gateway_ms: Option<f64>,
     pub api: &'a ApiView,
     pub failover: &'a Failover,
     pub scan: ScanView,
@@ -89,6 +107,7 @@ pub struct LinkOut {
     pub bitrate_mbps: u32,
     pub ip4: String,
     pub gateway: String,
+    pub gateway_ms: Option<f64>,
     pub connectivity: &'static str,
     pub portal_url: String,
 }
@@ -155,13 +174,20 @@ pub struct DnsOut {
     pub leaks: Vec<LeakOut>,
     pub failover: FailoverOut,
     pub manual_override: bool,
+    /// A Pi-hole is configured and queries on the primary link can skip it.
+    pub bypassed: bool,
+    /// First of resolved's compiled FallbackDNS servers; only for mode "none".
+    pub resolved_fallback: String,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct TodayOut {
     pub total: u64,
     pub blocked: u64,
     pub percent: f64,
+    /// Queries qnet's own probes sent, already taken out of the numbers.
+    pub self_queries: u64,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -190,8 +216,17 @@ pub struct PiholeOut {
     pub blocking: &'static str,
     pub pause_remaining_s: u64,
     pub api: String,
+    /// ok | degraded | unreachable | unknown
+    pub health: &'static str,
+    /// The last canary answered 0.0.0.0 (true) or did not (false).
+    pub canary_blocked: Option<bool>,
     pub today: TodayOut,
     pub history: Vec<BucketOut>,
+    /// Seconds of non-empty history (for fitting the graph's x axis).
+    pub history_span_s: u64,
+    /// A LAN Pi-hole seen blocking the canary while none is configured.
+    /// Display only; never used as the address.
+    pub detected: String,
     pub probes: Vec<ProbeOut>,
 }
 
@@ -225,7 +260,7 @@ fn gateways(net: Option<&NetSnapshot>) -> Vec<IpAddr> {
     .unwrap_or_default()
 }
 
-pub fn build_link(net: Option<&NetSnapshot>, profiles: &[Profile]) -> LinkOut {
+pub fn build_link(net: Option<&NetSnapshot>, profiles: &[Profile], gateway_ms: Option<f64>) -> LinkOut {
     let mut out = LinkOut {
         kind: "none",
         device: String::new(),
@@ -237,6 +272,7 @@ pub fn build_link(net: Option<&NetSnapshot>, profiles: &[Profile]) -> LinkOut {
         bitrate_mbps: 0,
         ip4: String::new(),
         gateway: String::new(),
+        gateway_ms: None,
         connectivity: Connectivity::Unknown.as_str(),
         portal_url: String::new(),
     };
@@ -252,6 +288,7 @@ pub fn build_link(net: Option<&NetSnapshot>, profiles: &[Profile]) -> LinkOut {
     out.device = dev.iface.clone();
     out.ip4 = dev.ip4.map(|a| a.to_string()).unwrap_or_default();
     out.gateway = dev.gateway.map(|a| a.to_string()).unwrap_or_default();
+    out.gateway_ms = gateway_ms.map(round1);
     if let Some(a) = &dev.active {
         out.connection = a.id.clone();
         out.uuid = a.uuid.clone();
@@ -346,7 +383,7 @@ fn reachable(probes: &VecDeque<ProbeRec>) -> bool {
 }
 
 pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
-    let link = build_link(i.net, i.profiles);
+    let link = build_link(i.net, i.profiles, i.gateway_ms);
     let networks = build_networks(i.net, i.profiles);
 
     let primary = i.net.and_then(|n| n.primary_device()).filter(|d| d.is_up());
@@ -357,13 +394,18 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
     let primary_link = primary.and_then(|d| i.resolver.and_then(|r| r.link(d.ifindex)));
     let link_servers: Vec<IpAddr> = primary_link.map(|l| l.servers.clone()).unwrap_or_default();
 
-    let mode = detect_mode(
+    let mut mode = detect_mode(
         primary.is_some(),
         i.failover.active(),
         &link_servers,
         primary_profile,
         i.pihole,
     );
+    // While a Pi-hole candidate is still being checked, "custom" would be a
+    // guess that may be wrong in a moment: say so instead.
+    if i.detect_pending && mode == Mode::Custom {
+        mode = Mode::Unknown;
+    }
 
     // Servers resolved will use, per link.
     let mut servers: Vec<ServerOut> = Vec::new();
@@ -429,6 +471,15 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
     };
 
     let configured = i.cfg.pihole.is_some();
+    let configured_addr = i.cfg.pihole.as_ref().map(|p| p.address);
+    let bypassed = match configured_addr {
+        Some(p) if primary.is_some() => is_bypassed(mode, &link_servers, primary_profile, p),
+        _ => false,
+    };
+    let resolved_fallback = match (mode, i.resolver) {
+        (Mode::None, Some(r)) if primary.is_some() => r.fallback.first().map(|a| a.to_string()).unwrap_or_default(),
+        _ => String::new(),
+    };
     let dns = DnsOut {
         mode: mode.as_str(),
         mode_source: if i.failover.active() { "runtime-failover" } else { "profile" },
@@ -442,6 +493,8 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
             reason: i.failover.reason().to_string(),
         },
         manual_override,
+        bypassed,
+        resolved_fallback,
     };
 
     // Pi-hole.
@@ -467,36 +520,66 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
     };
     let last = i.probes.back();
     let latency_ms = last.filter(|p| p.ok).and_then(|p| p.ms).map(round1);
-    let address = i.pihole.map(|a| a.to_string()).unwrap_or_default();
-    let admin_url = if i.pihole.is_some() {
-        match i.pihole {
-            Some(IpAddr::V6(a)) => format!("https://[{a}]/admin/"),
-            _ => format!("https://{address}/admin/"),
-        }
-    } else {
-        String::new()
+    // Address and admin URL come from the configuration and nothing else.
+    let address = configured_addr.map(|a| a.to_string()).unwrap_or_default();
+    let admin_url = match configured_addr {
+        Some(IpAddr::V6(a)) => format!("https://[{a}]/admin/"),
+        Some(a) => format!("https://{a}/admin/"),
+        None => String::new(),
     };
-    let today = i.api.today.unwrap_or(Summary { total: 0, blocked: 0, percent: 0.0 });
+    let is_reachable = i.pihole.is_some() && reachable(i.probes);
+    let health = if i.pihole.is_none() || i.probes.is_empty() {
+        "unknown"
+    } else if !is_reachable {
+        "unreachable"
+    } else if i.upstream_ok == Some(false) {
+        "degraded"
+    } else {
+        "ok"
+    };
+    let canary_blocked = if i.pihole.is_some() { last_ok.map(|p| p.blocked) } else { None };
+
+    // Our own probes are in Pi-hole's numbers; take them out.
+    let raw = i.api.today.unwrap_or(Summary { total: 0, blocked: 0, percent: 0.0 });
+    let (own_total, own_blocked) = i.api.own_today;
+    let have_today = i.api.today.is_some();
+    let total = raw.total.saturating_sub(own_total);
+    let blocked = raw.blocked.saturating_sub(own_blocked);
+    let percent = if have_today && total > 0 { blocked as f64 / total as f64 * 100.0 } else { 0.0 };
+    let history: Vec<BucketOut> = i
+        .api
+        .history
+        .iter()
+        .map(|b| {
+            let (ot, ob) = i.api.own_history.bucket(b.t);
+            BucketOut {
+                t: b.t,
+                total: b.total.saturating_sub(ot),
+                blocked: b.blocked.saturating_sub(ob),
+            }
+        })
+        .collect();
+    let history_span_s = history_span(&history);
     let pihole = PiholeOut {
         configured,
         address,
         admin_url,
-        reachable: i.pihole.is_some() && reachable(i.probes),
+        reachable: is_reachable,
         latency_ms,
         blocking: blocking.as_str(),
         pause_remaining_s,
         api: if configured { i.api.status.clone() } else { "unconfigured".into() },
+        health,
+        canary_blocked,
         today: TodayOut {
-            total: today.total,
-            blocked: today.blocked,
-            percent: round1(today.percent),
+            total,
+            blocked,
+            percent: round1(percent),
+            self_queries: if have_today { own_total.min(raw.total) } else { 0 },
         },
-        history: i
-            .api
-            .history
-            .iter()
-            .map(|b| BucketOut { t: b.t, total: b.total, blocked: b.blocked })
-            .collect(),
+        history,
+        history_span_s,
+        detected: i.detected.map(|a| a.to_string()).unwrap_or_default(),
         probes: i
             .probes
             .iter()
@@ -529,6 +612,17 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
         error: i.error.to_string(),
         heartbeat,
     }
+}
+
+/// Seconds covered by the history from its first non-empty bucket to the end
+/// of the last one, at most a day. Pi-hole zero-fills the time before it
+/// started recording, which must not stretch the graph.
+pub fn history_span(history: &[BucketOut]) -> u64 {
+    const BUCKET_S: i64 = 600;
+    let (Some(first), Some(last)) = (history.iter().find(|b| b.total > 0), history.last()) else {
+        return 0;
+    };
+    (last.t + BUCKET_S - first.t).clamp(0, 24 * 3600) as u64
 }
 
 /// Fields that tick with the clock and must not, on their own, cause a new
@@ -565,6 +659,10 @@ mod tests {
         probes: VecDeque<ProbeRec>,
         api: ApiView,
         fo: Failover,
+        upstream_ok: Option<bool>,
+        gateway_ms: Option<f64>,
+        detected: Option<IpAddr>,
+        detect_pending: bool,
     }
 
     fn fixture() -> Fixture {
@@ -589,8 +687,14 @@ mod tests {
                     Blocking { state: BlockingState::Enabled, timer: None },
                     1_794_000_004.0,
                 )),
+                own_today: (0, 0),
+                own_history: Ledger::default(),
             },
             fo: Failover::new(),
+            upstream_ok: Some(true),
+            gateway_ms: Some(3.84),
+            detected: None,
+            detect_pending: false,
         }
     }
 
@@ -602,7 +706,11 @@ mod tests {
                 resolver: Some(&f.resolver),
                 cfg: &f.cfg,
                 pihole: f.cfg.pihole.as_ref().map(|p| p.address),
+                detected: f.detected,
+                detect_pending: f.detect_pending,
                 probes: &f.probes,
+                upstream_ok: f.upstream_ok,
+                gateway_ms: f.gateway_ms,
                 api: &f.api,
                 failover: &f.fo,
                 scan: ScanView { running: false },
@@ -630,7 +738,7 @@ mod tests {
                 "kind": "wifi", "device": "wlp7s0", "connection": "Redwood",
                 "uuid": U_WIFI, "ssid": "Redwood", "signal": 72, "band": "5 GHz",
                 "bitrateMbps": 866, "ip4": "192.168.1.242", "gateway": "192.168.1.1",
-                "connectivity": "full", "portalUrl": ""
+                "gatewayMs": 3.8, "connectivity": "full", "portalUrl": ""
             },
             "radio": {"wifiEnabled": true, "hwEnabled": true},
             "networks": [
@@ -662,14 +770,19 @@ mod tests {
                      "detail": "uses router DNS (automatic)"}
                 ],
                 "failover": {"enabled": true, "fallback": "router", "active": false, "since": 0, "reason": ""},
-                "manualOverride": false
+                "manualOverride": false,
+                "bypassed": false,
+                "resolvedFallback": ""
             },
             "pihole": {
                 "configured": true, "address": "192.168.1.153",
                 "adminUrl": "https://192.168.1.153/admin/", "reachable": true,
                 "latencyMs": 3.0, "blocking": "enabled", "pauseRemainingS": 0, "api": "ok",
-                "today": {"total": 1204, "blocked": 164, "percent": 13.6},
+                "health": "ok", "canaryBlocked": true,
+                "today": {"total": 1204, "blocked": 164, "percent": 13.6, "selfQueries": 0},
                 "history": [{"t": 1794034800, "total": 40, "blocked": 6}],
+                "historySpanS": 600,
+                "detected": "",
                 "probes": [
                     {"t": 1794000000.0, "ok": true, "ms": 3.1, "blocked": true},
                     {"t": 1794000005.0, "ok": true, "ms": 3.0, "blocked": true}
@@ -950,7 +1063,11 @@ mod tests {
                     resolver: Some(&f.resolver),
                     cfg: &f.cfg,
                     pihole,
+                    detected: None,
+                    detect_pending: false,
                     probes: &VecDeque::new(),
+                    upstream_ok: None,
+                    gateway_ms: None,
                     api: &ApiView::unconfigured(),
                     failover: &f.fo,
                     scan: ScanView::default(),
@@ -1037,5 +1154,204 @@ mod tests {
         f.cfg.pihole = Some(PiholeCfg { ..f.cfg.pihole.clone().unwrap() });
         f.cfg.failover.enabled = true;
         assert!(build(&f).dns.failover.enabled);
+    }
+
+    #[test]
+    fn bypassed_dns_none_unknown_and_fallback_fields() {
+        // Healthy: not bypassed.
+        let f = fixture();
+        let st = build(&f);
+        assert!(!st.dns.bypassed);
+        assert_eq!(st.dns.resolved_fallback, "");
+
+        // Pi-hole in use, but the router answers too: still "pihole", bypassed.
+        let mut f = fixture();
+        f.resolver.links[0].servers = vec![fx::pi(), fx::gw()];
+        let st = build(&f);
+        assert_eq!(st.dns.mode, "pihole");
+        assert!(st.dns.bypassed);
+
+        // Unpinned profile (automatic, DHCP handing out the Pi-hole).
+        let mut f = fixture();
+        f.profiles[0].dns = fx::dns_auto();
+        let st = build(&f);
+        assert_eq!(st.dns.mode, "pihole");
+        assert!(st.dns.bypassed, "Pin has something to fix");
+
+        // Deliberate automatic mode on the router is not a bypass.
+        let mut f = fixture();
+        f.profiles[0].dns = fx::dns_auto();
+        f.resolver.links[0].servers = vec![fx::gw()];
+        let st = build(&f);
+        assert_eq!(st.dns.mode, "auto");
+        assert!(!st.dns.bypassed);
+
+        // Link up, no DNS servers at all: mode none, resolved's fallback shown.
+        let mut f = fixture();
+        f.resolver.links.clear();
+        let st = build(&f);
+        assert_eq!(st.dns.mode, "none");
+        assert_eq!(st.dns.resolved_fallback, "9.9.9.9");
+        assert!(!st.dns.bypassed);
+
+        // No link: no fallback line either.
+        let mut f = fixture();
+        f.net.devices[0].state = 30;
+        f.net.devices[0].active = None;
+        f.net.primary_conn = None;
+        f.resolver.links.clear();
+        let st = build(&f);
+        assert_eq!(st.dns.mode, "none");
+        assert_eq!(st.dns.resolved_fallback, "");
+
+        // Unconfigured: never bypassed, and the pending candidate reads unknown.
+        let mut f = fixture();
+        f.cfg.pihole = None;
+        f.resolver.links[0].servers = vec![fx::pi()];
+        f.detect_pending = true;
+        let st = {
+            let i = Inputs {
+                net: Some(&f.net),
+                profiles: &f.profiles,
+                resolver: Some(&f.resolver),
+                cfg: &f.cfg,
+                pihole: None,
+                detected: None,
+                detect_pending: true,
+                probes: &f.probes,
+                upstream_ok: None,
+                gateway_ms: None,
+                api: &f.api,
+                failover: &f.fo,
+                scan: ScanView::default(),
+                error: "",
+                now_unix: 1_794_000_006.0,
+                net_age_s: 0.0,
+            };
+            build_state(&i, 1, false)
+        };
+        assert_eq!(st.dns.mode, "unknown");
+        assert!(!st.dns.bypassed);
+    }
+
+    #[test]
+    fn health_degraded_and_unreachable() {
+        let mut f = fixture();
+        f.upstream_ok = Some(false);
+        let st = build(&f);
+        assert_eq!(st.pihole.health, "degraded");
+        assert!(st.pihole.reachable);
+        f.probes.push_back(ProbeRec { t: 1_794_000_010.0, ok: false, ms: None, blocked: false });
+        f.probes.push_back(ProbeRec { t: 1_794_000_015.0, ok: false, ms: None, blocked: false });
+        assert_eq!(build(&f).pihole.health, "unreachable");
+        f.probes.clear();
+        assert_eq!(build(&f).pihole.health, "unknown");
+        assert_eq!(build(&f).pihole.canary_blocked, None);
+    }
+
+    #[test]
+    fn canary_blocked_reflects_the_last_answered_probe() {
+        let mut f = fixture();
+        assert_eq!(build(&f).pihole.canary_blocked, Some(true));
+        f.probes.push_back(ProbeRec { t: 1_794_000_010.0, ok: true, ms: Some(3.0), blocked: false });
+        assert_eq!(build(&f).pihole.canary_blocked, Some(false), "paused");
+        // A probe that got no answer says nothing new.
+        f.probes.push_back(ProbeRec { t: 1_794_000_015.0, ok: false, ms: None, blocked: false });
+        assert_eq!(build(&f).pihole.canary_blocked, Some(false));
+    }
+
+    #[test]
+    fn address_and_admin_url_come_from_the_config_only() {
+        let mut f = fixture();
+        f.cfg.pihole = None;
+        let st = {
+            let i = Inputs {
+                net: Some(&f.net),
+                profiles: &f.profiles,
+                resolver: Some(&f.resolver),
+                cfg: &f.cfg,
+                pihole: Some(fx::pi()), // a confirmed detection drives the model
+                detected: Some(fx::pi()),
+                detect_pending: false,
+                probes: &f.probes,
+                upstream_ok: None,
+                gateway_ms: None,
+                api: &ApiView::unconfigured(),
+                failover: &f.fo,
+                scan: ScanView::default(),
+                error: "",
+                now_unix: 1_794_000_006.0,
+                net_age_s: 0.0,
+            };
+            build_state(&i, 1, false)
+        };
+        assert_eq!(st.pihole.address, "");
+        assert_eq!(st.pihole.admin_url, "");
+        assert_eq!(st.pihole.detected, "192.168.1.153");
+        assert_eq!(st.dns.mode, "pihole", "the detection still drives the truth shown");
+        assert!(!st.pihole.configured);
+        // With a config the address is the configured one.
+        let st = build(&fixture());
+        assert_eq!(st.pihole.address, "192.168.1.153");
+        assert_eq!(st.pihole.admin_url, "https://192.168.1.153/admin/");
+        assert_eq!(st.pihole.detected, "");
+    }
+
+    #[test]
+    fn own_queries_leave_today_and_the_history_buckets() {
+        let mut f = fixture();
+        f.api.history = vec![
+            Bucket { t: 1_794_034_200, total: 0, blocked: 0 },
+            Bucket { t: 1_794_034_800, total: 40, blocked: 6 },
+            Bucket { t: 1_794_035_400, total: 12, blocked: 3 },
+        ];
+        // 10 of our queries (all blocked) landed in the last bucket, plus 2
+        // plain ones; 4 in the middle one.
+        let mut ledger = Ledger::default();
+        ledger.add(1_794_035_450.0, 10, 10);
+        ledger.add(1_794_035_460.0, 2, 0);
+        ledger.add(1_794_034_850.0, 4, 0);
+        f.api.own_today = ledger.sums(1_794_035_500.0);
+        f.api.own_history = ledger.clone();
+        let st = build(&f);
+        let h = &st.pihole.history;
+        assert_eq!((h[0].total, h[0].blocked), (0, 0));
+        assert_eq!((h[1].total, h[1].blocked), (36, 6));
+        assert_eq!((h[2].total, h[2].blocked), (0, 0), "saturates instead of going negative");
+        assert_eq!(st.pihole.today.self_queries, 16);
+        assert_eq!(st.pihole.today.total, 1204 - 16);
+        assert_eq!(st.pihole.today.blocked, 164 - 10);
+        let want = (164.0 - 10.0) / (1204.0 - 16.0) * 100.0;
+        assert!((st.pihole.today.percent - want).abs() < 0.06);
+    }
+
+    #[test]
+    fn history_span_counts_from_the_first_non_empty_bucket() {
+        let b = |t: i64, n: u64| BucketOut { t, total: n, blocked: 0 };
+        assert_eq!(history_span(&[]), 0);
+        assert_eq!(history_span(&[b(0, 0), b(600, 0)]), 0, "all empty");
+        // Zero-filled before Pi-hole started recording.
+        assert_eq!(history_span(&[b(0, 0), b(600, 0), b(1200, 5), b(1800, 7)]), 1200);
+        assert_eq!(history_span(&[b(1800, 7)]), 600);
+        // Never more than a day.
+        let long: Vec<BucketOut> = (0..200).map(|i| b(i * 600, 1)).collect();
+        assert_eq!(history_span(&long), 86_400);
+        // The zero-filled stretch in front is not counted.
+        let mut f = fixture();
+        f.api.history = vec![
+            Bucket { t: 1_794_030_000, total: 0, blocked: 0 },
+            Bucket { t: 1_794_034_800, total: 40, blocked: 6 },
+            Bucket { t: 1_794_035_400, total: 12, blocked: 3 },
+        ];
+        assert_eq!(build(&f).pihole.history_span_s, 1_200);
+    }
+
+    #[test]
+    fn gateway_latency_is_rounded_and_optional() {
+        let mut f = fixture();
+        f.gateway_ms = Some(12.345);
+        assert_eq!(build(&f).link.gateway_ms, Some(12.3));
+        f.gateway_ms = None;
+        assert_eq!(to_json(&build(&f))["link"]["gatewayMs"], Value::Null);
     }
 }

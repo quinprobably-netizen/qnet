@@ -12,6 +12,7 @@
     "bitrateMbps": 866,
     "ip4": "192.168.1.242",
     "gateway": "192.168.1.1",
+    "gatewayMs": 4.2,
     "connectivity": "full",
     "portalUrl": ""
   },
@@ -121,21 +122,28 @@
       "since": 0,
       "reason": ""
     },
-    "manualOverride": false
+    "manualOverride": false,
+    "bypassed": false,
+    "resolvedFallback": ""
   },
   "pihole": {
     "configured": false,
     "address": "",
     "adminUrl": "",
+    "detected": "192.168.1.153",
     "reachable": false,
+    "health": "unknown",
+    "canaryBlocked": null,
     "latencyMs": null,
     "blocking": "unknown",
     "pauseRemainingS": 0,
     "api": "unconfigured",
+    "historySpanS": 0,
     "today": {
       "total": 0,
       "blocked": 0,
-      "percent": 0
+      "percent": 0,
+      "selfQueries": 0
     },
     "history": [],
     "probes": []

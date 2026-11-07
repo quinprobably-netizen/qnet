@@ -6,8 +6,9 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 use crate::https::{HttpError, HttpsClient};
 
@@ -164,7 +165,18 @@ fn error_message(v: &Value) -> String {
         .to_string()
 }
 
-pub type PasswordFn = Box<dyn FnMut() -> Result<String, ApiError> + Send>;
+pub type PasswordFn = Box<dyn FnMut() -> Result<Zeroizing<String>, ApiError> + Send>;
+
+/// A session id we are willing to put in a header and in a file: visible
+/// ASCII only, bounded.
+pub fn sid_is_sane(sid: &str) -> bool {
+    !sid.is_empty() && sid.len() <= 512 && sid.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+#[derive(Serialize)]
+struct LoginBody<'a> {
+    password: &'a str,
+}
 
 pub struct Pihole {
     http: HttpsClient,
@@ -207,8 +219,7 @@ impl Pihole {
             return None;
         }
         let sid = v.get("sid").and_then(Value::as_str)?;
-        (!sid.is_empty() && sid.len() <= 512 && !sid.bytes().any(|b| b < 0x20 || b == 0x7f))
-            .then(|| sid.to_string())
+        sid_is_sane(sid).then(|| sid.to_string())
     }
 
     fn save_sid(&self) {
@@ -257,11 +268,12 @@ impl Pihole {
 
     /// Log in with an explicit password (setup uses the web password).
     pub fn login_with(&mut self, password: &str) -> Result<(), ApiError> {
-        let body = serde_json::to_vec(&json!({ "password": password }))
-            .map_err(|e| ApiError::Other(e.to_string()))?;
+        let body = Zeroizing::new(
+            serde_json::to_vec(&LoginBody { password }).map_err(|e| ApiError::Other(e.to_string()))?,
+        );
         // Never reuse a connection for the login POST.
         self.http.close();
-        let r = self.http.request("POST", "/api/auth", &[], Some(&body))?;
+        let r = self.http.request("POST", "/api/auth", &[], Some(&body[..]))?;
         let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
         match r.status {
             200 => {
@@ -272,7 +284,7 @@ impl Pihole {
                     .unwrap_or(false);
                 let sid = session.and_then(|s| s.get("sid")).and_then(Value::as_str);
                 match (valid, sid) {
-                    (true, Some(sid)) if !sid.is_empty() && sid.len() <= 512 => {
+                    (true, Some(sid)) if sid_is_sane(sid) => {
                         self.sid = Some(sid.to_string());
                         self.save_sid();
                         Ok(())
@@ -288,7 +300,7 @@ impl Pihole {
 
     fn login(&mut self) -> Result<(), ApiError> {
         let pw = (self.password)()?;
-        self.login_with(&pw)
+        self.login_with(pw.as_str())
     }
 
     fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value), ApiError> {
@@ -417,7 +429,7 @@ mod tests {
     }
 
     fn pw(s: &'static str) -> PasswordFn {
-        Box::new(move || Ok(s.to_string()))
+        Box::new(move || Ok(Zeroizing::new(s.to_string())))
     }
 
     const LOGIN_OK: &str = r#"{"session":{"valid":true,"totp":false,"sid":"SID-1","csrf":"c","validity":300},"took":0.01}"#;
@@ -710,5 +722,28 @@ mod tests {
         assert!(c.resume_session());
         assert!(path.exists());
         std::mem::forget(c); // a SIGKILL would not run Drop either
+    }
+
+    #[test]
+    fn a_session_id_with_control_characters_is_refused_and_never_saved() {
+        for bad in [
+            r#"{"session":{"valid":true,"sid":"abc\ndef","validity":300}}"#,
+            r#"{"session":{"valid":true,"sid":"abc def","validity":300}}"#,
+            r#"{"session":{"valid":true,"sid":"abc\u0000def","validity":300}}"#,
+            r#"{"session":{"valid":true,"sid":"","validity":300}}"#,
+        ] {
+            let srv = serve(1, move |_, _| Some(ok_json(bad)));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("qnet").join("sid");
+            let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap().with_sid_file(path.clone());
+            assert!(matches!(p.summary(), Err(ApiError::Auth(_))), "{bad}");
+            assert!(!p.has_session());
+            assert!(!path.exists(), "nothing written for {bad}");
+        }
+        assert!(sid_is_sane("Abc123+/=_-"));
+        assert!(!sid_is_sane("a b"));
+        assert!(!sid_is_sane("a\tb"));
+        assert!(!sid_is_sane(&"a".repeat(513)));
+        assert!(!sid_is_sane("é"));
     }
 }

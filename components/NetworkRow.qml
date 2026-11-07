@@ -3,15 +3,14 @@ import qs.Ui
 import qs.Commons
 import "../Model.js" as Model
 
-// One network. A glyph for its signal (accent for the one in use), its name,
-// and on the right a caption: "Connected", "Open" (only open networks are
-// marked), "802.1X", or what is happening ("Connecting…", an error in
-// urgent). There is no lock on the others. Under the cursor or the pointer
-// the active row's caption becomes "Disconnect", which is what a press does.
+// One network that is not the one in use (that is the header's). A glyph for
+// its signal, its name, and on the right a dim caption: "Saved", "Open" (an
+// unsaved open network is marked), "802.1X", or what is happening
+// ("Connecting…", an error in urgent). There is no lock on the others.
 //
-//   press / Enter     active: disconnect; known or open: connect; secured and
-//                     unknown: the passphrase row opens under this one;
-//                     802.1X that is not saved: nmtui in a terminal
+//   press / Enter     saved or open: connect; secured and unknown: the
+//                     passphrase row opens under this one; 802.1X that is not
+//                     saved: nmtui in a terminal
 //   right-click / Delete   known networks: Forget, asked again in place
 //                     ("Forget  Cancel"; Enter forgets, Esc cancels)
 //
@@ -29,20 +28,16 @@ Item {
   readonly property bool armed: net.uuid !== "" && hub.armedUuid === net.uuid
   readonly property bool cursor: hub.has("net:" + index)
   readonly property var caption: Model.rowCaption(net, hub.captionContext)
-  readonly property bool busy: caption.key === "connecting" || caption.key === "disconnecting" || caption.key === "forgetting"
-  readonly property bool showDisconnect: net.active && (cursor || surface.hover) && !busy && caption.key !== "text" && !armed
 
   readonly property string captionText: {
     if (armed) return ""
-    if (showDisconnect) return hub.strings.t("net.disconnect")
     switch (caption.key) {
     case "": return ""
     case "text": return caption.text
     default: return hub.strings.t("net.caption." + caption.key)
     }
   }
-  readonly property color captionColor: showDisconnect ? hub.fg
-    : caption.tone === "accent" ? hub.accent
+  readonly property color captionColor: caption.tone === "accent" ? hub.accent
     : caption.tone === "urgent" ? hub.urgent : hub.dim
 
   width: parent ? parent.width : 0
@@ -61,7 +56,7 @@ Item {
   CursorSurface {
     id: surface
     width: row.width
-    height: Style.space(40)
+    height: Style.space(36)
     property bool hover: false
     hasCursor: row.cursor
     onHasCursorChanged: if (hasCursor) row.hub.ensureCursorVisible(row)
@@ -75,8 +70,8 @@ Item {
       anchors.verticalCenter: parent.verticalCenter
       textFormat: Text.PlainText
       renderType: Text.NativeRendering
-      text: row.net.active ? Model.linkGlyph(row.hub.view) : Model.wifiGlyph(row.net.signal)
-      color: row.net.active ? row.hub.accent : row.hub.dim
+      text: Model.wifiGlyph(row.net.signal)
+      color: row.hub.dim
       font.family: row.hub.fontFamily
       font.pixelSize: row.hub.typeBody + Style.space(3)
     }

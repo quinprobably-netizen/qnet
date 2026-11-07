@@ -205,11 +205,35 @@ pub struct Probe {
 /// The socket is `connect`ed, so the kernel drops datagrams from any other
 /// peer. The query is repeated once at `retry_after` (same id) to ride out
 /// a single lost datagram on Wi-Fi. `timeout` bounds the whole exchange.
+#[cfg(test)]
 pub fn query_a(
     server: SocketAddr,
     name: &str,
     timeout: Duration,
     retry_after: Option<Duration>,
+) -> Result<Probe, DnsError> {
+    query_a_counted(server, name, timeout, retry_after).1
+}
+
+/// Like `query_a`, but also says how many datagrams were sent: the server
+/// logs every one of them as a query, and the stats need to subtract them.
+pub fn query_a_counted(
+    server: SocketAddr,
+    name: &str,
+    timeout: Duration,
+    retry_after: Option<Duration>,
+) -> (u32, Result<Probe, DnsError>) {
+    let mut sent = 0u32;
+    let res = exchange(server, name, timeout, retry_after, &mut sent);
+    (sent, res)
+}
+
+fn exchange(
+    server: SocketAddr,
+    name: &str,
+    timeout: Duration,
+    retry_after: Option<Duration>,
+    sent: &mut u32,
 ) -> Result<Probe, DnsError> {
     let id = crate::util::random_u16();
     let query = build_query(id, name)?;
@@ -222,6 +246,7 @@ pub fn query_a(
 
     let start = Instant::now();
     sock.send(&query).map_err(|e| DnsError::Io(e.to_string()))?;
+    *sent += 1;
     let mut retried = retry_after.is_none();
     let mut buf = [0u8; 1500];
     loop {
@@ -233,7 +258,9 @@ pub fn query_a(
         if !retried {
             let at = retry_after.unwrap_or(timeout);
             if elapsed >= at {
-                let _ = sock.send(&query);
+                if sock.send(&query).is_ok() {
+                    *sent += 1;
+                }
                 retried = true;
             } else {
                 wait = wait.min(at - elapsed);
@@ -270,12 +297,23 @@ pub fn query_a(
 
 /// Probe `addr:53`.
 pub fn probe_server(addr: IpAddr, name: &str, timeout: Duration) -> Result<Probe, DnsError> {
-    query_a(
-        SocketAddr::new(addr, 53),
-        name,
-        timeout,
-        Some(timeout / 2),
-    )
+    probe_server_counted(addr, name, timeout).1
+}
+
+/// Probe `addr:53`, also returning the number of queries sent.
+pub fn probe_server_counted(addr: IpAddr, name: &str, timeout: Duration) -> (u32, Result<Probe, DnsError>) {
+    query_a_counted(SocketAddr::new(addr, 53), name, timeout, Some(timeout / 2))
+}
+
+/// A name nobody has asked for: `<16 hex digits>.<domain>`. It forces the
+/// resolver past its cache and all the way upstream.
+pub fn random_name_under(domain: &str) -> String {
+    let mut r = [0u8; 8];
+    if crate::util::urandom(&mut r).is_err() {
+        r = crate::util::unix_now().to_bits().to_be_bytes();
+    }
+    let label: String = r.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{label}.{domain}")
 }
 
 /// Classification of a probe against a blocking resolver.
@@ -288,7 +326,11 @@ pub struct Verdict {
     pub blocked: bool,
 }
 
-pub fn judge(reply: &Reply, server: IpAddr) -> Verdict {
+/// `strict` is for names that are *expected* to be NXDOMAIN when not blocked
+/// (the dedicated `.invalid` canary): only an explicit null or self address
+/// counts. Otherwise NXDOMAIN and empty answers also count as blocked, which
+/// covers Pi-hole's other blocking modes for a real blocklisted domain.
+pub fn judge(reply: &Reply, server: IpAddr, strict: bool) -> Verdict {
     let ok = reply.rcode == RCODE_NOERROR || reply.rcode == RCODE_NXDOMAIN;
     if !ok {
         return Verdict {
@@ -296,11 +338,16 @@ pub fn judge(reply: &Reply, server: IpAddr) -> Verdict {
             blocked: false,
         };
     }
-    let blocked = reply.rcode == RCODE_NXDOMAIN
-        || reply.answers.is_empty()
-        || reply.answers.iter().all(|a| {
-            a.is_unspecified() || IpAddr::V4(*a) == server
-        });
+    let all_null = !reply.answers.is_empty()
+        && reply
+            .answers
+            .iter()
+            .all(|a| a.is_unspecified() || IpAddr::V4(*a) == server);
+    let blocked = if strict {
+        reply.rcode == RCODE_NOERROR && all_null
+    } else {
+        reply.rcode == RCODE_NXDOMAIN || reply.answers.is_empty() || all_null
+    };
     Verdict { ok, blocked }
 }
 
@@ -450,20 +497,34 @@ mod tests {
             truncated: false,
             answers,
         };
-        let blocked = judge(&mk(0, vec![Ipv4Addr::UNSPECIFIED]), pi);
+        let blocked = judge(&mk(0, vec![Ipv4Addr::UNSPECIFIED]), pi, false);
         assert_eq!(blocked, Verdict { ok: true, blocked: true });
-        let paused = judge(&mk(0, vec![Ipv4Addr::new(142, 250, 1, 1)]), pi);
+        let paused = judge(&mk(0, vec![Ipv4Addr::new(142, 250, 1, 1)]), pi, false);
         assert_eq!(paused, Verdict { ok: true, blocked: false });
-        let ip_mode = judge(&mk(0, vec![Ipv4Addr::new(192, 168, 1, 153)]), pi);
+        let ip_mode = judge(&mk(0, vec![Ipv4Addr::new(192, 168, 1, 153)]), pi, false);
         assert!(ip_mode.blocked);
-        let nx = judge(&mk(RCODE_NXDOMAIN, vec![]), pi);
+        let nx = judge(&mk(RCODE_NXDOMAIN, vec![]), pi, false);
         assert_eq!(nx, Verdict { ok: true, blocked: true });
-        let nodata = judge(&mk(0, vec![]), pi);
+        let nodata = judge(&mk(0, vec![]), pi, false);
         assert_eq!(nodata, Verdict { ok: true, blocked: true });
-        let servfail = judge(&mk(2, vec![]), pi);
+        let servfail = judge(&mk(2, vec![]), pi, false);
         assert_eq!(servfail, Verdict { ok: false, blocked: false });
-        let refused = judge(&mk(5, vec![]), pi);
+        let refused = judge(&mk(5, vec![]), pi, false);
         assert!(!refused.ok);
+    }
+
+    #[test]
+    fn strict_verdicts_need_an_explicit_null_answer() {
+        let pi = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 153));
+        let mk = |rcode, answers: Vec<Ipv4Addr>| Reply { id: 1, rcode, truncated: false, answers };
+        // A `.invalid` name that is not on the deny list comes back NXDOMAIN
+        // from upstream; that must not read as "blocked".
+        assert_eq!(judge(&mk(RCODE_NXDOMAIN, vec![]), pi, true), Verdict { ok: true, blocked: false });
+        assert_eq!(judge(&mk(0, vec![]), pi, true), Verdict { ok: true, blocked: false });
+        assert_eq!(judge(&mk(0, vec![Ipv4Addr::UNSPECIFIED]), pi, true), Verdict { ok: true, blocked: true });
+        assert_eq!(judge(&mk(0, vec![Ipv4Addr::new(192, 168, 1, 153)]), pi, true), Verdict { ok: true, blocked: true });
+        assert_eq!(judge(&mk(0, vec![Ipv4Addr::new(1, 2, 3, 4)]), pi, true), Verdict { ok: true, blocked: false });
+        assert!(!judge(&mk(2, vec![]), pi, true).ok);
     }
 
     #[test]
@@ -512,5 +573,53 @@ mod tests {
         assert_eq!(r, Err(DnsError::Timeout));
         assert!(t0.elapsed() >= Duration::from_millis(390));
         assert_eq!(h.join().unwrap(), 2, "one send plus one retry");
+    }
+
+    #[test]
+    fn counts_every_datagram_sent() {
+        use std::thread;
+        let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = srv.local_addr().unwrap();
+        srv.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        let h = thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let mut seen = 0;
+            while srv.recv_from(&mut buf).is_ok() {
+                seen += 1;
+            }
+            seen
+        });
+        let (sent, res) = query_a_counted(
+            addr,
+            "doubleclick.net",
+            Duration::from_millis(400),
+            Some(Duration::from_millis(150)),
+        );
+        assert_eq!(res, Err(DnsError::Timeout));
+        assert_eq!(sent, 2);
+        assert_eq!(h.join().unwrap(), 2, "the server saw exactly what we counted");
+
+        // An immediate answer is one datagram.
+        let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = srv.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (_, from) = srv.recv_from(&mut buf).unwrap();
+            let id = u16::from_be_bytes([buf[0], buf[1]]);
+            srv.send_to(&response(id, "a.example.com", 0, &[Ipv4Addr::LOCALHOST]), from).unwrap();
+        });
+        let (sent, res) = query_a_counted(addr, "a.example.com", Duration::from_secs(2), Some(Duration::from_secs(1)));
+        assert!(res.is_ok());
+        assert_eq!(sent, 1);
+    }
+
+    #[test]
+    fn random_names_are_unique_valid_subdomains() {
+        let a = random_name_under("example.com");
+        let b = random_name_under("example.com");
+        assert_ne!(a, b);
+        assert!(a.ends_with(".example.com"));
+        assert_eq!(a.split('.').next().unwrap().len(), 16);
+        assert!(encode_name(&a).is_ok());
     }
 }

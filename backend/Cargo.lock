@@ -718,6 +718,7 @@ dependencies = [
  "tempfile",
  "toml",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@
     "bitrateMbps": 866,
     "ip4": "192.168.1.242",
     "gateway": "192.168.1.1",
+    "gatewayMs": 4.2,
     "connectivity": "full",
     "portalUrl": ""
   },
@@ -121,21 +122,28 @@
       "since": 0,
       "reason": ""
     },
-    "manualOverride": false
+    "manualOverride": false,
+    "bypassed": false,
+    "resolvedFallback": ""
   },
   "pihole": {
     "configured": true,
     "address": "192.168.1.153",
     "adminUrl": "https://192.168.1.153/admin/",
+    "detected": "",
     "reachable": true,
+    "health": "ok",
+    "canaryBlocked": true,
     "latencyMs": 3.1,
     "blocking": "enabled",
     "pauseRemainingS": 0,
     "api": "ok",
+    "historySpanS": 86400,
     "today": {
       "total": 1204,
       "blocked": 164,
-      "percent": 13.6
+      "percent": 13.6,
+      "selfQueries": 8
     },
     "history": [
       {

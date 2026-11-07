@@ -17,20 +17,23 @@ mod dnsmodel;
 mod dnswire;
 mod failover;
 mod https;
+mod icmp;
+mod ledger;
 mod net;
 mod nm;
 mod pihole;
 mod proc;
 mod setup;
 mod state;
+mod threads;
 mod util;
 mod watch;
 
 use std::io::{BufRead, IsTerminal, Read, Write};
-use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 use actions::{ActionErr, ActionResult, Ctx};
 
@@ -52,7 +55,7 @@ fn load_config() -> Result<config::Config, ActionErr> {
 // ---- Terminal helpers -----------------------------------------------------
 
 /// Read a line without echo (when stdin is a terminal).
-fn read_secret_line(prompt: &str) -> Result<String, String> {
+fn read_secret_line(prompt: &str) -> Result<Zeroizing<String>, String> {
     let tty = std::io::stdin().is_terminal();
     if tty {
         eprint!("{prompt}");
@@ -70,7 +73,9 @@ fn read_secret_line(prompt: &str) -> Result<String, String> {
             }
         }
     }
-    let mut line = String::new();
+    // Reserved up front (and the read is capped at 4096) so the buffer never
+    // reallocates and leaves an unwiped copy behind.
+    let mut line = Zeroizing::new(String::with_capacity(4200));
     let res = std::io::stdin().lock().take(4096).read_line(&mut line);
     if let Some(t) = saved {
         unsafe {
@@ -79,7 +84,9 @@ fn read_secret_line(prompt: &str) -> Result<String, String> {
         eprintln!();
     }
     res.map_err(|e| e.to_string())?;
-    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    let kept = line.trim_end_matches(['\n', '\r']).len();
+    line.truncate(kept);
+    Ok(line)
 }
 
 struct Terminal;
@@ -97,7 +104,21 @@ impl setup::Prompter for Terminal {
         }
         matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     }
-    fn password(&mut self, prompt: &str) -> Result<String, String> {
+    fn line(&mut self, prompt: &str) -> Result<String, String> {
+        eprint!("{prompt}");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let n = std::io::stdin()
+            .lock()
+            .take(1024)
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("end of input".into());
+        }
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    }
+    fn password(&mut self, prompt: &str) -> Result<Zeroizing<String>, String> {
         read_secret_line(prompt)
     }
 }
@@ -110,10 +131,11 @@ enum Cmd {
     State,
     DnsPihole { force: bool },
     DnsAuto { force: bool },
-    DnsPin { uuid: String, force: bool },
+    DnsPin { uuids: Vec<String>, force: bool },
     PiholePause { secs: u64 },
     PiholeResume,
-    PiholeSetup { addr: std::net::IpAddr },
+    /// The address is optional: without it setup asks the user to type one.
+    PiholeSetup { addr: Option<std::net::IpAddr> },
     WifiConnect { ap: String },
     WifiDown,
     WifiScan,
@@ -140,11 +162,17 @@ fn parse(args: &[String]) -> Result<Cmd, ActionErr> {
         ["--version"] | ["-V"] => Ok(Cmd::Version),
         ["dns", "pihole"] => Ok(Cmd::DnsPihole { force }),
         ["dns", "auto"] => Ok(Cmd::DnsAuto { force }),
-        ["dns", "pin", uuid] => {
-            if !util::is_uuid(uuid) {
+        ["dns", "pin", uuids @ ..] if !uuids.is_empty() => {
+            if uuids.len() > 16 || uuids.iter().any(|u| !util::is_uuid(u)) {
                 return Err(bad_uuid());
             }
-            Ok(Cmd::DnsPin { uuid: uuid.to_string(), force })
+            let mut list: Vec<String> = Vec::new();
+            for u in uuids {
+                if !list.iter().any(|x| x == u) {
+                    list.push(u.to_string());
+                }
+            }
+            Ok(Cmd::DnsPin { uuids: list, force })
         }
         ["pihole", "pause"] => Ok(Cmd::PiholePause { secs: 300 }),
         ["pihole", "pause", secs] => secs
@@ -152,9 +180,10 @@ fn parse(args: &[String]) -> Result<Cmd, ActionErr> {
             .map(|secs| Cmd::PiholePause { secs })
             .map_err(|_| ActionErr::new("invalid", "seconds must be a number")),
         ["pihole", "resume"] => Ok(Cmd::PiholeResume),
+        ["pihole", "setup"] => Ok(Cmd::PiholeSetup { addr: None }),
         ["pihole", "setup", addr] => addr
             .parse()
-            .map(|addr| Cmd::PiholeSetup { addr })
+            .map(|addr| Cmd::PiholeSetup { addr: Some(addr) })
             .map_err(|_| ActionErr::new("invalid", "the Pi-hole address must be an IP address")),
         ["wifi", "connect", ap] => {
             if !util::is_ap_path(ap) {
@@ -197,6 +226,7 @@ fn pihole_client(cfg: &config::Config) -> Result<pihole::Pihole, ActionErr> {
 fn run_oneshot(cmd: Cmd) -> ActionResult {
     match cmd {
         Cmd::PiholePause { secs } => {
+            util::harden_process();
             let cfg = load_config()?;
             let mut api = pihole_client(&cfg)?;
             let r = actions::pihole_pause(&mut api, secs);
@@ -204,6 +234,7 @@ fn run_oneshot(cmd: Cmd) -> ActionResult {
             r
         }
         Cmd::PiholeResume => {
+            util::harden_process();
             let cfg = load_config()?;
             let mut api = pihole_client(&cfg)?;
             let r = actions::pihole_resume(&mut api);
@@ -214,11 +245,13 @@ fn run_oneshot(cmd: Cmd) -> ActionResult {
             if !std::io::stdin().is_terminal() {
                 return Err(ActionErr::new("interactive", "pihole setup must be run from a terminal"));
             }
-            setup::run(SocketAddr::new(addr, 443), &mut Terminal, &setup::Keyring, &util::config_path())
+            util::harden_process();
+            setup::run(addr, 443, &mut Terminal, &setup::Keyring, &util::config_path())
         }
         Cmd::WifiConnect { ap } => {
             // One line on stdin: the passphrase (empty for open/known).
             // Read a line, never to EOF: the caller keeps the pipe open.
+            util::harden_process();
             let pass = read_secret_line("Passphrase (empty for none): ").map_err(|e| ActionErr::new("io", e))?;
             let be = backend()?;
             let cfg = load_config()?;
@@ -231,7 +264,7 @@ fn run_oneshot(cmd: Cmd) -> ActionResult {
             match other {
                 Cmd::DnsPihole { force } => actions::dns_pihole(&ctx, force),
                 Cmd::DnsAuto { force } => actions::dns_auto(&ctx, force),
-                Cmd::DnsPin { uuid, force } => actions::dns_pin(&ctx, &uuid, force),
+                Cmd::DnsPin { uuids, force } => actions::dns_pin_many(&ctx, &uuids, force),
                 Cmd::WifiDown => actions::wifi_down(&ctx),
                 Cmd::WifiScan => actions::wifi_scan(&ctx),
                 Cmd::WifiForget { uuid } => actions::wifi_forget(&ctx, &uuid),
@@ -345,14 +378,21 @@ mod tests {
         assert_eq!(p(&["dns", "pihole"]), Ok(Cmd::DnsPihole { force: false }));
         assert_eq!(p(&["dns", "pihole", "--force"]), Ok(Cmd::DnsPihole { force: true }));
         assert_eq!(p(&["dns", "--force", "auto"]), Ok(Cmd::DnsAuto { force: true }));
-        assert_eq!(p(&["dns", "pin", U]), Ok(Cmd::DnsPin { uuid: U.into(), force: false }));
+        assert_eq!(p(&["dns", "pin", U]), Ok(Cmd::DnsPin { uuids: vec![U.into()], force: false }));
+        let u2 = "f5520df2-a482-3ff6-a770-64b74a740967";
+        assert_eq!(
+            p(&["dns", "pin", U, "--force", u2, U]),
+            Ok(Cmd::DnsPin { uuids: vec![U.into(), u2.into()], force: true }),
+            "several uuids, duplicates dropped"
+        );
         assert_eq!(p(&["pihole", "pause"]), Ok(Cmd::PiholePause { secs: 300 }));
         assert_eq!(p(&["pihole", "pause", "60"]), Ok(Cmd::PiholePause { secs: 60 }));
         assert_eq!(p(&["pihole", "resume"]), Ok(Cmd::PiholeResume));
         assert_eq!(
             p(&["pihole", "setup", "192.168.1.153"]),
-            Ok(Cmd::PiholeSetup { addr: "192.168.1.153".parse().unwrap() })
+            Ok(Cmd::PiholeSetup { addr: Some("192.168.1.153".parse().unwrap()) })
         );
+        assert_eq!(p(&["pihole", "setup"]), Ok(Cmd::PiholeSetup { addr: None }));
         assert_eq!(p(&["wifi", "connect", AP]), Ok(Cmd::WifiConnect { ap: AP.into() }));
         assert_eq!(p(&["wifi", "down"]), Ok(Cmd::WifiDown));
         assert_eq!(p(&["wifi", "scan"]), Ok(Cmd::WifiScan));
@@ -370,10 +410,10 @@ mod tests {
             &["dns", "wipe"],
             &["dns", "pin"],
             &["dns", "pin", "../etc"],
+            &["dns", "pin", U, "not-a-uuid"],
             &["dns", "pihole", "extra"],
             &["pihole", "pause", "soon"],
             &["pihole", "pause", "-5"],
-            &["pihole", "setup"],
             &["pihole", "setup", "pi.hole"],
             &["wifi", "connect"],
             &["wifi", "connect", "Redwood"],

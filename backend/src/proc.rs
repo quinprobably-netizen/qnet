@@ -1,15 +1,28 @@
 //! Run a child process without a shell: arguments are argv elements, secrets
 //! go through stdin, output is capped and the whole run has a deadline.
+//!
+//! The child gets its own process group, so a timeout kills it and anything
+//! it spawned, and output readers are never joined unconditionally: a
+//! grandchild that keeps a pipe open must not be able to hang us.
 
 use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use zeroize::Zeroizing;
+
+/// How long to wait for the readers after the child has exited.
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub struct Output {
     pub code: Option<i32>,
-    pub stdout: Vec<u8>,
+    /// Wiped on drop: this may be a secret from the keyring.
+    pub stdout: Zeroizing<Vec<u8>>,
     pub timed_out: bool,
 }
 
@@ -19,25 +32,45 @@ impl Output {
     }
 }
 
-fn drain<R: Read + Send + 'static>(mut r: R, cap: usize) -> thread::JoinHandle<Vec<u8>> {
+type Captured = Arc<Mutex<Zeroizing<Vec<u8>>>>;
+
+/// Read `r` into a shared buffer (capped); the receiver fires at EOF.
+fn drain<R: Read + Send + 'static>(mut r: R, cap: usize) -> (Captured, Receiver<()>) {
+    // Reserve up front so growth never leaves unwiped copies behind.
+    let buf: Captured = Arc::new(Mutex::new(Zeroizing::new(Vec::with_capacity(cap.min(1 << 16)))));
+    let sink = buf.clone();
+    let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut buf = [0u8; 4096];
+        let mut chunk = [0u8; 4096];
         loop {
-            match r.read(&mut buf) {
+            match r.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let room = cap.saturating_sub(kept.len());
-                    kept.extend_from_slice(&buf[..n.min(room)]);
+                    if let Ok(mut kept) = sink.lock() {
+                        let room = cap.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..n.min(room)]);
+                    }
                 }
             }
         }
-        kept
-    })
+        let _ = tx.send(());
+    });
+    (buf, rx)
+}
+
+fn snapshot(c: &Captured) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(c.lock().map(|g| g.to_vec()).unwrap_or_default())
+}
+
+fn kill_group(pid: u32) {
+    // SAFETY: killpg with a pid we spawned (its own process group leader).
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
 }
 
 /// Run `program` with `args`. `stdin` bytes (if any) are written and the pipe
-/// closed. stdout/stderr are each capped at `max_out` bytes.
+/// closed. stdout is capped at `max_out` bytes; stderr is discarded.
 pub fn run(
     program: &str,
     args: &[&str],
@@ -47,23 +80,21 @@ pub fn run(
 ) -> io::Result<Output> {
     let mut child = Command::new(program)
         .args(args)
+        .process_group(0)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()?;
-    let out_h = drain(child.stdout.take().expect("piped"), max_out);
-    let err_h = drain(child.stderr.take().expect("piped"), max_out);
-    let writer = match (stdin, child.stdin.take()) {
-        (Some(data), Some(mut pipe)) => {
-            let data = data.to_vec();
-            Some(thread::spawn(move || {
-                let _ = pipe.write_all(&data);
-                // Dropping the pipe closes it.
-            }))
-        }
-        _ => None,
-    };
+    let (out, out_done) = drain(child.stdout.take().expect("piped"), max_out);
+    if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let data = Zeroizing::new(data.to_vec());
+        // Detached on purpose: a child that never reads must not block us.
+        thread::spawn(move || {
+            let _ = pipe.write_all(&data[..]);
+        });
+    }
     let start = Instant::now();
+    let pid = child.id();
     let mut timed_out = false;
     let status = loop {
         if let Some(st) = child.try_wait()? {
@@ -71,19 +102,25 @@ pub fn run(
         }
         if start.elapsed() >= timeout {
             timed_out = true;
-            let _ = child.kill();
+            kill_group(pid);
             break child.wait()?;
         }
         thread::sleep(Duration::from_millis(15));
     };
-    if let Some(w) = writer {
-        let _ = w.join();
+    if timed_out {
+        // Whatever was read is returned; the reader may outlive us if some
+        // process escaped the group, which is harmless.
+        return Ok(Output {
+            code: status.code(),
+            stdout: snapshot(&out),
+            timed_out,
+        });
     }
-    let stdout = out_h.join().unwrap_or_default();
-    let _ = err_h.join();
+    // The child is gone; a lingering grandchild may still hold the pipe.
+    let _ = out_done.recv_timeout(DRAIN_GRACE);
     Ok(Output {
         code: status.code(),
-        stdout,
+        stdout: snapshot(&out),
         timed_out,
     })
 }
@@ -96,13 +133,13 @@ mod tests {
     fn captures_and_feeds_stdin() {
         let o = run("cat", &[], Some(b"hello"), Duration::from_secs(5), 1024).unwrap();
         assert!(o.success());
-        assert_eq!(o.stdout, b"hello");
+        assert_eq!(&o.stdout[..], b"hello");
     }
 
     #[test]
     fn args_are_not_interpreted_by_a_shell() {
         let o = run("echo", &["$(id)", ";", "`id`"], None, Duration::from_secs(5), 1024).unwrap();
-        assert_eq!(o.stdout, b"$(id) ; `id`\n");
+        assert_eq!(&o.stdout[..], b"$(id) ; `id`\n");
     }
 
     #[test]
@@ -118,6 +155,42 @@ mod tests {
         let o = run("sleep", &["30"], None, Duration::from_millis(200), 10).unwrap();
         assert!(o.timed_out && !o.success());
         assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_group_and_returns_partial_output() {
+        // The shell prints, then waits on a child that holds the pipe open.
+        let t0 = Instant::now();
+        let o = run(
+            "sh",
+            &["-c", "echo partial; sleep 30 & sleep 30"],
+            None,
+            Duration::from_millis(300),
+            1024,
+        )
+        .unwrap();
+        assert!(o.timed_out);
+        assert_eq!(&o.stdout[..], b"partial\n");
+        assert!(t0.elapsed() < Duration::from_secs(3), "must not wait for the grandchild");
+    }
+
+    #[test]
+    fn a_grandchild_holding_the_pipe_cannot_hang_us() {
+        // The shell exits at once; the background sleep keeps stdout open.
+        let t0 = Instant::now();
+        let o = run("sh", &["-c", "echo hi; sleep 8 &"], None, Duration::from_secs(5), 1024).unwrap();
+        assert!(!o.timed_out);
+        assert_eq!(&o.stdout[..], b"hi\n");
+        assert!(t0.elapsed() < Duration::from_secs(3), "returned after {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn a_child_that_never_reads_stdin_does_not_block() {
+        let big = vec![b'x'; 1 << 20];
+        let t0 = Instant::now();
+        let o = run("sh", &["-c", "exit 0"], Some(&big), Duration::from_secs(5), 16).unwrap();
+        assert!(o.success());
+        assert!(t0.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

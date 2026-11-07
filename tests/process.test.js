@@ -10,6 +10,8 @@ test("every action is an argv array under the absolute qnet path", () => {
   assert.deepEqual(Model.argvDns(BIN, "pihole", false), [BIN, "dns", "pihole"])
   assert.deepEqual(Model.argvDns(BIN, "auto", true), [BIN, "dns", "auto", "--force"])
   assert.deepEqual(Model.argvPin(BIN, UUID), [BIN, "dns", "pin", UUID])
+  assert.deepEqual(Model.argvPin(BIN, [UUID, "0c3d9f12-88aa-4e77-b5d1-72f6e0a1c9d3"]),
+    [BIN, "dns", "pin", UUID, "0c3d9f12-88aa-4e77-b5d1-72f6e0a1c9d3"], "several profiles, one command")
   assert.deepEqual(Model.argvPause(BIN, 300), [BIN, "pihole", "pause", "300"])
   assert.deepEqual(Model.argvResume(BIN), [BIN, "pihole", "resume"])
   assert.deepEqual(Model.argvConnect(BIN, AP), [BIN, "wifi", "connect", AP])
@@ -27,6 +29,8 @@ test("input that does not validate yields no command at all", () => {
   assert.equal(Model.argvDns("", "pihole", false), null)
   assert.equal(Model.argvPin(BIN, "not-a-uuid"), null)
   assert.equal(Model.argvPin(BIN, UUID + "; reboot"), null)
+  assert.equal(Model.argvPin(BIN, [UUID, "nope"]), null, "one bad uuid refuses the lot")
+  assert.equal(Model.argvPin(BIN, []), null)
   assert.equal(Model.argvConnect(BIN, "Redwood"), null, "actions use the AP path, never the SSID")
   assert.equal(Model.argvConnect(BIN, AP + "/../../x"), null)
   assert.equal(Model.argvForget(BIN, ""), null)
@@ -38,7 +42,7 @@ test("the passphrase and SSIDs never appear in any argv builder's output", () =>
   const all = [
     Model.argvDns(BIN, "pihole"), Model.argvPin(BIN, UUID), Model.argvPause(BIN, 300), Model.argvResume(BIN),
     Model.argvConnect(BIN, AP), Model.argvDown(BIN), Model.argvForget(BIN, UUID), Model.argvScan(BIN),
-    Model.argvRadio(BIN, true), Model.argvPortal(BIN), Model.argvTerminal("nmtui", BIN), Model.argvTerminal("setup", BIN, "192.168.1.153")
+    Model.argvRadio(BIN, true), Model.argvPortal(BIN), Model.argvTerminal("nmtui", BIN), Model.argvTerminal("setup", BIN)
   ]
   for (const a of all) {
     assert.ok(Array.isArray(a))
@@ -49,13 +53,16 @@ test("the passphrase and SSIDs never appear in any argv builder's output", () =>
 
 test("terminal launches: nmtui and Pi-hole setup, as plain words", () => {
   assert.deepEqual(Model.argvTerminal("nmtui", BIN), ["omarchy-launch-floating-terminal-with-presentation", "nmtui"])
-  assert.deepEqual(Model.argvTerminal("setup", BIN, "192.168.1.153"),
-    ["omarchy-launch-floating-terminal-with-presentation", BIN, "pihole", "setup", "192.168.1.153"])
-  assert.deepEqual(Model.argvTerminal("setup", BIN, ""),
-    ["omarchy-launch-floating-terminal-with-presentation", BIN, "pihole", "setup", Model.DEFAULT_PIHOLE_ADDR])
-  assert.equal(Model.argvTerminal("setup", BIN, "1.2.3.4; reboot")[4], Model.DEFAULT_PIHOLE_ADDR, "a bad address falls back to the default")
-  assert.equal(Model.argvTerminal("setup", "/home/a b/.local/bin/qnet", "1.2.3.4")[1], "qnet", "a path with a space is not handed to the launcher's bash")
   assert.equal(Model.argvTerminal("evil", BIN), null)
+})
+
+test("setup is launched with no address: it asks the user to type it", () => {
+  assert.deepEqual(Model.argvTerminal("setup", BIN),
+    ["omarchy-launch-floating-terminal-with-presentation", BIN, "pihole", "setup"])
+  assert.deepEqual(Model.argvTerminal("setup", BIN, "192.168.1.153"),
+    ["omarchy-launch-floating-terminal-with-presentation", BIN, "pihole", "setup"], "a detected address is never passed on")
+  assert.equal(Model.argvTerminal("setup", "/home/a b/.local/bin/qnet")[1], "qnet", "a path with a space is not handed to the launcher's bash")
+  assert.equal(Model.DEFAULT_PIHOLE_ADDR, undefined, "there is no built-in address to fall back on")
 })
 
 test("admin links and copying", () => {
@@ -99,10 +106,26 @@ test("failures map to a message code; backend text is cleaned and bounded", () =
   assert.ok(!g.text.includes("\u0007"))
 })
 
-test("a Pi-hole switch that was answered by another server is called out", () => {
-  const v = view("healthy")
-  assert.equal(Model.verifyMismatch("pihole", { verifiedVia: "192.168.1.153" }, v), "")
-  assert.equal(Model.verifyMismatch("pihole", { verifiedVia: "1.1.1.1" }, v), "1.1.1.1")
-  assert.equal(Model.verifyMismatch("auto", { verifiedVia: "1.1.1.1" }, v), "")
-  assert.equal(Model.verifyMismatch("pihole", { verifiedVia: "" }, v), "")
+test("dns pihole results: blocked with verifiedVia, or a verifyError", () => {
+  const good = Model.parseResult('{"ok":true,"verifiedVia":"192.168.1.153","blocked":true}', 0)
+  assert.equal(good.blocked, true)
+  assert.equal(good.verifiedVia, "192.168.1.153")
+  assert.equal(good.verifyError, "")
+  const bad = Model.parseResult('{"ok":true,"verifyError":"canary answered 3.4.5.6"}', 0)
+  assert.equal(bad.blocked, false)
+  assert.equal(bad.verifiedVia, "")
+  assert.equal(bad.verifyError, "canary answered 3.4.5.6")
+  assert.equal(Model.parseResult('{"ok":true,"noop":true,"verifiedVia":"192.168.1.153","blocked":true}', 0).ok, true)
+})
+
+test("a Pi-hole switch that its canary did not confirm is called out, nothing else is", () => {
+  const good = Model.parseResult('{"ok":true,"verifiedVia":"192.168.1.153","blocked":true}', 0)
+  const bad = Model.parseResult('{"ok":true,"verifyError":"canary answered 3.4.5.6"}', 0)
+  const old = Model.parseResult('{"ok":true}', 0)
+  assert.equal(Model.verifyNote("pihole", good), "")
+  assert.equal(Model.verifyNote("pihole", bad), "canary answered 3.4.5.6")
+  assert.equal(Model.verifyNote("pihole", old), "", "a backend that says neither is not accused")
+  assert.equal(Model.verifyNote("auto", bad), "")
+  assert.equal(Model.verifyNote("pihole", Model.parseResult('{"ok":false,"error":"x","verifyError":"y"}', 1)), "", "a failure has its own message")
+  assert.equal(Model.verifyNote("pihole", null), "")
 })

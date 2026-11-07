@@ -1,11 +1,11 @@
 //! `qnet watch`: the long-lived process behind the panel.
 //!
-//! Threads (all feeding one event channel):
+//! Threads (all feeding one event channel; see `threads.rs`):
 //!   * stdin reader   - `open` / `closed` / `refresh`;
 //!   * signals        - SIGTERM / SIGINT / SIGHUP;
 //!   * NM watcher     - NetworkManager D-Bus signals;
-//!   * prober         - raw UDP DNS probes to the Pi-hole (and the gateway
-//!     while the Pi-hole probe is failing);
+//!   * prober         - raw UDP DNS probes to the Pi-hole, an upstream
+//!     check, the gateway gate, and (open only) an ICMP echo to the gateway;
 //!   * API poller     - Pi-hole HTTPS API, only while the panel is open.
 //!
 //! The main thread owns the model and is the only one that touches DNS
@@ -13,20 +13,22 @@
 //! its decisions can be tested without sleeping.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::net::IpAddr;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::thread::{self, JoinHandle};
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use crate::config::{self, Config};
+use crate::actions;
+use crate::config::{self, Config, Fallback};
 use crate::dnsmodel::{self, pihole_candidate};
-use crate::dnswire;
 use crate::failover::{Decision, Failover, LinkKey, Obs};
+use crate::ledger::Ledger;
 use crate::net::*;
-use crate::pihole::{ApiError, Blocking, Bucket, Pihole, Summary};
 use crate::state::*;
 use crate::util;
+
+pub use crate::threads::*;
 
 /// Desktop notification sink: (title, body).
 pub type Notifier = Box<dyn Fn(&str, &str) + Send>;
@@ -36,93 +38,33 @@ pub const HEARTBEAT_MS: u64 = 10_000;
 pub const RESOLVER_EVERY_MS: u64 = 30_000;
 pub const RESOLVER_FOLLOWUP_MS: u64 = 1_500;
 pub const NET_MIN_GAP_MS: u64 = 250;
-pub const SCAN_STALE_MS: u64 = 30_000;
-pub const SCAN_MIN_GAP_MS: u64 = 15_000;
-pub const SCAN_RUNNING_MAX_MS: u64 = 20_000;
-pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-pub const PROBE_EVERY_CLOSED: Duration = Duration::from_secs(15);
-pub const PROBE_EVERY_OPEN: Duration = Duration::from_secs(5);
-pub const API_EVERY: Duration = Duration::from_secs(10);
-pub const HISTORY_EVERY: Duration = Duration::from_secs(60);
-
-// ---- Events and thread messages ------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NmKind {
-    /// Devices, active connections, IP config, connectivity.
-    Core,
-    /// Access points came, went or changed.
-    Ap,
-    /// Saved profiles changed.
-    Settings,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProbeOutcome {
-    pub ok: bool,
-    pub ms: Option<f64>,
-    pub blocked: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProbeReport {
-    pub target: IpAddr,
-    pub t: f64,
-    pub pihole: ProbeOutcome,
-    /// Gateway probe result; only taken when the Pi-hole probe failed.
-    pub gateway: Option<bool>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ApiReport {
-    pub status: &'static str,
-    pub summary: Option<Summary>,
-    pub blocking: Option<Blocking>,
-    pub history: Option<Vec<Bucket>>,
-    pub at: f64,
-}
-
-pub enum Event {
-    Cmd(String),
-    StdinEof,
-    Signal,
-    Nm(NmKind),
-    NmLost,
-    Probe(ProbeReport),
-    Api(ApiReport),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProbeTarget {
-    pub addr: IpAddr,
-    pub canary: String,
-    pub gateway: Option<IpAddr>,
-}
-
-pub enum ProbeCtl {
-    Target(Option<ProbeTarget>),
-    Open(bool),
-    Kick,
-    Stop,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApiCfg {
-    pub addr: IpAddr,
-    pub pin: [u8; 32],
-}
-
-pub enum ApiCtl {
-    Config(Option<ApiCfg>),
-    Open(bool),
-    Kick,
-    Stop,
-}
+pub const LEDGER_SAVE_MS: u64 = 300_000;
+/// How long a gateway round trip stays valid with no new measurement.
+pub const GATEWAY_MS_FRESH_S: f64 = 20.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
     Continue,
     Shutdown,
+}
+
+/// One line of output.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Line {
+    State(Box<State>),
+    /// Liveness only: `{"type":"hb","seq":N}` with the last state's seq.
+    Hb { seq: u64 },
+}
+
+impl Line {
+    pub fn to_json_line(&self) -> Vec<u8> {
+        let mut v = match self {
+            Line::State(s) => serde_json::to_vec(s).unwrap_or_default(),
+            Line::Hb { seq } => format!("{{\"type\":\"hb\",\"seq\":{seq}}}").into_bytes(),
+        };
+        v.push(b'\n');
+        v
+    }
 }
 
 // ---- The model ------------------------------------------------------------
@@ -152,11 +94,20 @@ pub struct Watch {
     api: ApiView,
     api_cfg: Option<ApiCfg>,
     fo: Failover,
+    /// The link failover was applied to; recovery goes back to this one even
+    /// if the primary link has changed since.
+    engaged: Option<LinkKey>,
     candidate: Option<IpAddr>,
+    candidate_probed: bool,
     confirmed: Option<IpAddr>,
-    scan_running: bool,
-    scan_requested_ms: Option<u64>,
-    scan_age_at_request: Option<u64>,
+    /// Latest result of the upstream-resolution check.
+    upstream_ok: Option<bool>,
+    /// ICMP round trip to the gateway and when it was taken (unix s).
+    gateway_ms: Option<(f64, f64)>,
+    ledger: Ledger,
+    ledger_saved_ms: u64,
+    state_dir: PathBuf,
+    learned_for: Option<String>,
     dirty: Dirty,
     aps_stale: bool,
     last_net_ms: u64,
@@ -166,15 +117,20 @@ pub struct Watch {
     last_sig: String,
     last_emit_ms: u64,
     emitted_once: bool,
+    /// Bumped whenever anything the state is built from may have changed.
+    gen: u64,
+    emitted_gen: u64,
     pending_change: bool,
+    hb_every_ms: u64,
+    builds: std::cell::Cell<u64>,
     notify: Notifier,
     probe_tx: Option<Sender<ProbeCtl>>,
     api_tx: Option<Sender<ApiCtl>>,
-    config_path: std::path::PathBuf,
+    config_path: PathBuf,
 }
 
 impl Watch {
-    pub fn new(be: Box<dyn NetBackend>, config_path: std::path::PathBuf) -> Self {
+    pub fn new(be: Box<dyn NetBackend>, config_path: PathBuf) -> Self {
         Self {
             be,
             cfg: Config::default(),
@@ -192,11 +148,16 @@ impl Watch {
             api: ApiView::unconfigured(),
             api_cfg: None,
             fo: Failover::new(),
+            engaged: None,
             candidate: None,
+            candidate_probed: false,
             confirmed: None,
-            scan_running: false,
-            scan_requested_ms: None,
-            scan_age_at_request: None,
+            upstream_ok: None,
+            gateway_ms: None,
+            ledger: Ledger::default(),
+            ledger_saved_ms: 0,
+            state_dir: util::state_dir(),
+            learned_for: None,
             dirty: Dirty::default(),
             aps_stale: true,
             last_net_ms: 0,
@@ -206,7 +167,11 @@ impl Watch {
             last_sig: String::new(),
             last_emit_ms: 0,
             emitted_once: false,
+            gen: 1,
+            emitted_gen: 0,
             pending_change: false,
+            hb_every_ms: HEARTBEAT_MS,
+            builds: std::cell::Cell::new(0),
             notify: Box::new(|_, _| {}),
             probe_tx: None,
             api_tx: None,
@@ -218,9 +183,28 @@ impl Watch {
         self.notify = f;
     }
 
+    /// Where undo/gateway records and the query tally live.
+    #[cfg(test)]
+    pub fn set_state_dir(&mut self, dir: PathBuf) {
+        self.state_dir = dir;
+    }
+
+    #[cfg(test)]
+    pub fn set_heartbeat_ms(&mut self, ms: u64) {
+        self.hb_every_ms = ms;
+    }
+
     pub fn attach_threads(&mut self, probe: Sender<ProbeCtl>, api: Sender<ApiCtl>) {
         self.probe_tx = Some(probe);
         self.api_tx = Some(api);
+    }
+
+    fn touch(&mut self) {
+        self.gen += 1;
+    }
+
+    fn ledger_path(&self) -> PathBuf {
+        self.state_dir.join("self-queries.json")
     }
 
     // -- reading ------------------------------------------------------------
@@ -274,7 +258,6 @@ impl Watch {
             }
             Err(e) => self.net_error = format!("NetworkManager: {}", e.detail()),
         }
-        self.update_scan_running(now_ms);
     }
 
     fn read_profiles(&mut self) {
@@ -332,15 +315,22 @@ impl Watch {
         };
         if next != self.candidate {
             self.candidate = next;
+            self.candidate_probed = false;
             if self.confirmed != next {
                 self.confirmed = None;
             }
         }
     }
 
-    /// The Pi-hole address the rest of the model works with.
+    /// The Pi-hole address the rest of the model works with: the configured
+    /// one, or a detected one that has been seen blocking the canary. Only
+    /// the configured one is ever shown as `pihole.address`.
     pub fn effective_pihole(&self) -> Option<IpAddr> {
         self.cfg.pihole.as_ref().map(|p| p.address).or(self.confirmed)
+    }
+
+    fn detect_pending(&self) -> bool {
+        self.cfg.pihole.is_none() && self.candidate.is_some() && self.confirmed.is_none() && !self.candidate_probed
     }
 
     fn desired_probe_target(&self) -> Option<ProbeTarget> {
@@ -349,7 +339,7 @@ impl Watch {
             None => (self.candidate?, config::DEFAULT_CANARY.to_string()),
         };
         let gateway = self.primary().and_then(|d| d.gateway).map(IpAddr::V4);
-        Some(ProbeTarget { addr, canary, gateway })
+        Some(ProbeTarget { addr, port: 53, canary, gateway })
     }
 
     fn sync_threads(&mut self) {
@@ -358,6 +348,8 @@ impl Watch {
         if want != self.probe_target {
             if want.as_ref().map(|t| t.addr) != self.probe_target.as_ref().map(|t| t.addr) {
                 self.probes.clear();
+                self.upstream_ok = None;
+                self.gateway_ms = None;
             }
             if let Some(tx) = &self.probe_tx {
                 let _ = tx.send(ProbeCtl::Target(want.clone()));
@@ -366,6 +358,7 @@ impl Watch {
         }
         let api_cfg = self.cfg.pihole.as_ref().map(|p| ApiCfg {
             addr: p.address,
+            port: 443,
             pin: p.tls_sha256,
         });
         if api_cfg != self.api_cfg {
@@ -384,6 +377,8 @@ impl Watch {
     // -- startup / shutdown ---------------------------------------------------
 
     pub fn startup(&mut self, now_ms: u64) {
+        self.ledger = Ledger::load(&self.ledger_path());
+        self.ledger_saved_ms = now_ms;
         self.load_config();
         self.read_net(now_ms, true);
         self.read_profiles();
@@ -393,6 +388,7 @@ impl Watch {
             let _ = tx.send(ProbeCtl::Open(self.open));
         }
         self.adopt_stranded_failover();
+        self.touch();
     }
 
     /// A previous qnet may have died while failed over. If the device runs
@@ -406,19 +402,35 @@ impl Watch {
             return;
         };
         let (iface, saved) = (dev.iface.clone(), profile.dns.v4_dns.clone());
+        let key = self.link_key();
         if let Ok(applied) = self.be.applied_dns(&iface) {
             if applied.v4_dns != saved {
                 self.fo.adopt(util::unix_secs(), "device was running different DNS than its saved profile");
+                self.engaged = key;
             }
         }
     }
 
+    /// Clean exit. A failover is put back only when the Pi-hole is answering
+    /// again: leaving a dead Pi-hole in charge of DNS would be worse than
+    /// leaving the fallback in place (the next start adopts it).
     pub fn shutdown(&mut self) {
-        if self.fo.active() {
-            if let Some(iface) = self.primary().map(|d| d.iface.clone()) {
-                let _ = self.be.reapply_saved(&iface);
+        if self.fo.active() && self.last_probe_passed() {
+            let iface = self
+                .engaged
+                .as_ref()
+                .map(|k| k.iface.clone())
+                .or_else(|| self.primary().map(|d| d.iface.clone()));
+            if let Some(iface) = iface {
+                if self.be.reapply_saved(&iface).is_ok() {
+                    self.fo.dropped();
+                    self.engaged = None;
+                }
             }
-            self.fo.recovered();
+        }
+        if self.ledger.is_dirty() {
+            let path = self.ledger_path();
+            let _ = self.ledger.save(&path);
         }
         if let Some(tx) = self.probe_tx.take() {
             let _ = tx.send(ProbeCtl::Stop);
@@ -428,18 +440,31 @@ impl Watch {
         }
     }
 
+    fn last_probe_passed(&self) -> bool {
+        self.probes.back().is_some_and(|p| p.ok) && self.upstream_ok != Some(false)
+    }
+
     // -- events ---------------------------------------------------------------
 
     pub fn handle(&mut self, ev: Event, now_ms: u64) -> Flow {
         match ev {
-            Event::Cmd(line) => self.on_command(line.trim(), now_ms),
+            Event::Cmd(line) => {
+                self.on_command(line.trim(), now_ms);
+                self.touch();
+            }
             Event::StdinEof | Event::Signal => return Flow::Shutdown,
             Event::Nm(kind) => self.on_nm(kind, now_ms),
             Event::NmLost => {
                 self.dirty = Dirty { net: true, aps: self.open, profiles: true, resolver: true };
             }
-            Event::Probe(r) => self.on_probe(r, now_ms),
-            Event::Api(r) => self.on_api(r),
+            Event::Probe(r) => {
+                self.on_probe(r, now_ms);
+                self.touch();
+            }
+            Event::Api(r) => {
+                self.on_api(r);
+                self.touch();
+            }
         }
         Flow::Continue
     }
@@ -451,26 +476,21 @@ impl Watch {
     fn on_command(&mut self, cmd: &str, now_ms: u64) {
         match cmd {
             "open" => {
-                let was_open = self.open;
                 self.open = true;
                 self.op_error.clear();
                 self.mark_all_dirty();
                 self.load_config();
-                // Read now (not at the next loop turn) so the stale-scan
-                // rule looks at fresh data.
-                self.process_dirty(now_ms);
-                if !was_open {
-                    self.maybe_scan_on_open(now_ms);
-                }
                 if let Some(tx) = &self.probe_tx {
                     let _ = tx.send(ProbeCtl::Open(true));
                 }
                 if let Some(tx) = &self.api_tx {
                     let _ = tx.send(ApiCtl::Open(true));
                 }
+                self.process_dirty(now_ms);
             }
             "closed" => {
                 self.open = false;
+                self.gateway_ms = None;
                 if let Some(tx) = &self.probe_tx {
                     let _ = tx.send(ProbeCtl::Open(false));
                 }
@@ -505,6 +525,7 @@ impl Watch {
                     self.dirty.aps = true;
                     self.dirty.net = true;
                 } else {
+                    // Nothing to show while closed; the open re-reads it.
                     self.aps_stale = true;
                 }
             }
@@ -518,11 +539,15 @@ impl Watch {
 
     fn on_api(&mut self, r: ApiReport) {
         self.api.status = r.status.to_string();
+        // Remember how many of our own queries the Pi-hole had already
+        // counted when it produced each reading (see `ApiView`).
         if let Some(s) = r.summary {
             self.api.today = Some(s);
+            self.api.own_today = self.ledger.sums(r.at);
         }
         if let Some(h) = r.history {
             self.api.history = h;
+            self.api.own_history = self.ledger.clone();
         }
         if let Some(b) = r.blocking {
             self.api.blocking = Some((b, r.at));
@@ -531,15 +556,33 @@ impl Watch {
 
     // -- probes and failover ----------------------------------------------------
 
+    /// The profile whose DNS settings failover is about: the one it was
+    /// applied to while failed over, the primary link's otherwise.
+    fn watched_link(&self) -> Option<(LinkKey, &Device)> {
+        let key = match (&self.engaged, self.fo.active()) {
+            (Some(k), true) => k.clone(),
+            _ => self.link_key()?,
+        };
+        let dev = self
+            .net
+            .as_ref()?
+            .device_by_iface(&key.iface)
+            .filter(|d| d.is_up() && d.active.as_ref().is_some_and(|a| a.uuid == key.uuid))?;
+        Some((key, dev))
+    }
+
     /// Failover is allowed only with a configured Pi-hole, the switch on,
-    /// and the active profile pinned to that Pi-hole.
+    /// and the watched profile pinned to that Pi-hole.
     fn eligible(&self) -> bool {
         let Some(p) = &self.cfg.pihole else { return false };
         if !self.cfg.failover.enabled {
             return false;
         }
-        self.primary_profile()
-            .is_some_and(|prof| dnsmodel::profile_pinned(&prof.dns, p.address))
+        let Some((key, _)) = self.watched_link() else { return false };
+        self.profiles
+            .iter()
+            .find(|pr| pr.uuid == key.uuid)
+            .is_some_and(|pr| dnsmodel::profile_pinned(&pr.dns, p.address))
     }
 
     fn link_key(&self) -> Option<LinkKey> {
@@ -564,22 +607,78 @@ impl Watch {
         while self.probes.len() > MAX_PROBES {
             self.probes.pop_front();
         }
-        if self.cfg.pihole.is_none() && self.candidate == Some(r.target) && r.pihole.ok && r.pihole.blocked {
-            self.confirmed = Some(r.target);
+        self.ledger.add(r.t, r.own.total, r.own.blocked);
+        match (r.pihole.ok, r.upstream) {
+            (_, Some(u)) => self.upstream_ok = Some(u),
+            // The Pi-hole did not answer: what upstream does is unknown.
+            (false, None) => self.upstream_ok = None,
+            (true, None) => {}
+        }
+        if self.open {
+            if let Some(ms) = r.gateway_ms {
+                self.gateway_ms = Some((ms, util::unix_now()));
+            }
+        }
+        if self.cfg.pihole.is_none() && self.candidate == Some(r.target) {
+            self.candidate_probed = true;
+            if r.pihole.ok && r.pihole.blocked {
+                self.confirmed = Some(r.target);
+            }
         }
 
+        // The Pi-hole counts as up only if it answers the canary *and* can
+        // resolve something that is not blocked.
+        let healthy = r.pihole.ok && self.upstream_ok != Some(false);
         let obs = Obs {
             now_ms,
-            link: self.link_key(),
+            link: self.watched_link().map(|(k, _)| k),
             eligible: self.eligible(),
-            pihole_ok: r.pihole.ok,
+            pihole_ok: healthy,
             gateway_ok: r.gateway,
         };
         match self.fo.observe(&obs) {
-            Decision::Idle | Decision::Cleared(_) => {}
+            Decision::Idle => {}
+            Decision::Cleared(_) => self.engaged = None,
             Decision::Engage => self.engage(now_ms),
             Decision::Recover => self.recover(now_ms),
         }
+        if healthy && r.pihole.blocked {
+            self.learn_gateway();
+        }
+    }
+
+    /// First healthy sighting of a pinned profile with no gateway on file:
+    /// the Pi-hole answering and blocking means this is the network it was
+    /// pinned for. Written once per link.
+    fn learn_gateway(&mut self) {
+        if self.fo.active() || !self.eligible() {
+            return;
+        }
+        let Some((key, dev)) = self.watched_link() else { return };
+        let Some(gw) = dev.gateway else { return };
+        if self.learned_for.as_deref() == Some(key.uuid.as_str()) {
+            return;
+        }
+        self.learned_for = Some(key.uuid.clone());
+        let _ = actions::ensure_gateway_recorded(&self.state_dir, &key.uuid, gw);
+    }
+
+    /// Servers for the fallback, and the reason to show. `router` is only
+    /// used on the network the profile was pinned on (same gateway address).
+    fn fallback_plan(&self, uuid: &str, gateway: Option<std::net::Ipv4Addr>) -> (Fallback, Vec<std::net::Ipv4Addr>, String) {
+        let want = self.cfg.failover.fallback;
+        if want == Fallback::Router {
+            let recorded = actions::load_prev(&self.state_dir, uuid).and_then(|p| p.gateway_addr());
+            if gateway.is_some() && recorded == gateway {
+                return (Fallback::Router, Fallback::Router.servers(gateway), "Pi-hole not answering".into());
+            }
+            return (
+                Fallback::Quad9,
+                Fallback::Quad9.servers(None),
+                "Pi-hole not answering; this router is not the one the profile was pinned on, using quad9".into(),
+            );
+        }
+        (want, want.servers(gateway), "Pi-hole not answering".into())
     }
 
     fn engage(&mut self, now_ms: u64) {
@@ -592,14 +691,16 @@ impl Watch {
             self.fo.engage_failed(now_ms);
             return;
         };
-        let same_link = dev.active.as_ref().map(|a| a.uuid.as_str())
-            == self.link_key().as_ref().map(|k| k.uuid.as_str());
-        if !same_link {
+        let Some(uuid) = dev.active.as_ref().map(|a| a.uuid.clone()) else {
+            self.fo.engage_failed(now_ms);
+            return;
+        };
+        let watched = self.link_key();
+        if watched.as_ref().map(|k| (k.iface.as_str(), k.uuid.as_str())) != Some((dev.iface.as_str(), uuid.as_str())) {
             self.fo.engage_failed(now_ms);
             return;
         }
-        let fallback = self.cfg.failover.fallback;
-        let servers = fallback.servers(dev.gateway);
+        let (used, servers, reason) = self.fallback_plan(&uuid, dev.gateway);
         if servers.is_empty() {
             self.op_error = "failover: no gateway address for the router fallback".into();
             self.fo.engage_failed(now_ms);
@@ -608,8 +709,9 @@ impl Watch {
         match self.be.reapply_runtime_dns(&dev.iface, &servers) {
             Ok(()) => {
                 self.op_error.clear();
-                self.fo.engaged(util::unix_secs(), "Pi-hole not answering");
-                (self.notify)("Pi-hole unreachable", &format!("Using {} DNS", fallback.as_str()));
+                self.fo.engaged(util::unix_secs(), &reason);
+                self.engaged = Some(LinkKey { iface: dev.iface.clone(), uuid });
+                (self.notify)("Pi-hole unreachable", &format!("Using {} DNS", used.as_str()));
                 self.resolver_due_ms = now_ms + RESOLVER_FOLLOWUP_MS;
             }
             Err(e) => {
@@ -620,14 +722,20 @@ impl Watch {
     }
 
     fn recover(&mut self, now_ms: u64) {
-        let Some(iface) = self.primary().map(|d| d.iface.clone()) else {
+        let iface = self
+            .engaged
+            .as_ref()
+            .map(|k| k.iface.clone())
+            .or_else(|| self.primary().map(|d| d.iface.clone()));
+        let Some(iface) = iface else {
             self.fo.recover_failed(now_ms);
             return;
         };
         match self.be.reapply_saved(&iface) {
             Ok(()) => {
                 self.op_error.clear();
-                self.fo.recovered();
+                self.fo.recovered(now_ms);
+                self.engaged = None;
                 (self.notify)("Pi-hole is back", "Using Pi-hole DNS again");
                 self.resolver_due_ms = now_ms + RESOLVER_FOLLOWUP_MS;
             }
@@ -638,86 +746,39 @@ impl Watch {
         }
     }
 
-    // -- scanning -----------------------------------------------------------------
-
-    fn update_scan_running(&mut self, now_ms: u64) {
-        if !self.scan_running {
-            return;
-        }
-        let age_now = self
-            .net
-            .as_ref()
-            .and_then(|n| n.wifi_device())
-            .and_then(|d| d.wifi.as_ref())
-            .and_then(|w| w.last_scan_age_ms);
-        let progressed = match (age_now, self.scan_age_at_request) {
-            (Some(now), Some(then)) => now < then,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        let expired = self
-            .scan_requested_ms
-            .is_some_and(|t| now_ms.saturating_sub(t) >= SCAN_RUNNING_MAX_MS);
-        if progressed || expired {
-            self.scan_running = false;
-        }
-    }
-
-    /// The one automatic scan: on open, when NM's last scan is stale.
-    fn maybe_scan_on_open(&mut self, now_ms: u64) {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("QNET_DEV_NO_SCAN").is_some() {
-            return;
-        }
-        let Some(net) = &self.net else { return };
-        if !net.wifi_enabled {
-            return;
-        }
-        let Some(dev) = net.wifi_device() else { return };
-        if dev.state < NM_DEVICE_STATE_DISCONNECTED {
-            return;
-        }
-        let age = dev.wifi.as_ref().and_then(|w| w.last_scan_age_ms);
-        let stale = age.is_none_or(|a| a > SCAN_STALE_MS);
-        let spaced = self
-            .scan_requested_ms
-            .is_none_or(|t| now_ms.saturating_sub(t) >= SCAN_MIN_GAP_MS);
-        if !(stale && spaced) {
-            return;
-        }
-        let iface = dev.iface.clone();
-        match self.be.request_scan(&iface) {
-            Ok(()) => {
-                self.scan_running = true;
-                self.scan_requested_ms = Some(now_ms);
-                self.scan_age_at_request = age;
-            }
-            Err(e) => self.op_error = format!("scan: {}", e.detail()),
-        }
-    }
-
     // -- the loop's work ----------------------------------------------------------
 
     /// Perform pending reads. Cheap when nothing is dirty.
     pub fn process_dirty(&mut self, now_ms: u64) {
         let resolver_due = now_ms >= self.resolver_due_ms;
         let net_ok = now_ms.saturating_sub(self.last_net_ms) >= NET_MIN_GAP_MS || self.last_net_ms == 0;
+        let mut read = false;
         if self.dirty.net && net_ok {
             let with_aps = self.open && (self.dirty.aps || self.aps_stale);
             self.read_net(now_ms, with_aps);
             self.dirty.net = false;
             self.dirty.aps = false;
+            read = true;
         }
         if self.dirty.profiles {
             self.read_profiles();
             self.dirty.profiles = false;
+            read = true;
         }
         if self.dirty.resolver || resolver_due {
             self.read_resolver(now_ms);
             self.dirty.resolver = false;
+            read = true;
         }
-        self.sync_threads();
-        self.update_scan_running(now_ms);
+        if read {
+            self.sync_threads();
+            self.touch();
+        }
+        if self.ledger.is_dirty() && now_ms.saturating_sub(self.ledger_saved_ms) >= LEDGER_SAVE_MS {
+            let path = self.ledger_path();
+            let _ = self.ledger.save(&path);
+            self.ledger_saved_ms = now_ms;
+        }
     }
 
     pub fn state(&self, heartbeat: bool) -> State {
@@ -732,54 +793,77 @@ impl Watch {
         .find(|e| !e.is_empty())
         .map(|e| e.as_str())
         .unwrap_or("");
-        let mut st = build_state(
+        self.builds.set(self.builds.get() + 1);
+        let now = util::unix_now();
+        let gateway_ms = self
+            .gateway_ms
+            .filter(|(_, at)| self.open && now - at < GATEWAY_MS_FRESH_S)
+            .map(|(ms, _)| ms);
+        build_state(
             &Inputs {
                 net: self.net.as_ref(),
                 profiles: &self.profiles,
                 resolver: self.resolver.as_ref(),
                 cfg: &self.cfg,
                 pihole: self.effective_pihole(),
+                detected: if self.cfg.pihole.is_none() { self.confirmed } else { None },
+                detect_pending: self.detect_pending(),
                 probes: &self.probes,
+                upstream_ok: self.upstream_ok,
+                gateway_ms,
                 api: &self.api,
                 failover: &self.fo,
-                scan: ScanView { running: self.scan_running },
+                scan: ScanView { running: false },
                 error,
-                now_unix: util::unix_now(),
-                net_age_s: util::unix_now() - self.net_read_unix,
+                now_unix: now,
+                net_age_s: now - self.net_read_unix,
             },
             self.seq,
             heartbeat,
-        );
-        st.seq = self.seq;
-        st
+        )
     }
 
-    /// Decide whether a line goes out now. Updates sequence bookkeeping.
-    pub fn next_emission(&mut self, now_ms: u64) -> Option<State> {
-        let preview = self.state(false);
-        let sig = change_signature(&preview);
-        let changed = sig != self.last_sig || !self.emitted_once;
-        self.pending_change = changed;
+    /// Decide what, if anything, goes out now. A state line only when the
+    /// state changed (at most 4 per second); otherwise a bare `hb` line once
+    /// nothing has been said for the heartbeat interval. Quiet wakes cost
+    /// nothing: the state is not even built unless an input changed.
+    pub fn next_emission(&mut self, now_ms: u64) -> Option<Line> {
         let since = now_ms.saturating_sub(self.last_emit_ms);
-        let throttled = self.emitted_once && since < EMIT_MIN_GAP_MS;
-        let heartbeat_due = self.emitted_once && since >= HEARTBEAT_MS;
-        if (changed && !throttled) || heartbeat_due {
+        let hb_due = self.emitted_once && since >= self.hb_every_ms;
+        let inputs_changed = !self.emitted_once || self.gen != self.emitted_gen;
+        if !inputs_changed && !hb_due {
+            self.pending_change = false;
+            return None;
+        }
+        if inputs_changed && !hb_due && self.emitted_once && since < EMIT_MIN_GAP_MS {
+            self.pending_change = true;
+            return None;
+        }
+        let st = self.state(false);
+        let sig = change_signature(&st);
+        self.emitted_gen = self.gen;
+        self.pending_change = false;
+        if !self.emitted_once || sig != self.last_sig {
             self.seq += 1;
-            let mut st = self.state(heartbeat_due && !changed);
+            let mut st = st;
             st.seq = self.seq;
             self.last_sig = sig;
             self.last_emit_ms = now_ms;
             self.emitted_once = true;
-            self.pending_change = false;
-            Some(st)
-        } else {
-            None
+            return Some(Line::State(Box::new(st)));
         }
+        if hb_due {
+            self.last_emit_ms = now_ms;
+            return Some(Line::Hb { seq: self.seq });
+        }
+        None
     }
 
     /// Milliseconds until something needs attention.
     pub fn next_wake_ms(&self, now_ms: u64) -> u64 {
-        let mut wake = HEARTBEAT_MS.saturating_sub(now_ms.saturating_sub(self.last_emit_ms));
+        let mut wake = self
+            .hb_every_ms
+            .saturating_sub(now_ms.saturating_sub(self.last_emit_ms));
         wake = wake.min(self.resolver_due_ms.saturating_sub(now_ms));
         if self.pending_change {
             wake = wake.min((self.last_emit_ms + EMIT_MIN_GAP_MS).saturating_sub(now_ms));
@@ -787,10 +871,8 @@ impl Watch {
         if self.dirty.net || self.dirty.profiles || self.dirty.resolver {
             wake = wake.min((self.last_net_ms + NET_MIN_GAP_MS).saturating_sub(now_ms));
         }
-        if self.scan_running {
-            if let Some(t) = self.scan_requested_ms {
-                wake = wake.min((t + SCAN_RUNNING_MAX_MS).saturating_sub(now_ms));
-            }
+        if self.ledger.is_dirty() {
+            wake = wake.min((self.ledger_saved_ms + LEDGER_SAVE_MS).saturating_sub(now_ms));
         }
         wake.max(5)
     }
@@ -800,316 +882,29 @@ impl Watch {
     }
 
     #[cfg(test)]
+    pub fn state_builds(&self) -> u64 {
+        self.builds.get()
+    }
+
+    /// Pretend the API's blocking reading was taken `secs` ago.
+    #[cfg(test)]
+    pub fn age_api_blocking(&mut self, secs: f64) {
+        if let Some((_, at)) = self.api.blocking.as_mut() {
+            *at -= secs;
+        }
+    }
+
+    #[cfg(test)]
     pub fn failover_active(&self) -> bool {
         self.fo.active()
     }
 }
 
-// ---- Threads ----------------------------------------------------------------
-
-pub fn spawn_stdin(tx: Sender<Event>) {
-    thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(l) if !l.trim().is_empty() => {
-                    if tx.send(Event::Cmd(l)).is_err() {
-                        return;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        let _ = tx.send(Event::StdinEof);
-    });
-}
-
-pub fn spawn_signals(tx: Sender<Event>) {
-    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-    if let Ok(mut sigs) = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) {
-        thread::spawn(move || {
-            for _ in sigs.forever() {
-                let _ = tx.send(Event::Signal);
-            }
-        });
-    }
-}
-
-/// Watch NetworkManager's D-Bus signals and turn them into coarse events.
-pub fn spawn_nm_watcher(tx: Sender<Event>) {
-    use zbus::blocking::{Connection, MessageIterator};
-    use zbus::message::Type;
-    use zbus::MatchRule;
-    thread::spawn(move || loop {
-        if let Ok(conn) = Connection::system() {
-            let rule = MatchRule::builder()
-                .msg_type(Type::Signal)
-                .path_namespace("/org/freedesktop/NetworkManager")
-                .map(|b| b.build());
-            if let Ok(rule) = rule {
-                if let Ok(iter) = MessageIterator::for_match_rule(rule, &conn, Some(512)) {
-                    for msg in iter {
-                        let Ok(msg) = msg else { break };
-                        let hdr = msg.header();
-                        let path = hdr.path().map(|p| p.as_str().to_string()).unwrap_or_default();
-                        let kind = classify_nm_signal(&path);
-                        if tx.send(Event::Nm(kind)).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        if tx.send(Event::NmLost).is_err() {
-            return;
-        }
-        thread::sleep(Duration::from_secs(2));
-    });
-}
-
-pub fn classify_nm_signal(path: &str) -> NmKind {
-    if path.starts_with("/org/freedesktop/NetworkManager/Settings") {
-        NmKind::Settings
-    } else if path.starts_with("/org/freedesktop/NetworkManager/AccessPoint/") {
-        NmKind::Ap
-    } else {
-        NmKind::Core
-    }
-}
-
-pub fn run_probe(t: &ProbeTarget) -> ProbeReport {
-    let started = util::unix_now();
-    let pihole = match dnswire::probe_server(t.addr, &t.canary, PROBE_TIMEOUT) {
-        Ok(p) => {
-            let v = dnswire::judge(&p.reply, t.addr);
-            ProbeOutcome {
-                ok: v.ok,
-                ms: if v.ok { Some(p.rtt.as_secs_f64() * 1000.0) } else { None },
-                blocked: v.ok && v.blocked,
-            }
-        }
-        Err(_) => ProbeOutcome { ok: false, ms: None, blocked: false },
-    };
-    let gateway = if pihole.ok {
-        None
-    } else {
-        t.gateway.map(|g| {
-            matches!(
-                dnswire::probe_server(g, &t.canary, PROBE_TIMEOUT),
-                Ok(p) if p.reply.rcode == dnswire::RCODE_NOERROR || p.reply.rcode == dnswire::RCODE_NXDOMAIN
-            )
-        })
-    };
-    ProbeReport {
-        target: t.addr,
-        t: started,
-        pihole,
-        gateway,
-    }
-}
-
-pub fn spawn_prober(tx: Sender<Event>) -> (Sender<ProbeCtl>, JoinHandle<()>) {
-    let (ctl_tx, ctl_rx) = mpsc::channel::<ProbeCtl>();
-    let h = thread::spawn(move || {
-        let mut target: Option<ProbeTarget> = None;
-        let mut open = false;
-        let mut last = Instant::now() - Duration::from_secs(3600);
-        let mut next_due = Instant::now();
-        let interval = |open: bool| if open { PROBE_EVERY_OPEN } else { PROBE_EVERY_CLOSED };
-        loop {
-            let now = Instant::now();
-            let wait = if target.is_some() {
-                next_due.saturating_duration_since(now)
-            } else {
-                Duration::from_secs(3600)
-            };
-            match ctl_rx.recv_timeout(wait) {
-                Ok(ProbeCtl::Target(t)) => {
-                    target = t;
-                    next_due = Instant::now();
-                }
-                Ok(ProbeCtl::Open(o)) => {
-                    open = o;
-                    next_due = if o && last.elapsed() > Duration::from_secs(2) {
-                        Instant::now()
-                    } else {
-                        last + interval(o)
-                    };
-                }
-                Ok(ProbeCtl::Kick) => {
-                    next_due = (last + Duration::from_secs(1)).max(Instant::now());
-                }
-                Ok(ProbeCtl::Stop) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Some(t) = &target {
-                        let report = run_probe(t);
-                        last = Instant::now();
-                        next_due = last + interval(open);
-                        if tx.send(Event::Probe(report)).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
-    (ctl_tx, h)
-}
-
-fn password_fn(addr: IpAddr) -> crate::pihole::PasswordFn {
-    Box::new(move || {
-        config::lookup_password(addr).map_err(|e| match e {
-            config::SecretError::Missing(m) => ApiError::Auth(m),
-            config::SecretError::Failed(m) => ApiError::Other(m),
-        })
-    })
-}
-
-pub fn spawn_api(tx: Sender<Event>) -> (Sender<ApiCtl>, JoinHandle<()>) {
-    let (ctl_tx, ctl_rx) = mpsc::channel::<ApiCtl>();
-    let h = thread::spawn(move || {
-        let mut cfg: Option<ApiCfg> = None;
-        let mut client: Option<Pihole> = None;
-        let mut open = false;
-        let mut next_poll = Instant::now();
-        let mut last_poll = Instant::now() - Duration::from_secs(3600);
-        let mut last_history: Option<Instant> = None;
-        loop {
-            let now = Instant::now();
-            let wait = if open && cfg.is_some() {
-                next_poll.saturating_duration_since(now)
-            } else {
-                Duration::from_secs(3600)
-            };
-            match ctl_rx.recv_timeout(wait) {
-                Ok(ApiCtl::Config(c)) => {
-                    if let Some(mut old) = client.take() {
-                        old.logout();
-                    }
-                    cfg = c;
-                    last_history = None;
-                    next_poll = Instant::now();
-                }
-                Ok(ApiCtl::Open(o)) => {
-                    open = o;
-                    if o {
-                        next_poll = Instant::now();
-                    } else if let Some(c) = client.as_mut() {
-                        c.close_idle();
-                    }
-                }
-                Ok(ApiCtl::Kick) => {
-                    next_poll = (last_poll + Duration::from_secs(1)).max(Instant::now());
-                }
-                Ok(ApiCtl::Stop) | Err(RecvTimeoutError::Disconnected) => {
-                    if let Some(mut c) = client.take() {
-                        c.logout();
-                    }
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    let Some(c) = cfg.clone() else { continue };
-                    if client.is_none() {
-                        let made = Pihole::new(c.addr, c.pin, password_fn(c.addr)).map(|p| match util::sid_path() {
-                            Some(path) => p.with_sid_file(path),
-                            None => p,
-                        });
-                        match made {
-                            Ok(mut p) => {
-                                // A session left behind by a killed predecessor.
-                                p.resume_session();
-                                client = Some(p);
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Event::Api(failure(&e)));
-                                next_poll = Instant::now() + Duration::from_secs(30);
-                                continue;
-                            }
-                        }
-                    }
-                    let api = client.as_mut().expect("just created");
-                    last_poll = Instant::now();
-                    let history_due = last_history.is_none_or(|t| t.elapsed() >= HISTORY_EVERY);
-                    let res = poll(api, history_due);
-                    api.close_idle();
-                    match res {
-                        Ok(report) => {
-                            if report.history.is_some() {
-                                last_history = Some(Instant::now());
-                            }
-                            next_poll = Instant::now() + API_EVERY;
-                            if tx.send(Event::Api(report)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            // Do not hammer logins or a dead host.
-                            next_poll = Instant::now()
-                                + match e {
-                                    ApiError::Auth(_) => Duration::from_secs(60),
-                                    ApiError::Tls(_) => Duration::from_secs(30),
-                                    _ => API_EVERY,
-                                };
-                            if matches!(e, ApiError::Auth(_)) {
-                                client = None;
-                            }
-                            if tx.send(Event::Api(failure(&e))).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-    (ctl_tx, h)
-}
-
-fn failure(e: &ApiError) -> ApiReport {
-    ApiReport {
-        status: e.status(),
-        summary: None,
-        blocking: None,
-        history: None,
-        at: util::unix_now(),
-    }
-}
-
-fn poll(api: &mut Pihole, with_history: bool) -> Result<ApiReport, ApiError> {
-    let summary = api.summary()?;
-    let blocking = api.blocking()?;
-    let history = if with_history { Some(api.history()?) } else { None };
-    Ok(ApiReport {
-        status: "ok",
-        summary: Some(summary),
-        blocking: Some(blocking),
-        history,
-        at: util::unix_now(),
-    })
-}
-
-/// `notify-send` in the background; failures are ignored.
-pub fn desktop_notify(title: &str, body: &str) {
-    let (t, b) = (title.to_string(), body.to_string());
-    thread::spawn(move || {
-        let _ = crate::proc::run(
-            "notify-send",
-            &["-a", "qnet", &t, &b],
-            None,
-            Duration::from_secs(5),
-            1024,
-        );
-    });
-}
-
 // ---- Entry point ----------------------------------------------------------------
 
-/// Write each state as one JSON line; false when stdout is gone.
-pub fn write_line(out: &mut impl Write, st: &State) -> bool {
-    let Ok(mut line) = serde_json::to_vec(st) else { return true };
-    line.push(b'\n');
-    out.write_all(&line).and_then(|_| out.flush()).is_ok()
+/// Write one line; false when stdout is gone.
+pub fn write_line(out: &mut impl Write, line: &Line) -> bool {
+    out.write_all(&line.to_json_line()).and_then(|_| out.flush()).is_ok()
 }
 
 /// Ask the kernel to send SIGTERM when the parent process goes away, so an
@@ -1126,35 +921,19 @@ fn die_with_parent() -> bool {
     }
 }
 
-pub fn run_watch(be: Box<dyn NetBackend>) -> i32 {
-    if !die_with_parent() {
-        return 0;
-    }
-    let (tx, rx) = mpsc::channel::<Event>();
-    let mut w = Watch::new(be, util::config_path());
-    w.set_notifier(Box::new(desktop_notify));
-    spawn_signals(tx.clone());
-    spawn_stdin(tx.clone());
-    spawn_nm_watcher(tx.clone());
-    let (probe_tx, probe_h) = spawn_prober(tx.clone());
-    let (api_tx, api_h) = spawn_api(tx.clone());
-    w.attach_threads(probe_tx, api_tx);
-
-    let t0 = Instant::now();
-    let ms = move || t0.elapsed().as_millis() as u64;
-    w.startup(ms());
-
-    let stdout = std::io::stdout();
+/// The event loop. `out` receives each line; returning false (a closed
+/// stdout) ends the loop. Returns when asked to shut down.
+pub fn run_loop(w: &mut Watch, rx: &Receiver<Event>, clock: &dyn Fn() -> u64, out: &mut dyn FnMut(&Line) -> bool) {
     let mut shutdown = false;
 
     // Give the first probe a moment so the first line is not a false
     // "unreachable".
-    let deadline = ms() + 500;
-    while w.probe_pending() && ms() < deadline {
-        let left = deadline.saturating_sub(ms()).max(1);
+    let deadline = clock() + 500;
+    while w.probe_pending() && clock() < deadline {
+        let left = deadline.saturating_sub(clock()).max(1);
         match rx.recv_timeout(Duration::from_millis(left)) {
             Ok(ev) => {
-                if w.handle(ev, ms()) == Flow::Shutdown {
+                if w.handle(ev, clock()) == Flow::Shutdown {
                     shutdown = true;
                     break;
                 }
@@ -1164,24 +943,24 @@ pub fn run_watch(be: Box<dyn NetBackend>) -> i32 {
     }
 
     loop {
-        let now = ms();
+        let now = clock();
         w.process_dirty(now);
-        if let Some(st) = w.next_emission(now) {
-            if !write_line(&mut stdout.lock(), &st) {
+        if let Some(line) = w.next_emission(now) {
+            if !out(&line) {
                 break;
             }
         }
         if shutdown {
             break;
         }
-        let wake = w.next_wake_ms(ms());
+        let wake = w.next_wake_ms(clock());
         match rx.recv_timeout(Duration::from_millis(wake)) {
             Ok(ev) => {
-                if w.handle(ev, ms()) == Flow::Shutdown {
+                if w.handle(ev, clock()) == Flow::Shutdown {
                     break;
                 }
                 while let Ok(ev) = rx.try_recv() {
-                    if w.handle(ev, ms()) == Flow::Shutdown {
+                    if w.handle(ev, clock()) == Flow::Shutdown {
                         shutdown = true;
                         break;
                     }
@@ -1191,10 +970,34 @@ pub fn run_watch(be: Box<dyn NetBackend>) -> i32 {
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+pub fn run_watch(be: Box<dyn NetBackend>) -> i32 {
+    if !die_with_parent() {
+        return 0;
+    }
+    util::harden_process();
+    let (tx, rx) = mpsc::channel::<Event>();
+    let mut w = Watch::new(be, util::config_path());
+    w.set_notifier(Box::new(desktop_notify));
+    spawn_signals(tx.clone());
+    spawn_stdin(tx.clone());
+    spawn_nm_watcher(tx.clone());
+    let (probe_tx, probe_h) = spawn_prober(tx.clone(), Cadence::default(), real_probe());
+    let (api_tx, api_h) = spawn_api(tx.clone(), ApiTiming::default(), real_api_factory());
+    // Keep a second sender for the final join: `shutdown` consumes the
+    // watch's own copies.
+    w.attach_threads(probe_tx.clone(), api_tx.clone());
+
+    let t0 = Instant::now();
+    let clock = move || t0.elapsed().as_millis() as u64;
+    w.startup(clock());
+
+    let stdout = std::io::stdout();
+    run_loop(&mut w, &rx, &clock, &mut |line| write_line(&mut stdout.lock(), line));
 
     w.shutdown();
-    let _ = probe_h.join();
-    let _ = api_h.join();
+    stop_workers(probe_tx, probe_h, api_tx, api_h);
     0
 }
 
@@ -1203,7 +1006,8 @@ pub fn state_once(be: Box<dyn NetBackend>) -> State {
     let mut w = Watch::new(be, util::config_path());
     w.startup(0);
     if let Some(t) = w.probe_target.clone() {
-        let report = run_probe(&t);
+        let req = ProbeRequest { upstream: false, icmp: false };
+        let report = run_probe(&t, &req, &mut CanaryState::default());
         w.on_probe(report, 0);
     }
     let mut st = w.state(false);
@@ -1215,6 +1019,7 @@ pub fn state_once(be: Box<dyn NetBackend>) -> State {
 mod tests {
     use super::*;
     use crate::net::fake::*;
+    use crate::pihole::{Blocking, BlockingState, Summary};
     use std::sync::{Arc, Mutex};
 
     const PI: &str = "192.168.1.153";
@@ -1223,7 +1028,7 @@ mod tests {
         w: Watch,
         be: Arc<FakeNet>,
         notes: Arc<Mutex<Vec<(String, String)>>>,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         t: u64,
     }
 
@@ -1242,11 +1047,12 @@ mod tests {
         }
         let be = Arc::new(be);
         let mut w = Watch::new(Box::new(be.clone()), path);
+        w.set_state_dir(dir.path().join("state"));
         let notes: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
         let n2 = notes.clone();
         w.set_notifier(Box::new(move |t, b| n2.lock().unwrap().push((t.into(), b.into()))));
         w.startup(0);
-        Rig { w, be, notes, _dir: dir, t: 0 }
+        Rig { w, be, notes, dir, t: 0 }
     }
 
     fn rig() -> Rig {
@@ -1263,6 +1069,9 @@ mod tests {
                 blocked: ok,
             },
             gateway: gw,
+            upstream: None,
+            own: OwnQueries { total: 1, blocked: u32::from(ok) },
+            gateway_ms: None,
         }
     }
 
@@ -1278,6 +1087,7 @@ mod tests {
             self.t += 15_000;
             self.w.on_probe(report(true, None), self.t);
         }
+        /// Three failed probes 15 s apart: 30 s of failure.
         fn fail3(&mut self) {
             for _ in 0..3 {
                 self.probe(false, Some(true));
@@ -1286,13 +1096,25 @@ mod tests {
         fn runtime_calls(&self) -> Vec<String> {
             self.be.calls().into_iter().filter(|c| c.starts_with("reapply_runtime_dns")).collect()
         }
-        fn saved_calls(&self) -> usize {
-            self.be.calls().iter().filter(|c| c.starts_with("reapply_saved")).count()
+        fn saved_calls(&self) -> Vec<String> {
+            self.be.calls().into_iter().filter(|c| c.starts_with("reapply_saved")).collect()
+        }
+        fn state_dir(&self) -> std::path::PathBuf {
+            self.dir.path().join("state")
         }
     }
 
+    fn state_of(l: Line) -> State {
+        match l {
+            Line::State(s) => *s,
+            other => panic!("expected a state line, got {other:?}"),
+        }
+    }
+
+    // -- failover -----------------------------------------------------------
+
     #[test]
-    fn engages_after_three_failures_with_gateway_up() {
+    fn engages_after_thirty_seconds_of_failure_with_gateway_up() {
         let mut r = rig();
         r.settle();
         r.fail3();
@@ -1308,6 +1130,7 @@ mod tests {
         assert_eq!(st.dns.mode_source, "runtime-failover");
         assert!(st.dns.failover.active && st.dns.failover.enabled);
         assert!(st.dns.failover.since > 0);
+        assert!(!st.dns.bypassed, "a failover is not a bypass");
         // The saved profile was never written.
         assert!(!r.be.calls().iter().any(|c| c.starts_with("set_profile_dns")));
         assert!(r.be.profile(U_WIFI).dns.v4_dns == vec![PI.parse::<std::net::Ipv4Addr>().unwrap()]);
@@ -1357,10 +1180,7 @@ mod tests {
 
     #[test]
     fn failover_disabled_in_config_or_profile_not_pinned_never_engages() {
-        let mut r = rig_with(
-            Some(config_text("enabled = false")),
-            FakeNet::live_machine(),
-        );
+        let mut r = rig_with(Some(config_text("enabled = false")), FakeNet::live_machine());
         r.settle();
         r.fail3();
         r.fail3();
@@ -1379,6 +1199,52 @@ mod tests {
     }
 
     #[test]
+    fn upstream_failures_count_as_an_outage_when_the_canary_still_answers() {
+        let mut r = rig();
+        r.settle();
+        // The canary is answered (blocked locally) but upstream SERVFAILs.
+        for _ in 0..3 {
+            r.t += 15_000;
+            let mut rep = report(true, None);
+            rep.upstream = Some(false);
+            r.w.on_probe(rep, r.t);
+        }
+        assert_eq!(r.w.state(false).pihole.health, "degraded");
+        // The gateway probe only runs when the canary fails, so a degraded
+        // Pi-hole needs the gate answered too: it was not asked here.
+        assert!(r.runtime_calls().is_empty(), "no gateway evidence, no failover");
+        r.t += 15_000;
+        let mut rep = report(true, Some(true));
+        rep.upstream = Some(false);
+        r.w.on_probe(rep, r.t);
+        assert_eq!(r.runtime_calls().len(), 1, "degraded for over 30 s with the gateway up");
+    }
+
+    #[test]
+    fn recovery_waits_for_upstream_to_work_again() {
+        let mut r = rig();
+        r.settle();
+        r.fail3();
+        assert!(r.w.failover_active());
+        for _ in 0..4 {
+            r.t += 15_000;
+            let mut rep = report(true, None);
+            rep.upstream = Some(false);
+            r.w.on_probe(rep, r.t);
+        }
+        assert!(r.w.failover_active(), "canary alone is not enough");
+        assert!(r.saved_calls().is_empty());
+        for _ in 0..3 {
+            r.t += 15_000;
+            let mut rep = report(true, None);
+            rep.upstream = Some(true);
+            r.w.on_probe(rep, r.t);
+        }
+        assert!(!r.w.failover_active());
+        assert_eq!(r.saved_calls().len(), 1);
+    }
+
+    #[test]
     fn recovers_after_three_good_probes_and_notifies() {
         let mut r = rig();
         r.settle();
@@ -1386,14 +1252,32 @@ mod tests {
         assert!(r.w.failover_active());
         r.probe(true, None);
         r.probe(true, None);
-        assert_eq!(r.saved_calls(), 0);
+        assert_eq!(r.saved_calls().len(), 0);
         r.probe(true, None);
-        assert_eq!(r.saved_calls(), 1);
+        assert_eq!(r.saved_calls().len(), 1);
         assert!(!r.w.failover_active());
         assert_eq!(r.notes.lock().unwrap().len(), 2);
         assert_eq!(r.notes.lock().unwrap()[1].0, "Pi-hole is back");
         r.w.process_dirty(r.t + 2_000);
         assert_eq!(r.w.state(false).dns.mode, "pihole");
+    }
+
+    #[test]
+    fn a_second_outage_right_after_recovery_is_held_off() {
+        let mut r = rig();
+        r.settle();
+        r.fail3();
+        r.probe(true, None);
+        r.probe(true, None);
+        r.probe(true, None);
+        assert_eq!(r.saved_calls().len(), 1);
+        // Down again at once: 60 s hold-down after the recovery.
+        r.probe(false, Some(true));
+        r.probe(false, Some(true));
+        r.probe(false, Some(true));
+        assert_eq!(r.runtime_calls().len(), 1, "still only the first failover");
+        r.probe(false, Some(true));
+        assert_eq!(r.runtime_calls().len(), 2, "allowed once the hold-down has passed");
     }
 
     #[test]
@@ -1413,13 +1297,12 @@ mod tests {
     }
 
     #[test]
-    fn router_fallback_without_gateway_does_not_engage() {
+    fn router_fallback_without_a_known_gateway_uses_quad9_not_nothing() {
         let mut r = rig();
         r.settle();
         r.be.set_gateway(None);
         r.fail3();
-        assert!(r.runtime_calls().is_empty());
-        assert!(r.w.state(false).error.contains("no gateway"));
+        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
     }
 
     #[test]
@@ -1432,14 +1315,111 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_returns_a_runtime_failover_to_the_saved_profile() {
+    fn router_fallback_is_only_trusted_on_the_network_the_profile_was_pinned_on() {
+        let mut r = rig();
+        // The profile was pinned on a network with another router.
+        actions::save_prev(
+            &r.state_dir(),
+            U_WIFI,
+            &r.be.profile(U_WIFI).dns,
+            Some("10.0.0.1".parse().unwrap()),
+        )
+        .unwrap();
+        r.settle();
+        r.fail3();
+        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+        let st = r.w.state(false);
+        assert!(st.dns.failover.reason.contains("quad9"), "{}", st.dns.failover.reason);
+        assert!(st.dns.failover.reason.contains("not the one the profile was pinned on"));
+        assert_eq!(r.notes.lock().unwrap()[0].1, "Using quad9 DNS", "the notification names what is really used");
+    }
+
+    #[test]
+    fn the_gateway_is_learned_once_from_a_healthy_pinned_profile() {
+        let mut r = rig();
+        assert!(actions::load_prev(&r.state_dir(), U_WIFI).is_none());
+        r.settle();
+        let prev = actions::load_prev(&r.state_dir(), U_WIFI).expect("recorded on the first healthy probe");
+        assert_eq!(prev.gateway_addr(), Some("192.168.1.1".parse().unwrap()));
+        // Not rewritten on every probe, and never overwritten by a different router.
+        actions::record_gateway(&r.state_dir(), U_WIFI, "10.0.0.1".parse().unwrap()).unwrap();
+        r.probe(true, None);
+        r.probe(true, None);
+        assert_eq!(
+            actions::load_prev(&r.state_dir(), U_WIFI).unwrap().gateway_addr(),
+            Some("10.0.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn unhealthy_or_unpinned_profiles_learn_nothing() {
+        let mut r = rig();
+        r.t += 15_000;
+        r.w.on_probe(report(false, Some(true)), r.t);
+        assert!(actions::load_prev(&r.state_dir(), U_WIFI).is_none());
+        let be = FakeNet::live_machine();
+        be.set_profile_dns_direct(U_WIFI, be.profile(U_WIFI).dns.automatic());
+        be.apply_saved_to_link();
+        let mut r = rig_with(Some(config_text("enabled = true")), be);
+        r.settle();
+        assert!(actions::load_prev(&r.state_dir(), U_WIFI).is_none());
+    }
+
+    #[test]
+    fn recovery_goes_back_to_the_link_that_was_failed_over_even_if_the_primary_changed() {
+        let mut r = rig();
+        r.settle();
+        r.fail3();
+        assert!(r.w.failover_active());
+        // Ethernet comes up and takes the default route; Wi-Fi stays up.
+        r.be.add_ethernet_primary();
+        r.w.handle(Event::Nm(NmKind::Core), r.t);
+        r.t += 1_000;
+        r.w.process_dirty(r.t);
+        assert_eq!(r.w.state(false).link.kind, "ethernet");
+        assert!(r.w.failover_active(), "the engaged link is still up: nothing was reset");
+        r.probe(true, None);
+        r.probe(true, None);
+        r.probe(true, None);
+        assert_eq!(r.saved_calls(), vec!["reapply_saved wlp7s0"], "{:?}", r.be.calls());
+        assert!(!r.w.failover_active());
+    }
+
+    #[test]
+    fn failover_is_dropped_when_the_engaged_link_itself_goes_away() {
+        let mut r = rig();
+        r.settle();
+        r.fail3();
+        r.be.set_link_down();
+        r.w.handle(Event::Nm(NmKind::Core), r.t);
+        r.t += 1_000;
+        r.w.process_dirty(r.t);
+        r.probe(true, None);
+        assert!(!r.w.failover_active(), "a new activation loads the saved profile anyway");
+        assert!(r.saved_calls().is_empty(), "nothing to undo on a dead link");
+    }
+
+    #[test]
+    fn shutdown_restores_only_when_the_last_probe_passed() {
+        // Pi-hole answering again: put the saved profile back.
+        let mut r = rig();
+        r.settle();
+        r.fail3();
+        r.probe(true, None);
+        assert!(r.w.failover_active());
+        r.w.shutdown();
+        assert_eq!(r.saved_calls().len(), 1);
+        assert_eq!(r.be.link_servers(), vec![PI.parse::<std::net::IpAddr>().unwrap()]);
+
+        // Pi-hole still dead: do not strand DNS on it.
         let mut r = rig();
         r.settle();
         r.fail3();
         assert!(r.w.failover_active());
         r.w.shutdown();
-        assert_eq!(r.saved_calls(), 1);
-        assert_eq!(r.be.link_servers(), vec![PI.parse::<std::net::IpAddr>().unwrap()]);
+        assert!(r.saved_calls().is_empty(), "left on the fallback");
+        assert_eq!(r.be.link_servers(), vec!["192.168.1.1".parse::<std::net::IpAddr>().unwrap()]);
+
         // Without failover, shutdown touches nothing.
         let mut r = rig();
         r.w.shutdown();
@@ -1471,25 +1451,32 @@ mod tests {
         assert!(r.w.state(false).pihole.probes.is_empty());
     }
 
+    // -- detection without a config -------------------------------------------
+
     #[test]
-    fn unconfigured_pihole_is_detected_after_it_blocks_the_canary() {
+    fn unconfigured_pihole_is_detected_but_never_adopted_as_the_address() {
         let mut r = rig_with(None, FakeNet::live_machine());
         let st = r.w.state(false);
         assert!(!st.pihole.configured);
         assert_eq!(st.pihole.api, "unconfigured");
-        assert_eq!(st.pihole.address, "", "not trusted yet");
-        assert_eq!(st.dns.mode, "custom");
-        assert!(st.dns.leaks.is_empty());
+        assert_eq!(st.pihole.address, "");
+        assert_eq!(st.pihole.admin_url, "");
+        assert_eq!(st.pihole.detected, "");
+        assert_eq!(st.dns.mode, "unknown", "never 'custom' while the candidate is still being checked");
+        assert_eq!(st.pihole.health, "unknown");
 
         r.t = 15_000;
         r.w.on_probe(report(true, None), r.t);
         let st = r.w.state(false);
-        assert_eq!(st.pihole.address, PI);
+        assert_eq!(st.pihole.address, "", "the address comes from the config only");
+        assert_eq!(st.pihole.admin_url, "");
+        assert_eq!(st.pihole.detected, PI, "display only");
         assert!(st.pihole.reachable && !st.pihole.configured);
         assert_eq!(st.pihole.blocking, "enabled");
         assert_eq!(st.dns.mode, "pihole");
         assert_eq!(st.dns.leaks.len(), 2);
         assert!(!st.dns.failover.enabled, "no failover without a config");
+        assert!(!st.dns.bypassed, "bypassed needs a configured Pi-hole");
         // And no failover however long it stays down.
         r.settle();
         r.fail3();
@@ -1498,63 +1485,32 @@ mod tests {
     }
 
     #[test]
-    fn detection_requires_blocking_not_just_an_answer() {
+    fn a_resolver_that_does_not_block_ends_the_pending_state_as_custom() {
         let mut r = rig_with(None, FakeNet::live_machine());
         let mut rep = report(true, None);
         rep.pihole.blocked = false; // a LAN resolver that does not block
         r.w.on_probe(rep, 15_000);
         let st = r.w.state(false);
-        assert_eq!(st.pihole.address, "");
-        assert_eq!(st.dns.mode, "custom");
+        assert_eq!(st.pihole.detected, "");
+        assert_eq!(st.dns.mode, "custom", "the question is answered now");
     }
 
+    // -- the panel being open ---------------------------------------------------
+
     #[test]
-    fn open_scans_only_when_the_last_scan_is_stale() {
+    fn opening_the_panel_never_requests_a_scan() {
         let be = FakeNet::live_machine();
-        be.set_last_scan_age_ms(Some(40_000));
+        be.set_last_scan_age_ms(Some(600_000)); // as stale as it gets
         let mut r = rig_with(None, be);
-        let scans = |r: &Rig| r.be.calls().iter().filter(|c| c.starts_with("request_scan")).count();
-        r.t = 2_000;
-        r.w.handle(Event::Cmd("open".into()), r.t);
-        assert_eq!(scans(&r), 1);
-        assert!(r.w.state(false).scan.running);
-        // Close and reopen right away: not within 15 s of the last request.
-        r.w.handle(Event::Cmd("closed".into()), r.t + 100);
-        r.w.handle(Event::Cmd("open".into()), r.t + 200);
-        assert_eq!(scans(&r), 1);
-        // The scan completes (age drops): running clears.
-        r.be.set_last_scan_age_ms(Some(500));
-        r.t += 1_000;
-        r.w.handle(Event::Nm(NmKind::Core), r.t);
-        r.w.process_dirty(r.t + 300);
+        r.w.handle(Event::Cmd("open".into()), 2_000);
+        r.w.handle(Event::Cmd("closed".into()), 3_000);
+        r.w.handle(Event::Cmd("open".into()), 60_000);
+        r.w.handle(Event::Cmd("refresh".into()), 61_000);
+        r.w.process_dirty(62_000);
+        assert!(!r.be.calls().iter().any(|c| c.starts_with("request_scan")), "{:?}", r.be.calls());
         assert!(!r.w.state(false).scan.running);
-    }
-
-    #[test]
-    fn open_with_a_fresh_scan_and_refresh_never_scan() {
-        let be = FakeNet::live_machine();
-        be.set_last_scan_age_ms(Some(12_000));
-        let mut r = rig_with(None, be);
-        r.w.handle(Event::Cmd("open".into()), 2_000);
-        r.w.handle(Event::Cmd("refresh".into()), 3_000);
-        r.w.handle(Event::Cmd("closed".into()), 4_000);
-        assert!(!r.be.calls().iter().any(|c| c.starts_with("request_scan")));
-        // Stale but via refresh only: still no scan.
-        r.be.set_last_scan_age_ms(Some(120_000));
-        r.w.handle(Event::Cmd("refresh".into()), 60_000);
-        r.w.process_dirty(60_500);
-        assert!(!r.be.calls().iter().any(|c| c.starts_with("request_scan")));
-    }
-
-    #[test]
-    fn no_scan_when_the_radio_is_off() {
-        let be = FakeNet::live_machine();
-        be.set_last_scan_age_ms(None);
-        be.set_wifi_enabled(false).unwrap();
-        let mut r = rig_with(None, be);
-        r.w.handle(Event::Cmd("open".into()), 2_000);
-        assert!(!r.be.calls().iter().any(|c| c.starts_with("request_scan")));
-        assert!(r.w.state(false).networks.is_empty());
+        // It does report how old the last scan is, counting up between reads.
+        assert!(r.w.state(false).scan.last_scan_age_s.unwrap() >= 600);
     }
 
     #[test]
@@ -1605,27 +1561,246 @@ mod tests {
     }
 
     #[test]
+    fn gateway_latency_exists_only_while_open_and_fresh() {
+        let mut r = rig();
+        let mut rep = report(true, None);
+        rep.gateway_ms = Some(3.84);
+        // Closed: a stray measurement is not shown.
+        r.w.on_probe(rep.clone(), 10_000);
+        assert_eq!(r.w.state(false).link.gateway_ms, None);
+        r.w.handle(Event::Cmd("open".into()), 11_000);
+        r.w.on_probe(rep.clone(), 12_000);
+        assert_eq!(r.w.state(false).link.gateway_ms, Some(3.8));
+        // An unanswered ping clears nothing by itself but does not refresh it.
+        // Closing hides it at once.
+        r.w.handle(Event::Cmd("closed".into()), 13_000);
+        assert_eq!(r.w.state(false).link.gateway_ms, None);
+        // And a new Pi-hole target forgets it.
+        r.w.handle(Event::Cmd("open".into()), 14_000);
+        r.w.on_probe(rep, 15_000);
+        assert!(r.w.state(false).link.gateway_ms.is_some());
+    }
+
+    // -- numbers ----------------------------------------------------------------
+
+    fn api_report(total: u64, blocked: u64) -> ApiReport {
+        ApiReport {
+            status: "ok",
+            summary: Some(Summary { total, blocked, percent: 0.0 }),
+            blocking: Some(Blocking { state: BlockingState::Enabled, timer: None }),
+            history: None,
+            at: util::unix_now(),
+        }
+    }
+
+    #[test]
+    fn our_own_probes_are_subtracted_from_todays_numbers() {
+        let mut r = rig();
+        r.w.set_heartbeat_ms(1);
+        for _ in 0..10 {
+            let mut rep = report(true, None);
+            rep.t = util::unix_now();
+            rep.own = OwnQueries { total: 2, blocked: 1 }; // e.g. canary + upstream
+            r.w.on_probe(rep, r.t);
+        }
+        r.w.handle(Event::Api(api_report(300, 120)), r.t);
+        let st = r.w.state(false);
+        assert_eq!(st.pihole.today.self_queries, 20);
+        assert_eq!(st.pihole.today.total, 280);
+        assert_eq!(st.pihole.today.blocked, 110);
+        assert!((st.pihole.today.percent - 39.3).abs() < 0.05, "{}", st.pihole.today.percent);
+        // Never negative, even if Pi-hole has not caught up with our queries.
+        r.w.handle(Event::Api(api_report(5, 1)), r.t);
+        let st = r.w.state(false);
+        assert_eq!((st.pihole.today.total, st.pihole.today.blocked, st.pihole.today.self_queries), (0, 0, 5));
+        assert_eq!(st.pihole.today.percent, 0.0);
+    }
+
+    #[test]
+    fn today_does_not_dip_between_api_polls() {
+        let mut r = rig();
+        r.w.handle(Event::Api(api_report(100, 40)), r.t);
+        assert_eq!(r.w.state(false).pihole.today.total, 100);
+        // Our probes keep flying, but the Pi-hole's reading is from before
+        // them: subtracting them from it would make the count fall.
+        for _ in 0..3 {
+            let mut rep = report(true, None);
+            rep.t = util::unix_now();
+            rep.own = OwnQueries { total: 2, blocked: 1 };
+            r.w.on_probe(rep, r.t);
+        }
+        let st = r.w.state(false);
+        assert_eq!((st.pihole.today.total, st.pihole.today.self_queries), (100, 0));
+        // The next reading includes them, and now they are taken out.
+        r.w.handle(Event::Api(api_report(106, 43)), r.t);
+        let st = r.w.state(false);
+        assert_eq!((st.pihole.today.total, st.pihole.today.blocked, st.pihole.today.self_queries), (100, 40, 6));
+    }
+
+    #[test]
+    fn the_query_tally_survives_a_restart() {
+        let mut r = rig();
+        let mut rep = report(true, None);
+        rep.t = util::unix_now();
+        rep.own = OwnQueries { total: 7, blocked: 4 };
+        r.w.on_probe(rep, 1_000);
+        r.w.shutdown();
+        let saved = r.state_dir().join("self-queries.json");
+        assert!(saved.exists());
+        let led = Ledger::load(&saved);
+        assert_eq!(led.sums(util::unix_now()), (7, 4));
+        // A fresh Watch on the same state dir starts from it.
+        let be = Arc::new(FakeNet::live_machine());
+        let mut w2 = Watch::new(Box::new(be), r.dir.path().join("config.toml"));
+        w2.set_state_dir(r.state_dir());
+        w2.startup(0);
+        w2.on_api(api_report(100, 50));
+        assert_eq!(w2.state(false).pihole.today.self_queries, 7);
+    }
+
+    #[test]
+    fn health_and_canary_blocked() {
+        let mut r = rig();
+        let st = r.w.state(false);
+        assert_eq!(st.pihole.health, "unknown");
+        assert_eq!(st.pihole.canary_blocked, None);
+        r.w.on_probe(report(true, None), 15_000);
+        let st = r.w.state(false);
+        assert_eq!(st.pihole.health, "ok");
+        assert_eq!(st.pihole.canary_blocked, Some(true));
+        // Paused: answered, not blocked.
+        let mut rep = report(true, None);
+        rep.pihole.blocked = false;
+        r.w.on_probe(rep, 30_000);
+        assert_eq!(r.w.state(false).pihole.canary_blocked, Some(false));
+        // Canary fine, upstream failing.
+        let mut rep = report(true, None);
+        rep.upstream = Some(false);
+        r.w.on_probe(rep, 45_000);
+        assert_eq!(r.w.state(false).pihole.health, "degraded");
+        // And back.
+        let mut rep = report(true, None);
+        rep.upstream = Some(true);
+        r.w.on_probe(rep, 60_000);
+        assert_eq!(r.w.state(false).pihole.health, "ok");
+        // Two silent probes: unreachable, and upstream is forgotten.
+        r.w.on_probe(report(false, Some(true)), 75_000);
+        r.w.on_probe(report(false, Some(true)), 90_000);
+        assert_eq!(r.w.state(false).pihole.health, "unreachable");
+        // A canary answered after the outage is judged on its own again.
+        r.w.on_probe(report(true, None), 105_000);
+        assert_eq!(r.w.state(false).pihole.health, "ok");
+    }
+
+    // -- output -------------------------------------------------------------------
+
+    #[test]
     fn emission_rules() {
         let mut r = rig();
         // First line goes out immediately.
-        let a = r.w.next_emission(100).expect("first state");
+        let a = state_of(r.w.next_emission(100).expect("first state"));
         assert_eq!(a.seq, 1);
         assert!(!a.heartbeat);
         // Nothing changed: nothing to say.
         assert!(r.w.next_emission(200).is_none());
         // A change inside the 250 ms window waits.
-        r.w.on_probe(report(true, None), 300);
+        r.w.handle(Event::Probe(report(true, None)), 300);
         assert!(r.w.next_emission(320).is_none());
         assert!(r.w.next_wake_ms(320) <= 30);
-        let b = r.w.next_emission(360).expect("coalesced change");
+        let b = state_of(r.w.next_emission(360).expect("coalesced change"));
         assert_eq!(b.seq, 2);
-        // Quiet for 10 s: heartbeat, with a fresh seq.
+        // Quiet for 10 s: a bare heartbeat that repeats the last seq.
         assert!(r.w.next_emission(9_000).is_none());
         let h = r.w.next_emission(10_600).expect("heartbeat");
-        assert!(h.heartbeat);
-        assert_eq!(h.seq, 3);
-        // Clock-only differences do not trigger lines.
-        assert!(r.w.next_emission(11_000).is_none());
+        assert_eq!(h, Line::Hb { seq: 2 });
+        assert_eq!(h.to_json_line(), b"{\"type\":\"hb\",\"seq\":2}\n".to_vec());
+        // And again 10 s later; the state seq did not move.
+        assert!(r.w.next_emission(15_000).is_none());
+        assert_eq!(r.w.next_emission(20_700).unwrap(), Line::Hb { seq: 2 });
+    }
+
+    #[test]
+    fn quiet_wakes_do_not_build_the_state() {
+        let mut r = rig();
+        r.w.next_emission(100).unwrap();
+        let built = r.w.state_builds();
+        for ms in (200..9_000).step_by(100) {
+            assert!(r.w.next_emission(ms).is_none());
+        }
+        assert_eq!(r.w.state_builds(), built, "no inputs changed, so nothing was serialised");
+        // An ignored AP signal while closed is also free.
+        r.w.handle(Event::Nm(NmKind::Ap), 9_100);
+        r.w.process_dirty(9_100);
+        assert!(r.w.next_emission(9_200).is_none());
+        assert_eq!(r.w.state_builds(), built);
+        // The heartbeat check itself rebuilds once to see whether anything
+        // time-driven changed; unchanged, it prints just hb.
+        assert_eq!(r.w.next_emission(10_200).unwrap(), Line::Hb { seq: 1 });
+        assert_eq!(r.w.state_builds(), built + 1);
+    }
+
+    #[test]
+    fn a_clock_driven_change_is_sent_as_a_state_not_swallowed_by_the_heartbeat() {
+        let mut r = rig();
+        r.w.next_emission(100).unwrap();
+        // The API reading goes stale on the clock alone (45 s), no event.
+        r.w.handle(Event::Api(api_report(10, 1)), 200);
+        state_of(r.w.next_emission(500).unwrap());
+        // Simulate staleness by aging the stored reading.
+        r.w.age_api_blocking(60.0);
+        let line = r.w.next_emission(11_000).unwrap();
+        assert!(matches!(line, Line::State(_)), "{line:?}");
+    }
+
+    #[test]
+    fn the_run_loop_emits_state_then_heartbeats_and_stops_on_eof() {
+        let be = Arc::new(FakeNet::live_machine());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("c.toml"), config_text("enabled = true")).unwrap();
+        let mut w = Watch::new(Box::new(be), dir.path().join("c.toml"));
+        w.set_state_dir(dir.path().join("state"));
+        w.set_heartbeat_ms(60);
+        w.startup(0);
+        let (tx, rx) = mpsc::channel::<Event>();
+        // The first probe is what the loop waits for before the first line.
+        tx.send(Event::Probe(report(true, None))).unwrap();
+        let t0 = Instant::now();
+        let clock = move || t0.elapsed().as_millis() as u64;
+        let lines: Arc<Mutex<Vec<Line>>> = Arc::default();
+        let l2 = lines.clone();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            tx.send(Event::StdinEof).unwrap();
+        });
+        run_loop(&mut w, &rx, &clock, &mut |l| {
+            l2.lock().unwrap().push(l.clone());
+            true
+        });
+        h.join().unwrap();
+        let lines = lines.lock().unwrap();
+        assert!(matches!(lines[0], Line::State(_)));
+        let hbs = lines.iter().filter(|l| matches!(l, Line::Hb { .. })).count();
+        let states = lines.iter().filter(|l| matches!(l, Line::State(_))).count();
+        assert_eq!(states, 1, "nothing changed, so only the first state");
+        assert!(hbs >= 2, "{} heartbeats", hbs);
+    }
+
+    #[test]
+    fn a_closed_stdout_ends_the_loop() {
+        let be = Arc::new(FakeNet::live_machine());
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Watch::new(Box::new(be), dir.path().join("none.toml"));
+        w.set_state_dir(dir.path().join("state"));
+        w.startup(0);
+        let (_tx, rx) = mpsc::channel::<Event>();
+        let t0 = Instant::now();
+        let clock = move || t0.elapsed().as_millis() as u64;
+        let mut calls = 0;
+        run_loop(&mut w, &rx, &clock, &mut |_| {
+            calls += 1;
+            false // EPIPE
+        });
+        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -1652,34 +1827,5 @@ mod tests {
         assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager/Devices/4"), NmKind::Core);
         assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager/IP4Config/2"), NmKind::Core);
         assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager"), NmKind::Core);
-    }
-
-    #[test]
-    fn real_probe_against_a_local_dns_server() {
-        use std::net::UdpSocket;
-        let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = srv.local_addr().unwrap().port();
-        // run_probe sends to port 53, so test the pieces: judge + a live
-        // exchange on a custom port through dnswire.
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 512];
-            if let Ok((n, from)) = srv.recv_from(&mut buf) {
-                let mut resp = buf[..n].to_vec();
-                resp[2] = 0x81;
-                resp[3] = 0x80;
-                resp[7] = 1; // one answer
-                resp.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 2, 0, 4, 0, 0, 0, 0]);
-                let _ = srv.send_to(&resp, from);
-            }
-        });
-        let p = dnswire::query_a(
-            format!("127.0.0.1:{port}").parse().unwrap(),
-            "doubleclick.net",
-            Duration::from_secs(2),
-            None,
-        )
-        .unwrap();
-        let v = dnswire::judge(&p.reply, "127.0.0.1".parse().unwrap());
-        assert!(v.ok && v.blocked);
     }
 }
