@@ -803,6 +803,13 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
+    // Open the panel on a view: "main", "dns" or "wifi" (for scripts and
+    // screenshots; no synthetic input needed).
+    function view(name: string): void {
+      root.open()
+      if (name === "dns" || name === "wifi") root.openView(name, false)
+      else if (root.page !== "main") root.goBack(false)
+    }
   }
 
   // ---------------------------------------------------------- bar icon
