@@ -135,6 +135,11 @@ pub struct Cadence {
     pub open: Duration,
     pub upstream_closed: Duration,
     pub upstream_open: Duration,
+    /// After a failed cycle, probe this often (open or closed) until
+    /// `settle_good` good cycles in a row: failover and recovery stay quick
+    /// while the healthy closed cadence stays cheap.
+    pub suspect: Duration,
+    pub settle_good: u32,
     /// Never probe more often than this, whatever is asked.
     pub min_gap: Duration,
 }
@@ -142,10 +147,14 @@ pub struct Cadence {
 impl Default for Cadence {
     fn default() -> Self {
         Self {
-            closed: Duration::from_secs(60),
+            // The dedicated canary and the own-query subtraction keep the
+            // Pi-hole's numbers clean, so the closed cadence can stay at 15 s.
+            closed: Duration::from_secs(15),
             open: Duration::from_secs(5),
             upstream_closed: Duration::from_secs(60),
             upstream_open: Duration::from_secs(15),
+            suspect: Duration::from_secs(5),
+            settle_good: 6,
             min_gap: Duration::from_secs(1),
         }
     }
@@ -299,7 +308,12 @@ pub fn spawn_prober(tx: Sender<Event>, cadence: Cadence, probe: ProbeFn) -> (Sen
         let mut last = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
         let mut last_upstream: Option<Instant> = None;
         let mut next_due = Instant::now();
-        let interval = |open: bool| if open { cadence.open } else { cadence.closed };
+        // Good cycles still needed before leaving the fast `suspect` cadence.
+        let mut unsettled: u32 = 0;
+        let interval = |open: bool, unsettled: u32| {
+            let base = if open { cadence.open } else { cadence.closed };
+            if unsettled > 0 { base.min(cadence.suspect) } else { base }
+        };
         let upstream_every = |open: bool| if open { cadence.upstream_open } else { cadence.upstream_closed };
         loop {
             let now = Instant::now();
@@ -319,10 +333,10 @@ pub fn spawn_prober(tx: Sender<Event>, cadence: Cadence, probe: ProbeFn) -> (Sen
                     open = o;
                     // Opening: probe now if the last probe is a full open
                     // interval old, otherwise keep to the schedule.
-                    next_due = if o && last.elapsed() >= interval(true) {
+                    next_due = if o && last.elapsed() >= interval(true, unsettled) {
                         Instant::now()
                     } else {
-                        last + interval(o)
+                        last + interval(o, unsettled)
                     };
                 }
                 Ok(ProbeCtl::Kick) => {
@@ -343,7 +357,9 @@ pub fn spawn_prober(tx: Sender<Event>, cadence: Cadence, probe: ProbeFn) -> (Sen
                             // Check upstream again on the first good cycle.
                             last_upstream = None;
                         }
-                        next_due = last + interval(open);
+                        let failed = !report.pihole.ok || report.upstream == Some(false);
+                        unsettled = if failed { cadence.settle_good } else { unsettled.saturating_sub(1) };
+                        next_due = last + interval(open, unsettled);
                         if tx.send(Event::Probe(report)).is_err() {
                             break;
                         }
@@ -658,6 +674,8 @@ mod tests {
             open: Duration::from_millis(30),
             upstream_closed: Duration::from_millis(200),
             upstream_open: Duration::from_millis(100),
+            suspect: Duration::from_millis(40),
+            settle_good: 3,
             min_gap: Duration::from_millis(15),
         }
     }
@@ -705,6 +723,40 @@ mod tests {
         ctl.send(ProbeCtl::Stop).unwrap();
         h.join().unwrap();
         assert!(drain_probes(&rx) >= 3);
+    }
+
+    #[test]
+    fn a_failed_probe_switches_to_the_suspect_cadence_until_it_settles() {
+        let (tx, _rx) = mpsc::channel();
+        let seen: Seen = Arc::default();
+        let fails = Arc::new(Mutex::new(2u32));
+        let probe: ProbeFn = {
+            let (seen, fails) = (seen.clone(), fails.clone());
+            Arc::new(move |t, req, _| {
+                seen.lock().unwrap().push((Instant::now(), *req));
+                let mut r = ok_report(t, req);
+                let mut f = fails.lock().unwrap();
+                if *f > 0 {
+                    *f -= 1;
+                    r.pihole = ProbeOutcome { ok: false, ms: None, blocked: false };
+                }
+                r
+            })
+        };
+        let (ctl, h) = spawn_prober(tx, fast(), probe);
+        ctl.send(ProbeCtl::Target(Some(tgt(53)))).unwrap();
+        // Closed cadence is 200 ms, suspect 40 ms: 2 failures + 3 settling
+        // good cycles all land well inside 400 ms.
+        sleep(400);
+        let n = seen.lock().unwrap().len();
+        assert!(n >= 5, "fast while failing and settling, got {n}");
+        // Settled: back to the 200 ms closed cadence.
+        let before = seen.lock().unwrap().len();
+        sleep(300);
+        let after = seen.lock().unwrap().len();
+        assert!(after - before <= 2, "settled cadence is slow again, got {}", after - before);
+        ctl.send(ProbeCtl::Stop).unwrap();
+        h.join().unwrap();
     }
 
     #[test]
