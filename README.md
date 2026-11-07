@@ -47,6 +47,41 @@ Blind council: Opus/Sonnet seats plus a Fable security seat, with an Opus chair.
 | R3, the Route + drill-down rows | | 8.2: "still the dns and wifi menus" |
 | R3b, node navigation, network-native views | seats 7 / 6.5 / 7 / 7.5 / 8 | |
 
+## Next round: the chair's minimum for 8.5 (not started)
+
+Mostly subtractions. Do not add identity elements before the owner rates 3b.
+
+1. **Wi-Fi view tooltip:** "Scan (r)" shows on hover only and stays inside
+   the gutter.
+2. **Main view subtraction:**
+   - drop the footer and the header signal %;
+   - replace the blocked pool gauge with "51% blocked" text and demote the
+     query count;
+   - hide Pause when the Pi-hole isn't the resolver.
+3. **No alarm while healthy:** no badge or warning for inactive profiles.
+4. **DNS view, out of Sound Hub grammar:**
+   - leaks become dashed branches off the chain ("inactive · Pin", one Pin all);
+   - failover state goes into the Pi-hole row caption;
+   - drop the Leaks and Failover sections and the IP on the resolver radio.
+5. **Wi-Fi card:**
+   - drop the Signal and DNS rows;
+   - plasma-tint the connected network's bars;
+   - move the list up.
+6. **Navigable nodes:** a persistent brighter ring at rest. No `›`, which
+   reads as a menu row.
+7. **Truth:**
+   - a line plus a cure for every non-profile leak;
+   - Automatic lists the servers actually seen;
+   - "ready" only when failover is eligible.
+8. **Failover:**
+   - Quad9 by default;
+   - reachability from gateway ICMP plus the fallback query;
+   - warning wording when router trust rests on the MAC.
+9. **No silent passes:**
+   - the downgrade check reports "unknown" on timeout (or reads the journal);
+   - adopt only fallbacks qnet recognises;
+   - gravity empty or stale counts as degraded.
+
 ## Known issues (open, from round 3)
 
 **Truth.**
