@@ -3,16 +3,20 @@ import qs.Ui
 import qs.Commons
 import "../Model.js" as Model
 
-// One network that is not the one in use (that is the header's). A glyph for
-// its signal, its name, and on the right a dim caption: "Saved", "Open" (an
-// unsaved open network is marked), "802.1X", or what is happening
-// ("Connecting…", an error in urgent). There is no lock on the others.
+// One network. A glyph for its signal (the one in use leads the list: its
+// glyph and "Connected" are the accent, and "Disconnect" is on the row), its
+// name, and on the right a dim caption: "Saved", "Open" (an unsaved open
+// network is marked), "802.1X", or what is happening ("Connecting…", an error
+// in urgent). There is no lock on the others.
 //
 //   press / Enter     saved or open: connect; secured and unknown: the
 //                     passphrase row opens under this one; 802.1X that is not
-//                     saved: nmtui in a terminal
-//   right-click / Delete   known networks: Forget, asked again in place
-//                     ("Forget  Cancel"; Enter forgets, Esc cancels)
+//                     saved: nmtui in a terminal. On the one in use a press
+//                     does nothing (Disconnect is its own button; Enter on it
+//                     disconnects).
+//   right-click / Delete   saved networks, the one in use included: Forget,
+//                     asked again in place ("Forget  Cancel"; Enter forgets,
+//                     Esc cancels)
 //
 // The passphrase row lives here, under its network, so it stays with that
 // network if the list reorders. The text is cleared when it closes.
@@ -70,8 +74,8 @@ Item {
       anchors.verticalCenter: parent.verticalCenter
       textFormat: Text.PlainText
       renderType: Text.NativeRendering
-      text: Model.wifiGlyph(row.net.signal)
-      color: row.hub.dim
+      text: row.net.active ? Model.linkGlyph(row.hub.view) : Model.wifiGlyph(row.net.signal)
+      color: row.net.active ? row.hub.accent : row.hub.dim
       font.family: row.hub.fontFamily
       font.pixelSize: row.hub.typeBody + Style.space(3)
     }
@@ -98,15 +102,17 @@ Item {
       anchors.right: parent.right
       anchors.rightMargin: row.hub.gutter
       anchors.verticalCenter: parent.verticalCenter
-      width: row.armed ? armedRow.width : Math.min(captionLabel.implicitWidth, surface.width * 0.5)
+      width: row.armed ? armedRow.width
+        : Math.min(captionLabel.implicitWidth, surface.width * 0.4) + (disconnect.visible ? disconnect.width - disconnect.padX + Style.space(6) : 0)
       height: surface.height
 
       Text {
         id: captionLabel
         visible: !row.armed
-        anchors.right: parent.right
+        anchors.right: disconnect.visible ? disconnect.left : parent.right
+        anchors.rightMargin: disconnect.visible ? Style.space(6) - disconnect.padX : 0
         anchors.verticalCenter: parent.verticalCenter
-        width: parent.width
+        width: Math.min(implicitWidth, surface.width * 0.4)
         horizontalAlignment: Text.AlignRight
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
@@ -115,6 +121,22 @@ Item {
         font.family: row.hub.fontFamily
         font.pixelSize: row.hub.typeSmall
         elide: Text.ElideRight
+      }
+
+      // The one in use can be dropped from its own row.
+      TextButton {
+        id: disconnect
+        visible: row.net.active && !row.armed && !row.hub.pending.disconnecting
+        hub: row.hub
+        anchors.right: parent.right
+        anchors.rightMargin: -padX
+        anchors.verticalCenter: parent.verticalCenter
+        padX: Style.space(6)
+        padY: Style.space(4)
+        text: row.hub.strings.t("net.disconnect")
+        textColor: row.hub.dim
+        hotColor: row.hub.fg
+        onClicked: row.hub.disconnectNet()
       }
 
       Row {
@@ -155,7 +177,7 @@ Item {
       onClicked: function(mouse) {
         row.hub.setCursor("net:" + row.index, 0)
         if (mouse.button === Qt.RightButton) row.hub.armForget(row.index)
-        else row.hub.activateNet(row.index)
+        else if (!row.net.active) row.hub.activateNet(row.index)
       }
     }
 

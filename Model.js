@@ -27,12 +27,16 @@ var MAX_SERVERS = 8
 var MAX_LEAKS = 8
 var HISTORY_BUCKET_S = 600
 var HISTORY_SPAN_S = 86400
-var MIN_AXIS_S = 10800         // the graph's x-axis is never shorter than 3 h
+var MAX_UPSTREAMS = 4
 var STABLE_UPTIME_MS = 30000   // a watch child must live this long to reset the backoff
 var PAUSE_SECONDS = 300
 var LATENCY_BAD_MS = 100
 var PENDING_TTL_MS = 12000     // an unconfirmed request is given up after this
 var SCAN_SPIN_MS = 4000
+var SCAN_IF_STALE_S = 60         // entering the Wi-Fi view scans only if the last scan is older
+var FAILOVER_AFTER_S = 30        // the backend fails over after this long of failed probes
+var ACTION_DEADLINE_MS = 25000   // an action that has not answered by now is given up
+var GW_SLOW_MS = 50              // the gateway's latency is worth a word above this
 
 var BACKOFF_MS = [1000, 2000, 5000, 10000, 30000]
 var AP_PATH_RE = /^\/org\/freedesktop\/NetworkManager\/AccessPoint\/\d+$/
@@ -53,6 +57,13 @@ var GLYPH = {
   qr: "\u{f0432}",
   speed: "\u{f04c5}",
   refresh: "\u{f0450}",
+  pc: "\u{f0322}",
+  ap: "\u{f05a9}",
+  shield: "\u{f0498}",
+  shieldOutline: "\u{f0499}",
+  shieldOff: "\u{f099c}",
+  earth: "\u{f01e7}",
+  plus: "\u{f0415}",
   check: "\u{f012c}"
 }
 
@@ -132,7 +143,7 @@ function normalizeState(raw) {
     if (!isObj(lk[j])) continue
     var uuid = String(lk[j].uuid || "")
     leaks.push({
-      kind: oneOf(lk[j].kind, ["link", "profile", "ipv6-ra"], "link"),
+      kind: oneOf(lk[j].kind, ["link", "profile", "ipv6-ra", "resolved-fallback"], "link"),
       where: clean(lk[j].where, 80), uuid: UUID_RE.test(uuid) ? uuid : "",
       detail: clean(lk[j].detail, 120)
     })
@@ -176,6 +187,28 @@ function normalizeState(raw) {
 
   var pms = p.latencyMs === null || p.latencyMs === undefined ? NaN : num(p.latencyMs, NaN)
   var gms = l.gatewayMs === null || l.gatewayMs === undefined ? NaN : num(l.gatewayMs, NaN)
+  var dbm = l.signalDbm === null || l.signalDbm === undefined ? NaN : num(l.signalDbm, NaN)
+
+  // The resolvers the Pi-hole forwards to, busiest first, at most four.
+  var upstreams = []
+  var up = Array.isArray(p.upstreams) ? p.upstreams : []
+  for (var u = 0; u < up.length; u++) {
+    if (!isObj(up[u])) continue
+    var uip = addr(up[u].ip)
+    var rms = up[u].responseMs === null || up[u].responseMs === undefined ? NaN : num(up[u].responseMs, NaN)
+    if (uip === "" && clean(up[u].name, 80) === "") continue
+    upstreams.push({
+      name: clean(up[u].name, 80), ip: uip, port: clamp(toInt(up[u].port, 53), 0, 65535),
+      count: Math.max(0, toInt(up[u].count, 0)), responseMs: isFinite(rms) && rms >= 0 ? rms : null
+    })
+  }
+  upstreams.sort(function(a, b) { return b.count - a.count })
+  upstreams = upstreams.slice(0, MAX_UPSTREAMS)
+  var ab = isObj(p.answeredBy) ? p.answeredBy : {}
+  var answeredBy = {
+    blocklist: Math.max(0, toInt(ab.blocklist, 0)), cache: Math.max(0, toInt(ab.cache, 0)),
+    forwarded: Math.max(0, toInt(ab.forwarded, 0))
+  }
   // health is the Pi-hole's state; reachable follows it when it is given.
   var healthRaw = oneOf(p.health, ["ok", "degraded", "unreachable", "unknown"], "")
   var reachable = healthRaw !== "" ? (healthRaw === "ok" || healthRaw === "degraded") : p.reachable === true
@@ -189,6 +222,8 @@ function normalizeState(raw) {
       ssid: clean(l.ssid, 64), signal: clamp(toInt(l.signal, 0), 0, 100), band: clean(l.band, 12),
       bitrateMbps: Math.max(0, toInt(l.bitrateMbps, 0)), ip4: ip(l.ip4), gateway: ip(l.gateway),
       gatewayMs: isFinite(gms) && gms >= 0 ? gms : null,
+      gatewayOk: typeof l.gatewayOk === "boolean" ? l.gatewayOk : null,
+      signalDbm: isFinite(dbm) && dbm < 0 && dbm >= -130 ? Math.round(dbm) : null,
       connectivity: oneOf(l.connectivity, ["full", "limited", "portal", "none", "unknown"], "unknown"),
       portalUrl: safeUrl(l.portalUrl)
     },
@@ -211,6 +246,8 @@ function normalizeState(raw) {
       configured: p.configured === true, address: addr(p.address), adminUrl: safeUrl(p.adminUrl),
       detected: addr(p.detected), reachable: reachable, health: health,
       canaryBlocked: typeof p.canaryBlocked === "boolean" ? p.canaryBlocked : null,
+      healthReason: clean(p.healthReason, 80),
+      upstreams: upstreams, answeredBy: answeredBy,
       historySpanS: clamp(num(p.historySpanS, 0), 0, HISTORY_SPAN_S),
       latencyMs: isFinite(pms) && pms >= 0 ? pms : null,
       blocking: oneOf(p.blocking, ["enabled", "disabled", "unknown"], "unknown"),
@@ -309,18 +346,6 @@ function formatLatency(ms, fmt) {
   return formatDecimal(Math.round(v), 0, fmt) + " ms"
 }
 
-// 5400 -> "1.5 h", 7200 -> "2 h", 2400 -> "40 min", 50000 -> "14 h"
-function formatSpan(sec, fmt) {
-  var s = Math.max(0, num(sec, 0))
-  if (s < 3600) return formatDecimal(Math.max(1, Math.round(s / 60)), 0, fmt) + " min"
-  var h = s / 3600
-  if (h < 10) {
-    var tenth = Math.round(h * 10) / 10
-    return formatDecimal(tenth, tenth === Math.round(tenth) ? 0 : 1, fmt) + " h"
-  }
-  return formatDecimal(Math.round(h), 0, fmt) + " h"
-}
-
 // 866 -> "866 Mb/s", 1000 -> "1 Gb/s", 2500 -> "2.5 Gb/s"
 function formatRate(mbps, fmt) {
   var v = num(mbps, 0)
@@ -365,10 +390,8 @@ function effective(state, pending, appliedMs, nowMs, down) {
   if (p.dns === "pihole" || p.dns === "auto") mode = p.dns
   if (mode !== state.dns.mode) {
     // Asked for the Pi-hole: pinned, so nothing bypasses it. Asked for
-    // Automatic: unpinned, which is what "bypassed" means with a Pi-hole set up.
-    v.dns = Object.assign({}, state.dns, {
-      mode: mode, modeSource: "profile", bypassed: mode === "auto" && state.pihole.configured
-    })
+    // Automatic through qnet: a choice, not a bypass.
+    v.dns = Object.assign({}, state.dns, { mode: mode, modeSource: "profile", bypassed: false })
     v.dns.failover = Object.assign({}, state.dns.failover, { active: false })
   }
   var blocking = state.pihole.blocking
@@ -480,11 +503,41 @@ function blockingWord(v) {
   return ""
 }
 
+// How long until the backend fails over, in seconds, while the Pi-hole's
+// probes are failing and a failover is armed (enabled and not yet active);
+// null otherwise. The failing run is counted from the probes themselves, to
+// nowS (or to the newest probe when nowS is not given).
+function failoverIn(v, nowS) {
+  var f = v.dns.failover
+  if (!f.enabled || f.active) return null
+  var pr = v.pihole.probes
+  var i = pr.length - 1
+  while (i >= 0 && !pr[i].ok) i--
+  if (i === pr.length - 1) return null
+  var first = pr[i + 1].t
+  var now = typeof nowS === "number" ? nowS : pr[pr.length - 1].t
+  return Math.min(FAILOVER_AFTER_S, Math.max(0, Math.ceil(FAILOVER_AFTER_S - (now - first))))
+}
+
+// Who the extra resolver is when the Pi-hole is one of several: the first
+// server that is not the Pi-hole, as { who, viaRa } ("router" or an address;
+// viaRa when it arrives by IPv6 router advertisement), or null.
+function extraResolver(v) {
+  if (v.dns.mode !== "pihole") return null
+  var s = v.dns.servers
+  var who = ""
+  for (var i = 0; i < s.length; i++) if (s[i].role !== "pihole") { who = s[i].role === "router" ? "router" : s[i].addr; break }
+  var ra = false
+  for (var j = 0; j < v.dns.leaks.length; j++) if (v.dns.leaks[j].kind === "ipv6-ra") ra = true
+  if (who === "" && ra) who = "router"
+  return who === "" ? null : { who: who, viaRa: ra }
+}
+
 // What the hero says. kind picks the state word (Panel maps it to a
 // translated string), tone its colour, `frozen` greys the graph.
 //
 //   pihole       accent   queries are answered by the Pi-hole and it blocks
-//   paused       dim      the Pi-hole answers but blocking is off (countdown)
+//   paused       warning  the Pi-hole answers but blocking is off (countdown)
 //   degraded     warning  the Pi-hole answers its canary but upstream fails
 //   fallback     warning  a runtime failover moved DNS off the Pi-hole
 //   bypassed     urgent   a Pi-hole is set up and this link's queries can skip
@@ -500,17 +553,24 @@ function blockingWord(v) {
 // setup: no Pi-hole is configured, so the hero offers to set one up
 // (`detected` is a candidate on the LAN, shown as such, never used).
 // empty: nothing to draw. frozen: unreachable or the API fails, so the graph
-// is old. blocking: "blocking" | "notBlocking" | "" (see blockingWord).
-function heroState(v) {
+// is old. desaturated: frozen, or DNS is not going through the Pi-hole at
+// all (the picture greys either way). blocking: "blocking" | "notBlocking" |
+// "" (see blockingWord). action: the one corrective step this state offers,
+// "setup" | "signin" | "usepihole" | "pin" | "" (it sits on the hero's line;
+// nothing gets a row of its own). failoverIn: seconds until the backend
+// fails over, while that is armed and the probes fail. extra: see
+// extraResolver, set when the Pi-hole is one of several resolvers.
+function heroState(v, nowS) {
   var p = v.pihole
   var d = v.dns
   var cur = currentServer(v)
   var apiBad = p.api !== "ok"
   var out = {
-    kind: "router", tone: "dim", frozen: false, setup: !p.configured, empty: !p.configured,
+    kind: "router", tone: "dim", frozen: false, desaturated: true, setup: !p.configured, empty: !p.configured,
     via: cur ? cur.addr : "", latencyMs: null, latencyBad: false, apiIssue: "",
     fallback: "", pauseS: 0, noAnswer: false, sinceS: 0, blocking: "",
-    resolvedFallback: "", detected: p.configured ? "" : p.detected
+    resolvedFallback: "", detected: p.configured ? "" : p.detected,
+    action: "", failoverIn: null, extra: null, healthReason: p.healthReason
   }
   if (v.backendDown) {
     out.kind = "nobackend"; out.tone = "urgent"; out.frozen = true; out.setup = false; out.empty = true
@@ -525,6 +585,7 @@ function heroState(v) {
     else if (d.mode === "unknown") { out.kind = "checking"; out.via = "" }
     else out.kind = "router"
     out.frozen = true
+    out.action = v.link.kind === "none" ? "" : "setup"
     return out
   }
 
@@ -534,36 +595,44 @@ function heroState(v) {
   out.latencyBad = out.latencyMs !== null && out.latencyMs > LATENCY_BAD_MS || (p.reachable && probesFailing)
   out.apiIssue = p.reachable && apiBad && p.api !== "unconfigured" ? p.api : ""
   out.frozen = !p.reachable || apiBad
+  out.desaturated = out.frozen || d.mode !== "pihole"
+  if (p.reachable && p.api === "auth") out.action = "signin"
 
   if (v.link.kind === "none") {
-    out.kind = "offline"; out.tone = "dim"; out.frozen = true; out.via = ""; out.latencyMs = null
-    out.latencyBad = false; out.apiIssue = ""
+    out.kind = "offline"; out.tone = "dim"; out.frozen = true; out.desaturated = true; out.via = ""; out.latencyMs = null
+    out.latencyBad = false; out.apiIssue = ""; out.action = ""
     return out
   }
   if (d.mode === "unknown" || (p.health === "unknown" && d.mode !== "none")) {
     out.kind = "checking"; out.tone = "dim"; out.via = ""; out.latencyMs = null; out.latencyBad = false; out.apiIssue = ""
+    out.desaturated = true; out.action = ""
     return out
   }
   if (d.mode === "none") {
     out.kind = "none"; out.tone = "urgent"; out.resolvedFallback = d.resolvedFallback; out.via = ""
-    out.latencyMs = null; out.latencyBad = false; out.apiIssue = ""
+    out.latencyMs = null; out.latencyBad = false; out.apiIssue = ""; out.desaturated = true
+    out.action = "usepihole"
     return out
   }
   if (d.mode === "fallback" || d.failover.active) {
     out.kind = "fallback"; out.tone = "warning"; out.fallback = d.failover.fallback
     out.sinceS = d.failover.since; out.latencyMs = null; out.latencyBad = false; out.apiIssue = ""
-    out.frozen = true
+    out.frozen = true; out.desaturated = true; out.action = ""
     return out
   }
   if (d.mode === "pihole") {
     if (!p.reachable) {
       out.kind = "unreachable"; out.tone = "urgent"; out.noAnswer = true; out.via = p.address || out.via
-      out.latencyBad = false; out.apiIssue = ""
+      out.latencyBad = false; out.apiIssue = ""; out.failoverIn = failoverIn(v, nowS); out.action = ""
       return out
     }
     out.blocking = blockingWord(v)
-    if (d.bypassed) { out.kind = "bypassed"; out.tone = "urgent"; return out }
-    if (isPaused(v)) { out.kind = "paused"; out.tone = "dim"; out.pauseS = p.pauseRemainingS; out.blocking = ""; return out }
+    if (d.bypassed) {
+      out.kind = "bypassed"; out.tone = "urgent"; out.extra = extraResolver(v); out.blocking = ""
+      out.action = "pin"
+      return out
+    }
+    if (isPaused(v)) { out.kind = "paused"; out.tone = "warning"; out.pauseS = p.pauseRemainingS; out.blocking = ""; return out }
     if (p.health === "degraded") { out.kind = "degraded"; out.tone = "warning"; return out }
     out.kind = "pihole"; out.tone = "accent"
     return out
@@ -571,162 +640,266 @@ function heroState(v) {
   // automatic or custom DNS: bypassed when a reachable Pi-hole is set up
   // and this link is not pinned to it
   out.latencyMs = null; out.latencyBad = false
-  if (d.bypassed && p.reachable) { out.kind = "bypassed"; out.tone = "urgent"; return out }
+  if (d.bypassed && p.reachable) { out.kind = "bypassed"; out.tone = "urgent"; out.action = "pin"; return out }
   out.kind = d.mode === "custom" ? "custom" : "router"
   out.tone = "dim"
   return out
 }
 
-// ------------------------------------------------------------- the graph
-
-// The x-axis: three hours at least, as long as the history there is, a day
-// at most; right-anchored on now.
-function axisSpan(spanS) {
-  return clamp(Math.max(MIN_AXIS_S, num(spanS, 0)), MIN_AXIS_S, HISTORY_SPAN_S)
+// Whether the panel's clock must tick while it is open: a pause counting
+// down, a failover countdown, or a request waiting for the backend.
+function needsClock(v, pending, nowS) {
+  if (hasPending(pending)) return true
+  if (v.pihole.blocking === "disabled") return true
+  return failoverIn(v, nowS) !== null && !v.pihole.reachable && v.dns.mode === "pihole"
 }
 
-// Seconds of history from its first non-empty bucket to nowS: the span the
-// backend reports as historySpanS, for when it does not.
-function dataSpan(history, nowS) {
-  var h = Array.isArray(history) ? history : []
-  for (var i = 0; i < h.length; i++) if (h[i].total > 0) return Math.max(0, nowS - h[i].t)
-  return 0
-}
+// ------------------------------------------------------------- the route
 
-// Whether the panel says how much history the graph holds: only while it is
-// under a day.
-function showSpanLabel(spanS) {
-  var s = num(spanS, 0)
-  return s > 0 && s < HISTORY_SPAN_S - HISTORY_BUCKET_S
-}
-
-// The history as columns of 10 minutes ending at nowS, as many as the axis
-// holds, scaled to 0..1 against the busiest column (plus headroom) and
-// lightly smoothed. Missing buckets are empty columns.
-//   { total, blocked, peak, n, axisS, start } or null without data; start is
-//   the first column that holds anything (the columns before it are empty).
-function historySeries(history, nowS, spanS) {
-  var h = Array.isArray(history) ? history : []
-  if (h.length === 0) return null
-  var axis = axisSpan(spanS)
-  var colS = HISTORY_BUCKET_S
-  var cols = Math.max(2, Math.round(axis / colS))
-  // Columns sit on the bucket grid, the last one being the bucket now is in.
-  var t0 = Math.floor(nowS / colS) * colS - (cols - 1) * colS
-  var total = []
-  var blocked = []
+// How busy DNS is right now, 0..1: the last three history buckets' average
+// against the busiest bucket of the day, never under 0.15 while there is any
+// traffic. It sets how thick the flow on the route is.
+function queryDensity(v) {
+  var h = v.pihole.history
+  var peak = 0
   var i
-  for (i = 0; i < cols; i++) { total.push(0); blocked.push(0) }
-  for (i = 0; i < h.length; i++) {
-    var idx = Math.floor((h[i].t - t0) / colS)
-    if (idx < 0 || idx >= cols) continue
-    total[idx] += h[i].total
-    blocked[idx] += h[i].blocked
+  for (i = 0; i < h.length; i++) if (h[i].total > peak) peak = h[i].total
+  if (peak <= 0) return v.pihole.today.total > 0 ? 0.3 : 0
+  var recent = 0
+  var n = 0
+  for (i = Math.max(0, h.length - 3); i < h.length; i++) { recent += h[i].total; n++ }
+  return clamp((recent / Math.max(1, n)) / peak, 0.15, 1)
+}
+
+// Today's blocked share, 0..1.
+function blockedShare(v) {
+  var t = v.pihole.today
+  if (t.total <= 0) return 0
+  return clamp(t.blocked / t.total, 0, 1)
+}
+
+// "192.168.1.242" -> ".242"; anything else, "" (an IPv6 address is not
+// shortened this way).
+function lastOctet(address) {
+  var m = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.(\d{1,3})$/.exec(String(address || ""))
+  return m ? "." + m[1] : ""
+}
+
+// How the Pi-hole's answers divide, in whole percent: { blocklist, cache,
+// forwarded } (they add up to 100 unless there is nothing yet).
+function answeredShares(a) {
+  var total = a.blocklist + a.cache + a.forwarded
+  if (total <= 0) return { blocklist: 0, cache: 0, forwarded: 0 }
+  var b = Math.round(a.blocklist * 100 / total)
+  var c = Math.round(a.cache * 100 / total)
+  return { blocklist: b, cache: c, forwarded: Math.max(0, 100 - b - c) }
+}
+
+function part(text, tone) { return { text: String(text), tone: tone || "" } }
+function word(key, args, tone) { return { key: key, args: args || [], tone: tone || "" } }
+
+// The address as it goes under a node: a LAN address as its last octet
+// (".153"), anything else whole ("9.9.9.9").
+function shortAddr(a) {
+  var o = lastOctet(a)
+  return o !== "" && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a) ? o : a
+}
+
+// The hero's picture, as data: the route a DNS query takes from this machine
+// out to the internet, hop by hop, and what state each hop is in. HeroViz
+// only draws it. Slots, left to right: pc, ap, ph (the Pi-hole's place), up
+// (the resolver beyond), then the arrow into the internet.
+//
+//   kind     route | direct | none | checking | offline | nobackend
+//            route    the Pi-hole is the resolver: pc, ap, ph, up
+//            direct   no Pi-hole in the path (not set up, or Automatic, or
+//                     custom): pc, ap, [ph slot: a ghost to set up, or idle],
+//                     up is the resolver
+//            none     the link has no DNS servers: pc, ap, then a note
+//            offline  pc alone
+//   nodes    [{ id, glyph, tone, label, stat, statTone, mark, tip }]
+//            label and stat are parts: { text } or { key, args } to be worded
+//            by the panel; tone accent | dim | warning | urgent
+//   links    [{ a, b, state, tone, thin }] state flow | stalled | dim |
+//            dashed; thin: after the Pi-hole, where the blocked share has
+//            peeled off
+//   branch   null or { tone, label, flow }: a dashed branch from the AP under
+//            the Pi-hole to the internet (failover, or a bypass)
+//   sink     null or { pct, empty, label }: the drain under the Pi-hole into
+//            the pool of what was blocked
+//   note     the words for the none/offline kinds
+//   ghost    true when the ph slot offers setup
+//   flow     { live, density, share }: live is whether traffic is moving
+function routeModel(v, nowS) {
+  var h = heroState(v, nowS)
+  var l = v.link
+  var p = v.pihole
+  var d = v.dns
+  var share = blockedShare(v)
+  var out = {
+    kind: "route", nodes: [], links: [], branch: null, sink: null, note: null, ghost: false,
+    flow: { live: false, density: queryDensity(v), share: share }
   }
-  // The newest column is still filling: scale what it holds to a full
-  // bucket so the graph does not end in a dip, or repeat the column before
-  // it while there is too little to scale.
-  var lastIdx = cols - 1
-  var elapsed = nowS - (t0 + lastIdx * colS)
-  if (elapsed > 0 && elapsed < colS) {
-    if (elapsed < 120) { total[lastIdx] = total[lastIdx - 1]; blocked[lastIdx] = blocked[lastIdx - 1] }
-    else { var k = Math.min(4, colS / elapsed); total[lastIdx] *= k; blocked[lastIdx] *= k }
+  if (h.kind === "nobackend") { out.kind = "nobackend"; out.flow.density = 0; return out }
+
+  function node(id, glyph, tone, label, stat, extra) {
+    var n = { id: id, glyph: glyph, tone: tone, label: label, stat: stat || null, statTone: "", mark: "", tip: "" }
+    if (extra) for (var k in extra) n[k] = extra[k]
+    out.nodes.push(n)
+    return n
   }
-  var start = cols
-  for (i = 0; i < cols; i++) if (total[i] > 0) { start = i; break }
-  function smooth(a) {
-    var out = []
-    for (var j = 0; j < a.length; j++) {
-      var l = a[j > 0 ? j - 1 : 0], r = a[j < a.length - 1 ? j + 1 : a.length - 1]
-      out.push((l + 2 * a[j] + r) / 4)
-    }
+
+  var online = l.kind !== "none"
+  var pcLabel = part(l.ip4 !== "" ? (lastOctet(l.ip4) || l.ip4) : "—")
+  node("pc", "pc", online ? "accent" : "dim", pcLabel, null, { tip: l.ip4 })
+
+  if (!online) {
+    out.kind = "offline"
+    out.links.push({ a: "pc", b: "ap", state: "dashed", tone: "dim", thin: false })
+    out.note = word(v.radio.wifiEnabled ? "route.offline" : "route.wifiOff", [], "dim")
+    out.flow.density = 0
     return out
   }
-  var st = smooth(total)
-  var sb = smooth(blocked)
-  var peak = 0
-  for (i = 0; i < st.length; i++) if (st[i] > peak) peak = st[i]
-  if (peak <= 0) return { total: st, blocked: sb, peak: 0, n: cols, axisS: axis, start: start }
-  var top = peak * 1.08
-  var t = [], b = []
-  for (i = 0; i < st.length; i++) {
-    t.push(st[i] / top)
-    b.push(Math.min(sb[i], st[i]) / top)
-  }
-  return { total: t, blocked: b, peak: peak, n: cols, axisS: axis, start: start }
-}
 
-// Values (0..1) as points left to right over [x0, x0 + width], 0 on the
-// floor line yFloor and 1 at yFloor - h.
-function edgePoints(values, x0, width, yFloor, h) {
-  var pts = []
-  var n = values.length
-  if (n < 2) return pts
-  for (var i = 0; i < n; i++) {
-    pts.push({ x: x0 + width * i / (n - 1), y: yFloor - clamp(values[i], 0, 1) * h })
-  }
-  return pts
-}
+  // the access point (or the wire)
+  var wired = l.kind === "ethernet"
+  var apLabel = l.signalDbm !== null ? part(l.signalDbm + " dBm") : (wired ? part(formatRate(l.bitrateMbps)) : part(l.signal > 0 ? l.signal + "%" : "—"))
+  var apStat = null
+  var apStatTone = ""
+  if (l.gatewayOk === false) { apStat = part("gw ✗"); apStatTone = "urgent" }
+  else if (l.gatewayMs !== null) { apStat = part(formatLatency(l.gatewayMs)); apStatTone = l.gatewayMs > GW_SLOW_MS ? "urgent" : "" }
+  var ap = node("ap", wired ? "wire" : "ap", isRestricted(v) ? "urgent" : "accent", apLabel, apStat, { tip: wired ? "" : l.ssid })
+  ap.statTone = apStatTone
 
-// The same as a smooth curve (Catmull-Rom through each value, `steps` points
-// between neighbours, never below the floor or above the top).
-function smoothEdge(values, x0, width, yFloor, h, steps) {
-  var pts = []
-  var n = values.length
-  if (n < 2) return pts
-  var dx = width / (n - 1)
-  var st = Math.max(1, toInt(steps, 6))
-  function y(v) { return yFloor - clamp(v, 0, 1) * h }
-  for (var i = 0; i < n - 1; i++) {
-    var p0 = values[i > 0 ? i - 1 : 0], p1 = values[i], p2 = values[i + 1], p3 = values[i + 2 < n ? i + 2 : n - 1]
-    for (var k = 0; k < st; k++) {
-      var t = k / st
-      var v = 0.5 * ((2 * p1) + (p2 - p0) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (3 * p1 - p0 - 3 * p2 + p3) * t * t * t)
-      pts.push({ x: x0 + (i + t) * dx, y: y(v) })
+  var live = p.configured && h.kind !== "unreachable" && h.kind !== "fallback" && out.flow.density > 0
+
+  if (h.kind === "none") {
+    out.kind = "none"
+    out.links.push({ a: "pc", b: "ap", state: "flow", tone: "accent", thin: false, flow: false })
+    out.note = word("route.none", [d.resolvedFallback], "urgent")
+    out.flow.density = 0
+    return out
+  }
+
+  // the resolver in use, for the routes that go straight to it
+  var cur = currentServer(v)
+  function resolverNode(tone) {
+    var a = cur ? cur.addr : ""
+    var role = cur ? cur.role : "other"
+    var n = node("up", "earth", tone, part(a !== "" ? shortAddr(a) : "—"), role !== "other" && role !== "pihole" ? word("route.role." + role) : null, { tip: a })
+    return n
+  }
+
+  if (h.kind === "checking") {
+    out.kind = "route"
+    node("ph", "shield", "dim", part(p.address !== "" ? shortAddr(p.address) : "…"), null, {})
+    node("up", "earth", "dim", part("…"), null, {})
+    out.links.push({ a: "pc", b: "ap", state: "dim", tone: "dim", thin: false }, { a: "ap", b: "ph", state: "dim", tone: "dim", thin: false },
+      { a: "ph", b: "up", state: "dim", tone: "dim", thin: false }, { a: "up", b: "end", state: "dim", tone: "dim", thin: false })
+    out.flow.density = 0
+    return out
+  }
+
+  var throughPihole = p.configured && d.mode !== "auto" && d.mode !== "custom"
+  if (!throughPihole) {
+    // no Pi-hole in the path: not set up, Automatic, or somebody else's DNS
+    out.kind = "direct"
+    var bypassed = h.kind === "bypassed"
+    if (!p.configured) {
+      out.ghost = true
+      node("ph", "ghost", "dim", part(p.detected !== "" ? shortAddr(p.detected) + "?" : ""), null, { tip: p.detected })
+    } else {
+      node("ph", "shield", "dim", part(shortAddr(p.address)), word("route.idle", [], ""), { tip: p.address })
+    }
+    resolverNode(bypassed ? "urgent" : "accent")
+    var liveDirect = out.flow.density > 0 || p.today.total > 0
+    out.links.push({ a: "pc", b: "ap", state: "flow", tone: "accent", thin: false, flow: liveDirect })
+    out.links.push({ a: "ap", b: "up", state: "flow", tone: bypassed ? "urgent" : "accent", thin: false, flow: liveDirect })
+    out.links.push({ a: "up", b: "end", state: "flow", tone: bypassed ? "urgent" : "accent", thin: false, flow: liveDirect })
+    out.flow.live = liveDirect
+    if (!p.configured && out.flow.density === 0) out.flow.density = 0.3
+    return out
+  }
+
+  // the Pi-hole is the resolver
+  var piholeNode = { tone: "accent", glyph: "shield", mark: "✓", label: part(shortAddr(p.address) + " ✓"), stat: null, statTone: "" }
+  var ms = p.latencyMs !== null ? formatLatency(p.latencyMs) : ""
+  if (h.kind === "paused") {
+    piholeNode = { tone: "dim", glyph: "shieldOutline", mark: "", label: part(shortAddr(p.address)),
+      stat: word("route.paused", [h.pauseS > 0 ? formatCountdown(h.pauseS) : ""], "warning"), statTone: "warning" }
+  } else if (h.kind === "fallback") {
+    piholeNode = { tone: "dim", glyph: "shieldOff", mark: "✕", label: part(shortAddr(p.address) + " ✕"), stat: null, statTone: "" }
+  } else if (h.kind === "unreachable") {
+    var fi = h.failoverIn
+    piholeNode = { tone: "urgent", glyph: "shieldOff", mark: "✕", label: part(shortAddr(p.address) + " ✕"),
+      stat: fi !== null ? (fi > 0 ? word("hero.failoverIn", [formatCountdown(fi)], "warning") : word("hero.failingOver", [], "warning")) : word("hero.noAnswer", [], "urgent"),
+      statTone: fi !== null ? "warning" : "urgent" }
+  } else {
+    piholeNode.stat = ms !== "" ? part(ms) : null
+    piholeNode.statTone = h.latencyBad ? "urgent" : ""
+  }
+  var ph = node("ph", piholeNode.glyph, piholeNode.tone, piholeNode.label, piholeNode.stat, { mark: piholeNode.mark, tip: p.address })
+  ph.statTone = piholeNode.statTone
+
+  // the resolver beyond: the Pi-hole's busiest upstream
+  var upstream = p.upstreams.length ? p.upstreams[0] : null
+  var tips = []
+  for (var i = 0; i < p.upstreams.length; i++) {
+    var u = p.upstreams[i]
+    tips.push((u.name !== "" ? u.name + "  " : "") + u.ip + (u.responseMs !== null ? "  " + formatLatency(u.responseMs) : ""))
+  }
+  var upTone = "accent"
+  var upStat = upstream && upstream.responseMs !== null ? part(formatLatency(upstream.responseMs)) : null
+  var upStatTone = ""
+  if (h.kind === "degraded") {
+    upTone = "warning"
+    upStat = p.healthReason !== "" ? part(p.healthReason) : word("route.servfail", [], "warning")
+    upStatTone = "warning"
+  }
+  var up = node("up", "earth", h.kind === "fallback" || h.kind === "unreachable" ? "dim" : upTone,
+    upstream ? part(upstream.ip !== "" ? upstream.ip : upstream.name) : word("route.upstream", []), upStat,
+    { tip: tips.join("\n") })
+  up.statTone = upStatTone
+
+  var thin = h.kind === "paused" || h.kind === "fallback" || h.kind === "unreachable" ? false : share > 0
+  var flowing = live
+  out.links.push({ a: "pc", b: "ap", state: "flow", tone: "accent", thin: false, flow: flowing || h.kind === "unreachable" ? true : false })
+  if (h.kind === "unreachable") {
+    out.links.push({ a: "ap", b: "ph", state: "stalled", tone: "accent", thin: false, flow: false })
+    out.links.push({ a: "ph", b: "up", state: "dashed", tone: "dim", thin: false, flow: false })
+    out.links.push({ a: "up", b: "end", state: "dashed", tone: "dim", thin: false, flow: false })
+    out.links[0].flow = false
+  } else if (h.kind === "fallback") {
+    out.links.push({ a: "ap", b: "ph", state: "dim", tone: "dim", thin: false, flow: false })
+    out.links.push({ a: "ph", b: "up", state: "dim", tone: "dim", thin: false, flow: false })
+    out.links.push({ a: "up", b: "end", state: "dim", tone: "dim", thin: false, flow: false })
+    var fb = d.failover.fallback
+    out.branch = { tone: "warning", label: word("fallback." + fb, [], "warning"), flow: out.flow.density > 0 }
+    out.links[0].flow = out.flow.density > 0
+    // the fallback resolver is where the branch comes out
+    if (cur) { up.label = part(shortAddr(cur.addr)); up.tone = "warning"; up.tip = cur.addr; up.stat = null }
+  } else {
+    out.links.push({ a: "ap", b: "ph", state: "flow", tone: "accent", thin: false, flow: flowing })
+    out.links.push({ a: "ph", b: "up", state: "flow", tone: "accent", thin: thin, flow: flowing })
+    out.links.push({ a: "up", b: "end", state: "flow", tone: "accent", thin: thin, flow: flowing })
+  }
+
+  if (h.kind === "bypassed") {
+    var ex = h.extra
+    var who = ex ? ex.who : (cur ? shortAddr(cur.addr) : "")
+    out.branch = {
+      tone: "urgent", flow: flowing,
+      label: ex && ex.viaRa ? word("hero.extraRa", [who], "urgent") : word("hero.extra", [who], "urgent")
     }
   }
-  pts.push({ x: x0 + width, y: y(values[n - 1]) })
-  return pts
-}
 
-// The runs of an edge that stand more than `rise` px above the floor, for
-// the stroke: a span of nothing gets no line. Each run takes the point on
-// either side, so it ends down on the floor.
-function strokeRuns(pts, yFloor, rise) {
-  var runs = []
-  var run = null
-  for (var i = 0; i < pts.length; i++) {
-    var up = pts[i].y < yFloor - rise
-    if (up && !run) {
-      run = i > 0 ? [pts[i - 1]] : []
-      runs.push(run)
-    }
-    if (run) {
-      run.push(pts[i])
-      if (!up) run = null
-    }
-  }
-  for (var j = runs.length - 1; j >= 0; j--) if (runs[j].length < 2) runs.splice(j, 1)
-  return runs
-}
-
-// The graph's head dot: the newest probe's verdict. ok null: no probe yet.
-function headState(probes) {
-  var list = Array.isArray(probes) ? probes : []
-  if (list.length === 0) return { ok: null, ms: null }
-  var last = list[list.length - 1]
-  return { ok: last.ok === true, ms: last.ms }
-}
-
-// A short signature of the history/probe arrays, so the panel redraws the
-// graph when they change and not on every snapshot.
-function seriesSignature(arr) {
-  var a = Array.isArray(arr) ? arr : []
-  if (a.length === 0) return "0"
-  var last = a[a.length - 1]
-  var sum = 0
-  for (var i = 0; i < a.length; i++) sum += (a[i].total !== undefined ? a[i].total + a[i].blocked : (a[i].ok ? 1 : 0) + (a[i].ms || 0))
-  return a.length + ":" + last.t + ":" + sum
+  if (h.kind === "paused") out.sink = { pct: 0, empty: true, label: null }
+  else if ((h.kind === "pihole" || h.kind === "degraded" || h.kind === "bypassed") && p.today.total > 0)
+    out.sink = { pct: Math.round(share * 1000) / 10, empty: share <= 0, label: word("hero.blocked", [formatPercent(p.today.percent)], "legend") }
+  var anyFlow = !!(out.branch && out.branch.flow)
+  for (var q = 0; q < out.links.length; q++) if (out.links[q].flow) anyFlow = true
+  out.flow.live = anyFlow
+  return out
 }
 
 // ---------------------------------------------------------------- leaks
@@ -767,7 +940,11 @@ function leakGroups(v, pending) {
       if (inactive[k].uuid !== "" && uuids.indexOf(inactive[k].uuid) < 0) uuids.push(inactive[k].uuid)
       lines.push(inactive[k].where + (inactive[k].detail ? ": " + inactive[k].detail : ""))
     }
-    profiles = { count: inactive.length, uuids: uuids, lines: lines, pinnable: uuids.length > 0 }
+    var items = []
+    for (var m = 0; m < inactive.length; m++) items.push({
+      where: inactive[m].where, detail: inactive[m].detail, uuid: inactive[m].uuid, key: inactive[m].where + ":" + inactive[m].uuid
+    })
+    profiles = { count: inactive.length, uuids: uuids, lines: lines, items: items, pinnable: uuids.length > 0 }
   }
   return { bypass: bypass, profiles: profiles }
 }
@@ -805,11 +982,28 @@ function customServers(v) {
 }
 
 // A tap on a tile: the verb to run, or null when the tile is already lit.
+// `leaves` is set when the verb moves DNS off the Pi-hole (Automatic while
+// the Pi-hole, or its failover, is in use): the risky direction.
 function tapDns(tile, v) {
   var t = dnsTiles(v)
-  if (tile === "pihole") return t.pihole === "off" ? { verb: "pihole" } : null
-  if (tile === "auto") return t.auto === "off" ? { verb: "auto" } : null
+  if (tile === "pihole") return t.pihole === "off" ? { verb: "pihole", leaves: false } : null
+  if (tile === "auto") return t.auto === "off" ? { verb: "auto", leaves: v.dns.mode === "pihole" || v.dns.mode === "fallback" } : null
   return null
+}
+
+// What a tap on a tile does:
+//   none      the tile is already lit (or unknown): nothing
+//   setup     the Pi-hole tile without a Pi-hole: run setup
+//   confirm   leaving the Pi-hole: ask first, inline (two steps: the tap, then
+//             "Use automatic DNS"); nothing runs yet
+//   run       anything else: run the verb now (towards the Pi-hole, or from a
+//             resolver that is not the Pi-hole)
+function tapPlan(tile, v) {
+  var t = tapDns(tile, v)
+  if (!t) return { action: "none", verb: "" }
+  if (tile === "pihole" && !v.pihole.configured) return { action: "setup", verb: t.verb }
+  if (t.leaves) return { action: "confirm", verb: t.verb, kind: "leave" }
+  return { action: "run", verb: t.verb }
 }
 
 // What "Replace custom DNS ...?" names: the servers the backend reported in
@@ -828,13 +1022,20 @@ function confirmServers(detail, v) {
   return list.slice(0, 2).join(", ")
 }
 
-// The pause chip: "Pause 5m", or "Resume 4:32" while paused.
+// The Pause tile: "Pause blocking · 5 min", or "Paused · 4:32 · Resume" in the
+// warning colour while paused. Disabled (and dim) when DNS is not going
+// through a Pi-hole that can be told to pause: not set up, not answering, its
+// API failing, the link down, or the resolver pointed somewhere else. A
+// paused one can always be resumed while the Pi-hole answers.
 function pauseChip(v) {
   var paused = isPaused(v)
+  var p = v.pihole
   return {
     mode: paused ? "resume" : "pause",
-    remainingS: paused ? v.pihole.pauseRemainingS : 0,
-    enabled: !v.backendDown && v.pihole.configured && v.pihole.reachable && v.pihole.api === "ok" && v.link.kind !== "none"
+    tone: paused ? "warning" : "dim",
+    remainingS: paused ? p.pauseRemainingS : 0,
+    enabled: !v.backendDown && p.configured && p.reachable && p.api === "ok" && v.link.kind !== "none" &&
+      (paused || v.dns.mode === "pihole")
   }
 }
 
@@ -859,16 +1060,19 @@ function linkGlyph(v) {
 
 // The header's two lines. title: the SSID, or "" when the panel names it
 // itself ("Ethernet", "Offline", "Wi-Fi off"). status: [{ k, ... }] parts the
-// panel joins with " · ": k "state" (key connected | limited | portal |
-// nointernet | offline | off) or k "text" (band, signal, rate, "gw 4 ms" while
-// the panel is open and the backend measures it). urgent: the state part
-// reads in the urgent colour. disconnectable: a Wi-Fi link, which the header
-// can drop (a secondary click or Delete on it).
+// panel joins with " · ": k "state" (key limited | portal | nointernet |
+// offline | off | connected) or k "text" (band, signal, rate, "gw 120 ms").
+//   - "Connected" is left out when the connection is fine and there is
+//     something else to say (Wi-Fi: "5 GHz · 58%"); a wire with no rate
+//     keeps it so the line is never empty.
+//   - the gateway's latency appears only when it is slow (over GW_SLOW_MS)
+//     or the probe fails (gatewayOk false), never as routine noise.
+// urgent: the state part reads in the urgent colour.
 function headerInfo(v, fmt) {
   var l = v.link
   var out = {
     kind: "offline", title: "", glyph: linkGlyph(v), status: [], urgent: false, portal: false,
-    restricted: isRestricted(v), disconnectable: false
+    restricted: isRestricted(v)
   }
   if (v.backendDown) {
     out.kind = "nobackend"; out.urgent = true; out.restricted = false
@@ -881,30 +1085,32 @@ function headerInfo(v, fmt) {
     return out
   }
   out.kind = l.kind
-  out.disconnectable = l.kind === "wifi"
   out.title = l.kind === "wifi" ? (l.ssid || l.connection) : ""
-  var rate = formatRate(l.bitrateMbps, fmt)
   if (l.connectivity === "portal") {
     out.urgent = true; out.portal = true
     out.status.push({ k: "state", key: "portal" })
     return out
   }
+  var parts = []
+  if (l.kind === "wifi") {
+    if (l.band) parts.push({ k: "text", text: l.band })
+    if (l.signal > 0) parts.push({ k: "text", text: formatDecimal(l.signal, 0, fmt) + "%" })
+  } else {
+    var rate = formatRate(l.bitrateMbps, fmt)
+    if (rate !== "") parts.push({ k: "text", text: rate })
+  }
+  if (l.gatewayOk === false) parts.push({ k: "text", text: "gw \u2717" })
+  else if (l.gatewayMs !== null && l.gatewayMs > GW_SLOW_MS) parts.push({ k: "text", text: "gw " + formatLatency(l.gatewayMs, fmt) })
   if (l.connectivity === "limited") {
     out.urgent = true
     out.status.push({ k: "state", key: "limited" })
   } else if (l.connectivity === "none") {
     out.urgent = true
     out.status.push({ k: "state", key: "nointernet" })
-  } else {
+  } else if (parts.length === 0) {
     out.status.push({ k: "state", key: "connected" })
   }
-  if (l.kind === "wifi") {
-    if (l.band) out.status.push({ k: "text", text: l.band })
-    if (l.signal > 0) out.status.push({ k: "text", text: formatDecimal(l.signal, 0, fmt) + "%" })
-  }
-  if (rate !== "") out.status.push({ k: "text", text: rate })
-  if (l.gatewayMs !== null) out.status.push({ k: "text", text: "gw " + formatLatency(l.gatewayMs, fmt) })
-  return out
+  return { kind: out.kind, title: out.title, glyph: out.glyph, status: out.status.concat(parts), urgent: out.urgent, portal: false, restricted: out.restricted }
 }
 
 // The bar icon's tooltip: only when something deserves one.
@@ -930,37 +1136,38 @@ function canShareWifi(v) {
   return true
 }
 
-// The IP footer, with a stable placeholder so it never reflows. (The
-// gateway's latency is on the header's status line.)
+// The footer: "192.168.1.242 · gw 192.168.1.1", with stable placeholders so
+// it never reflows.
 function ipFooter(v) {
-  return { ip: v.link.ip4, text: v.link.ip4 !== "" ? v.link.ip4 : "--", copyable: v.link.ip4 !== "" }
+  var ipText = v.link.ip4 !== "" ? v.link.ip4 : "--"
+  var gw = v.link.gateway !== "" ? v.link.gateway : "--"
+  return { ip: v.link.ip4, gateway: v.link.gateway, text: ipText + " · gw " + gw, copyable: v.link.ip4 !== "" }
 }
 
 // ------------------------------------------------------------- networks
 
-// The list under the header: saved networks first, then the rest;
-// strongest first within each group, ties by name. The network in use is not
-// in it (the header is that row, and carries its Disconnect). Hidden
-// networks (no SSID) are left out unless asked for; a duplicate SSID keeps
-// its strongest entry (the backend groups, this is a guard).
+// The Wi-Fi view's list: the network in use first, then saved ones, then the
+// rest; strongest first within each group, ties by name. Hidden networks (no
+// SSID) are left out unless one is in use or they are asked for; a duplicate
+// SSID keeps its best entry (the backend groups, this is a guard).
 function orderNetworks(networks, showHidden) {
   var best = {}
   var order = []
   var list = Array.isArray(networks) ? networks : []
-  var inUse = {}
   var i
-  for (i = 0; i < list.length; i++) if (list[i].active && !list[i].hidden) inUse[list[i].ssid] = true
   for (i = 0; i < list.length; i++) {
     var n = list[i]
-    if (n.active || (!n.hidden && inUse[n.ssid])) continue
-    if (n.hidden && !showHidden) continue
+    if (n.hidden && !n.active && !showHidden) continue
     var key = n.hidden ? "\u0000" + n.id : n.ssid
     if (best[key] === undefined) { best[key] = n; order.push(key) }
-    else if (n.signal > best[key].signal) best[key] = n
+    else {
+      var b = best[key]
+      if ((n.active && !b.active) || (n.active === b.active && n.signal > b.signal)) best[key] = n
+    }
   }
   var out = []
   for (i = 0; i < order.length; i++) out.push(best[order[i]])
-  function rank(n) { return n.known ? 0 : 1 }
+  function rank(n) { return n.active ? 0 : (n.known ? 1 : 2) }
   out.sort(function(a, b) {
     var ra = rank(a), rb = rank(b)
     if (ra !== rb) return ra - rb
@@ -1047,7 +1254,20 @@ function argvForget(bin, uuid) {
   return [bin, "wifi", "forget", String(uuid)]
 }
 
-function argvScan(bin) { return okBin(bin) ? [bin, "wifi", "scan"] : null }
+// `qnet wifi scan`, or with ifStaleS `qnet wifi scan --if-stale <s>`: the
+// backend scans only when the last scan is older than that (entering the
+// Wi-Fi view); the scan button forces one (it is throttled there).
+function argvScan(bin, ifStaleS) {
+  if (!okBin(bin)) return null
+  var a = [bin, "wifi", "scan"]
+  if (ifStaleS !== undefined && ifStaleS !== null) {
+    if (typeof ifStaleS !== "number" && !/^\d{1,6}$/.test(String(ifStaleS))) return null
+    var n = Math.round(num(ifStaleS, -1))
+    if (n < 0 || n > 86400) return null
+    a.push("--if-stale", String(n))
+  }
+  return a
+}
 
 function argvRadio(bin, on) { return okBin(bin) ? [bin, "wifi", "radio", on ? "on" : "off"] : null }
 
@@ -1095,27 +1315,33 @@ function parseResult(text, exitCode) {
     if (!isObj(obj) || typeof obj.ok !== "boolean") break
     return {
       ok: obj.ok === true, error: clean(obj.error, 80), detail: obj.detail === undefined ? null : obj.detail,
-      verifiedVia: addr(obj.verifiedVia), blocked: obj.blocked === true, verifyError: clean(obj.verifyError, 80)
+      verifiedVia: addr(obj.verifiedVia), blocked: obj.blocked === true, verifyError: clean(obj.verifyError, 80),
+      retryInS: Math.max(0, Math.min(3600, toInt(obj.retryInS, 0)))
     }
   }
   return {
     ok: false, error: exitCode === 0 || exitCode === undefined ? "noanswer" : "exit", detail: null,
-    verifiedVia: "", blocked: false, verifyError: ""
+    verifiedVia: "", blocked: false, verifyError: "", retryInS: 0
   }
 }
 
-// A failed result as { code, text }: code is a translated message key
+// A failed result as { code, text, retryInS }: code is a message key
 // (confirm and enterprise are handled by the panel before this), text a
-// cleaned backend message to show when the code is "generic".
+// cleaned backend message to show when the code is "generic". "too-soon"
+// carries retryInS; "busy" is another action in flight; "skipped" is the
+// backend deciding there was nothing to do, which is not an error.
 function failure(result) {
   var e = String(result && result.error || "").toLowerCase()
-  if (e === "confirm" || e === "enterprise") return { code: e, text: "" }
+  var retry = result && result.retryInS ? result.retryInS : 0
+  if (e === "confirm" || e === "enterprise") return { code: e, text: "", retryInS: 0 }
   if (e === "wrongpassword" || e === "wrong-password" || e === "auth" || e === "secrets" || e === "badpassword")
-    return { code: "wrongPassword", text: "" }
-  if (e === "noanswer" || e === "exit" || e === "") return { code: "noAnswer", text: "" }
-  if (e === "timeout") return { code: "timeout", text: "" }
-  if (e === "toosoon" || e === "too-soon" || e === "ratelimit") return { code: "tooSoon", text: "" }
-  return { code: "generic", text: clean(e, 60) }
+    return { code: "wrongPassword", text: "", retryInS: 0 }
+  if (e === "noanswer" || e === "exit" || e === "") return { code: "noAnswer", text: "", retryInS: 0 }
+  if (e === "timeout") return { code: "timeout", text: "", retryInS: 0 }
+  if (e === "toosoon" || e === "too-soon" || e === "ratelimit") return { code: "tooSoon", text: "", retryInS: retry }
+  if (e === "busy") return { code: "busy", text: "", retryInS: 0 }
+  if (e === "skipped") return { code: "skipped", text: "", retryInS: 0 }
+  return { code: "generic", text: clean(e, 60), retryInS: 0 }
 }
 
 // After `qnet dns pihole` succeeded: "" when its canary came back blocked,
@@ -1126,41 +1352,144 @@ function verifyNote(verb, result) {
   return result.verifyError
 }
 
+// ------------------------------------------------------- the two rows
+
+// The right-hand side of the main view's DNS row: what the resolver is, and
+// what is wrong with it. { mode, arg, suffix, tone, leaks }
+//   mode   pihole | fallback | auto | custom | none | unknown
+//   arg    the custom servers or the fallback's name, where the word takes one
+//   suffix ["bypassed", "leaks"] in the order they are said
+//   tone   dim | warning | urgent: warning for a fallback or leaking
+//          profiles, urgent for a bypass or no DNS at all
+function dnsSummary(v, pending) {
+  var g = leakGroups(v, pending)
+  var out = { mode: v.dns.mode, arg: "", suffix: [], tone: "dim", leaks: g.profiles ? g.profiles.count : 0 }
+  if (v.backendDown) { out.mode = "unknown"; return out }
+  if (out.mode === "custom") out.arg = customServers(v).join(", ")
+  if (out.mode === "fallback") out.arg = v.dns.failover.fallback
+  if (out.mode === "fallback") out.tone = "warning"
+  if (out.mode === "none") out.tone = "urgent"
+  if (g.bypass && out.mode !== "none") { out.suffix.push("bypassed"); out.tone = "urgent" }
+  if (out.leaks > 0) { out.suffix.push("leaks"); if (out.tone === "dim") out.tone = "warning" }
+  return out
+}
+
+// Seconds as { unit, n }: "now" under a minute, then minutes, then hours.
+function ageParts(sec) {
+  var s = num(sec, -1)
+  if (s < 0) return null
+  if (s < 60) return { unit: "now", n: 0 }
+  if (s < 3600) return { unit: "min", n: Math.floor(s / 60) }
+  return { unit: "hour", n: Math.floor(s / 3600) }
+}
+
+// The Wi-Fi row's value: { state, name, age } -- state connected | offline |
+// off; name the SSID (or ""); age ageParts() of the last scan, only with the
+// radio on.
+function wifiSummary(v) {
+  var l = v.link
+  var age = v.radio.wifiEnabled ? ageParts(v.scan.lastScanAgeS) : null
+  if (v.backendDown) return { state: "offline", name: "", age: null }
+  if (l.kind === "none") return { state: v.radio.wifiEnabled ? "offline" : "off", name: "", age: age }
+  return { state: "connected", name: l.kind === "wifi" ? (l.ssid || l.connection) : "", age: l.kind === "wifi" ? age : null, wired: l.kind === "ethernet" }
+}
+
+// The DNS view's failover line: { state, fallback, reason, sinceS }
+//   off     failover is not enabled
+//   armed   enabled, not engaged
+//   active  DNS is on the fallback right now
+// fallback is the one in effect (the backend names the effective fallback);
+// reason is the backend's own words, shown as they are.
+function failoverInfo(v) {
+  var f = v.dns.failover
+  return {
+    state: f.active ? "active" : (f.enabled ? "armed" : "off"),
+    fallback: f.fallback, reason: f.reason, sinceS: f.since
+  }
+}
+
+// ----------------------------------------------------------- the views
+
+// Which view is up: the main one, or a drill-down the main one pushed (DNS,
+// Wi-Fi), as Sound Hub pushes its Bluetooth view. returnCursor is where the
+// cursor was on the main view, put back when the drill-down is left.
+function navInit() { return { view: "main", returnCursor: null } }
+
+// Open a drill-down. effects says what entering it does: the Wi-Fi view runs
+// `qnet wifi scan --if-stale 60` (never on opening the panel itself).
+function navOpen(nav, name, cursor) {
+  if ((name !== "dns" && name !== "wifi") || nav.view === name) return { nav: nav, effects: [] }
+  var ret = nav.view === "main" ? (cursor || null) : nav.returnCursor
+  return {
+    nav: { view: name, returnCursor: ret },
+    effects: name === "wifi" ? [{ run: "scan", ifStaleS: SCAN_IF_STALE_S }] : []
+  }
+}
+
+// Back to the main view; cursor is the stop to put the cursor on (null when
+// already there).
+function navBack(nav) {
+  if (nav.view === "main") return { nav: nav, cursor: null, left: false }
+  return { nav: navInit(), cursor: nav.returnCursor, left: true }
+}
+
+// What Esc does, one level at a time: an armed Forget, the DNS confirm, the
+// passphrase row, a drill-down (back), then the panel (close).
+function escapeStep(ctx) {
+  var c = ctx || {}
+  if (c.armed) return "disarm"
+  if (c.confirm) return "confirm"
+  if (c.password) return "password"
+  if (c.view && c.view !== "main") return "back"
+  return "close"
+}
+
 // ------------------------------------------------------------ keyboard
 
 // The focusable rows in order, top to bottom, each with the items that
-// left/right walk. ctx: { confirm } -- an inline confirm line adds its two
-// buttons as a row above the DNS row.
-//   header   conn? (the Wi-Fi link: Delete or Enter drops it), portal?, qr?,
-//            speed?, radio
-//   hero     setup (no Pi-hole configured), else pause, admin?
-//   bypass   Pin, when this link's queries can skip the Pi-hole
-//   profiles Pin all, for saved profiles that would bypass it
-//   confirm  replace, cancel
-//   dns      tile:pihole, tile:auto
-//   scan     the Networks label's scan action
-//   net:N    one row per listed network
-//   ip       the footer
+// left/right walk, for the view that is up. ctx: { view, confirm }.
+//   main     header: portal?, qr?, speed?, radio
+//            hero: the one corrective action, when the state has one
+//            pause: the Pause tile
+//            goto:dns, goto:wifi: the two drill-down rows
+//            ip: the footer
+//   dns      back, dns (tile:pihole, tile:auto), confirm? (replace, cancel),
+//            bypass? (fix), leak:N (pin) one per profile, pinall? (two or
+//            more), admin?
+//   wifi     back, scan, net:N one per listed network
 function focusRows(v, ctx, pending, nets) {
   var c = ctx || {}
   var rows = []
+  if (c.view === "dns") {
+    rows.push({ id: "back", items: ["back"] })
+    rows.push({ id: "dns", items: ["tile:pihole", "tile:auto"] })
+    if (c.confirm) rows.push({ id: "confirm", items: ["replace", "cancel"] })
+    var g = leakGroups(v, pending)
+    if (g.bypass) rows.push({ id: "bypass", items: ["fix"] })
+    if (g.profiles) {
+      for (var k = 0; k < g.profiles.items.length; k++) if (g.profiles.items[k].uuid !== "") rows.push({ id: "leak:" + k, items: ["pin"] })
+      if (g.profiles.uuids.length > 1) rows.push({ id: "pinall", items: ["pinall"] })
+    }
+    if (v.pihole.configured && v.pihole.adminUrl !== "") rows.push({ id: "admin", items: ["admin"] })
+    return rows
+  }
+  if (c.view === "wifi") {
+    rows.push({ id: "back", items: ["back"] })
+    rows.push({ id: "scan", items: ["scan"] })
+    var list = nets || orderNetworks(v.networks)
+    for (var n = 0; n < list.length; n++) rows.push({ id: "net:" + n, items: ["row"] })
+    return rows
+  }
   var items = []
-  if (v.link.kind === "wifi") items.push("conn")
   if (v.link.kind !== "none" && v.link.connectivity === "portal") items.push("portal")
   if (canShareWifi(v)) items.push("qr")
   if (v.link.device !== "" && v.link.kind !== "none") items.push("speed")
   items.push("radio")
   rows.push({ id: "header", items: items })
-  if (!v.pihole.configured) rows.push({ id: "hero", items: ["setup"] })
-  else rows.push({ id: "hero", items: v.pihole.adminUrl !== "" ? ["pause", "admin"] : ["pause"] })
-  var g = leakGroups(v, pending)
-  if (g.bypass) rows.push({ id: "bypass", items: ["fix"] })
-  if (g.profiles && g.profiles.pinnable) rows.push({ id: "profiles", items: ["pinall"] })
-  if (c.confirm) rows.push({ id: "confirm", items: ["replace", "cancel"] })
-  rows.push({ id: "dns", items: ["tile:pihole", "tile:auto"] })
-  rows.push({ id: "scan", items: ["scan"] })
-  var list = nets || orderNetworks(v.networks)
-  for (var n = 0; n < list.length; n++) rows.push({ id: "net:" + n, items: ["row"] })
+  if (heroState(v).action !== "") rows.push({ id: "hero", items: ["action"] })
+  rows.push({ id: "pause", items: ["pause"] })
+  rows.push({ id: "goto:dns", items: ["go"] })
+  rows.push({ id: "goto:wifi", items: ["go"] })
   rows.push({ id: "ip", items: ["ip"] })
   return rows
 }
@@ -1170,13 +1499,16 @@ function rowIndex(rows, id) {
   return -1
 }
 
-// Where the cursor starts: the Networks list ("net:0"), else the scan
-// action, else the DNS row.
-function initialCursor(rows) {
-  var i = rowIndex(rows, "net:0")
-  if (i < 0) i = rowIndex(rows, "scan")
-  if (i < 0) i = rowIndex(rows, "dns")
-  return { row: rows[Math.max(0, i)].id, item: 0 }
+// Where the cursor starts: on the Wi-Fi row of the main view, the way back on
+// the DNS view (never on a mode tile: a stray Enter or Space as the view opens
+// must not change DNS), the first network of the Wi-Fi view.
+function initialCursor(rows, view) {
+  var order = view === "dns" ? ["back"] : (view === "wifi" ? ["net:0", "scan", "back"] : ["goto:wifi", "pause", "header"])
+  for (var i = 0; i < order.length; i++) {
+    var at = rowIndex(rows, order[i])
+    if (at >= 0) return { row: rows[at].id, item: 0 }
+  }
+  return { row: rows[0].id === "dns" && rows.length > 1 ? rows[1].id : rows[0].id, item: 0 }
 }
 
 // One key. cursor { row, item }; memory { rowId: itemIndex } remembers where
@@ -1187,7 +1519,7 @@ function moveFocus(rows, cursor, dx, dy, memory) {
   var mk = Object.keys(memory || {})
   for (var m = 0; m < mk.length; m++) mem[mk[m]] = memory[mk[m]]
   var at = rowIndex(rows, cursor.row)
-  if (at < 0) return { cursor: initialCursor(rows), memory: mem }
+  if (at < 0) return { cursor: initialCursor(rows, null), memory: mem }
   var row = rows[at]
   var item = clamp(cursor.item, 0, row.items.length - 1)
   mem[row.id] = item
@@ -1226,19 +1558,22 @@ function freshGate(times, name, nowMs, gapMs) {
 if (typeof module !== "undefined") {
   module.exports = {
     MAX_LINE: MAX_LINE, MAX_NETWORKS: MAX_NETWORKS, MAX_HISTORY: MAX_HISTORY, MAX_PROBES: MAX_PROBES,
-    HISTORY_SPAN_S: HISTORY_SPAN_S, HISTORY_BUCKET_S: HISTORY_BUCKET_S, MIN_AXIS_S: MIN_AXIS_S,
-    STABLE_UPTIME_MS: STABLE_UPTIME_MS, PAUSE_SECONDS: PAUSE_SECONDS, LATENCY_BAD_MS: LATENCY_BAD_MS,
-    PENDING_TTL_MS: PENDING_TTL_MS, SCAN_SPIN_MS: SCAN_SPIN_MS, GLYPH: GLYPH,
+    HISTORY_SPAN_S: HISTORY_SPAN_S, HISTORY_BUCKET_S: HISTORY_BUCKET_S, MAX_UPSTREAMS: MAX_UPSTREAMS,
+    STABLE_UPTIME_MS: STABLE_UPTIME_MS, PAUSE_SECONDS: PAUSE_SECONDS, SCAN_IF_STALE_S: SCAN_IF_STALE_S,
+    FAILOVER_AFTER_S: FAILOVER_AFTER_S, ACTION_DEADLINE_MS: ACTION_DEADLINE_MS, GW_SLOW_MS: GW_SLOW_MS,
+    LATENCY_BAD_MS: LATENCY_BAD_MS, PENDING_TTL_MS: PENDING_TTL_MS, SCAN_SPIN_MS: SCAN_SPIN_MS, GLYPH: GLYPH,
     clean: clean, safeUrl: safeUrl, emptyState: emptyState, normalizeState: normalizeState,
     parseStateLine: parseStateLine, backoffMs: backoffMs, restartAttempt: restartAttempt,
     formatCountdown: formatCountdown, groupDigits: groupDigits, formatCount: formatCount,
-    formatPercent: formatPercent, formatLatency: formatLatency, formatRate: formatRate, formatSpan: formatSpan,
+    formatPercent: formatPercent, formatLatency: formatLatency, formatRate: formatRate,
     pauseRemaining: pauseRemaining, effective: effective, reconcilePending: reconcilePending,
     emptyPending: emptyPending, hasPending: hasPending, withPending: withPending,
     currentServer: currentServer, heroState: heroState, blockingWord: blockingWord,
-    axisSpan: axisSpan, dataSpan: dataSpan, showSpanLabel: showSpanLabel, historySeries: historySeries,
-    edgePoints: edgePoints, smoothEdge: smoothEdge, strokeRuns: strokeRuns, headState: headState,
-    seriesSignature: seriesSignature, leakGroups: leakGroups, dnsTiles: dnsTiles,
+    failoverIn: failoverIn, extraResolver: extraResolver, needsClock: needsClock,
+    dnsSummary: dnsSummary, ageParts: ageParts, wifiSummary: wifiSummary, failoverInfo: failoverInfo,
+    navInit: navInit, navOpen: navOpen, navBack: navBack, escapeStep: escapeStep,
+    queryDensity: queryDensity, blockedShare: blockedShare, lastOctet: lastOctet, answeredShares: answeredShares,
+    routeModel: routeModel, leakGroups: leakGroups, dnsTiles: dnsTiles, tapPlan: tapPlan,
     customServers: customServers, tapDns: tapDns, confirmServers: confirmServers, pauseChip: pauseChip,
     wifiGlyph: wifiGlyph, isRestricted: isRestricted, linkGlyph: linkGlyph, headerInfo: headerInfo,
     barTip: barTip, barActive: barActive, canShareWifi: canShareWifi, ipFooter: ipFooter,

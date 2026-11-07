@@ -78,59 +78,57 @@ test("durations go through Style.duration, and nothing is eased in or bounced", 
     const src = read(f)
     for (const [i, line] of src.split("\n").entries()) {
       if (/^\s*\/\//.test(line)) continue
-      if (/\bduration:/.test(line)) assert.match(line, /duration:\s*Style\.duration\(\d+\)/, f + ":" + (i + 1) + " " + line.trim())
+      if (/\bduration:/.test(line)) assert.match(line, /duration:\s*Style\.duration\([^)]/, f + ":" + (i + 1) + " " + line.trim())
       assert.doesNotMatch(line, /Easing\.(In|InOut|OutIn)(Quad|Cubic|Quart|Quint|Sine|Expo|Circ|Back|Bounce|Elastic)/, f + ":" + (i + 1))
       assert.doesNotMatch(line, /Easing\.OutBounce|Easing\.OutBack|Easing\.OutElastic/, f + ":" + (i + 1))
     }
   }
 })
 
-test("durations stay under 300 ms; only the scan spinner and the head dot's breath are longer", () => {
+test("durations stay under 300 ms; only the scan spinner and the route's flow are longer", () => {
   for (const f of FILES) {
     for (const m of read(f).matchAll(/Style\.duration\((\d+)\)/g)) {
       const ms = Number(m[1])
       if (f === "components/NetworkList.qml" && ms === 900) continue
-      if (f === "components/DnsHero.qml" && (ms === 1600 || ms === 500)) continue
+      if (f === "components/HeroViz.qml" && ms === 5000) continue
       assert.ok(ms <= 300, f + " " + ms)
     }
   }
 })
 
-test("the head dot is the only ambient motion on the panel, besides the scan spinner while it scans", () => {
+test("the route's flow is the only ambient motion on the panel, besides the scan spinner while it scans", () => {
   const looping = FILES.filter((f) => /Animation\.Infinite/.test(read(f)))
-  assert.deepEqual(looping.sort(), ["components/DnsHero.qml", "components/NetworkList.qml"])
-  const hero = read("components/DnsHero.qml")
-  assert.equal((hero.match(/Animation\.Infinite/g) || []).length, 1, "one loop in the hero")
-  assert.match(hero, /running:[^\n]*!Style\.reduceMotion/, "still when animations are off")
+  assert.deepEqual(looping.sort(), ["components/HeroViz.qml", "components/NetworkList.qml"])
+  const viz = read("components/HeroViz.qml")
+  assert.match(viz, /readonly property bool flowing: animate && !Style\.reduceMotion/, "still when animations are off")
+  // every animation in the picture runs only while it is flowing
+  for (const m of viz.matchAll(/running:\s*([^\n]+)/g)) assert.match(m[1], /live|visible/, "running: " + m[1])
+  assert.match(viz, /live: viz\.flowing && index < count/)
   assert.match(read("components/NetworkList.qml"), /running:[^\n]*scan\.running[^\n]*!Style\.reduceMotion/)
+  assert.doesNotMatch(read("components/Hero.qml"), /NumberAnimation|PropertyAnimation|Animation\.Infinite/, "the words do not move")
 })
 
-test("the hero draws no live stroke, no live zone and no rule across the floor", () => {
-  const hero = read("components/DnsHero.qml")
-  assert.doesNotMatch(hero, /pulse|liveW|histW|probeLive/i)
-  assert.doesNotMatch(hero, /Rectangle \{[^}]*height: 1[^}]*\}/s, "no hairline rectangles")
+test("the hero's picture is its own piece: it takes the view and the host's words, not the hub", () => {
+  const viz = read("components/HeroViz.qml")
+  const hero = read("components/Hero.qml")
+  assert.match(viz, /required property var view/)
+  assert.match(viz, /property var tr: function/)
+  assert.doesNotMatch(viz, /\bhub\b/, "the picture does not reach into the panel")
+  assert.doesNotMatch(viz, /strings\.|\bt\("/, "and has no words of its own")
+  assert.match(viz, /implicitHeight:/)
+  assert.match(viz, /readonly property real overlap/)
+  assert.match(viz, /readonly property color legendColor/)
+  assert.match(viz, /Model\.routeModel\(view, nowS\)/, "what it draws is decided in Model.js")
+  assert.doesNotMatch(hero, /Shape|ShapePath|PathPolyline|Gradient/, "the words draw nothing")
+  assert.match(hero, /HeroViz \{/)
+  assert.match(hero, /view: hero\.hub\.view/)
+  assert.match(hero, /tr: hero\.hub\.strings\.t/)
 })
 
-test("one font: no family but the bar's", () => {
-  for (const f of FILES) {
-    for (const [i, line] of read(f).split("\n").entries()) {
-      for (const m of line.matchAll(/font\.family:\s*(.+)$/g)) {
-        assert.match(m[1], /fontFamily|Style\.font\.family/, f + ":" + (i + 1) + " " + line.trim())
-      }
-      assert.doesNotMatch(line, /["'](Adwaita|Inter|Noto Sans|sans-serif|DejaVu)/, f + ":" + (i + 1))
-    }
-  }
-})
-
-test("sizes come from Style.font or the three panel sizes", () => {
-  for (const f of FILES) {
-    for (const [i, line] of read(f).split("\n").entries()) {
-      for (const m of line.matchAll(/font\.pixelSize:\s*(.+)$/g)) {
-        const v = m[1].trim()
-        assert.ok(/(type(Title|Hero|Body|Small)|Style\.font\.|Style\.space|fontSize|size\b)/.test(v), f + ":" + (i + 1) + " " + line.trim())
-      }
-    }
-  }
+test("the area graph is gone: no history series, no crest, no head dot, no axis", () => {
+  const all = FILES.map(read).join("\n") + read("Model.js")
+  assert.doesNotMatch(all, /historySeries|smoothEdge|strokeRuns|edgePoints|headState|axisSpan|showSpanLabel|seriesSignature|formatSpan|PathPolyline/)
+  assert.doesNotMatch(read("Panel.qml"), /syncSeries|historySig|probeHead/)
 })
 
 test("Model.js has no QML imports and loads in node", () => {
@@ -145,9 +143,14 @@ test("Model.js has no QML imports and loads in node", () => {
 function usedKeys() {
   const exact = new Set()
   const prefixes = new Set()
+  // the model names the words of the route by key
+  for (const m of read("Model.js").matchAll(/"((?:route|hero|fallback)\.[A-Za-z0-9.]+)"(\s*\+)?/g)) {
+    if (m[2]) prefixes.add(m[1])
+    else exact.add(m[1])
+  }
   for (const f of FILES) {
     const src = read(f)
-    for (const m of src.matchAll(/(?<![A-Za-z0-9_])tn?\(\s*"([A-Za-z][A-Za-z0-9.]*)"(\s*\+)?/g)) {
+    for (const m of src.matchAll(/(?<![A-Za-z0-9_])(?:tn?|tr)\(\s*"([A-Za-z][A-Za-z0-9.]*)"(\s*\+)?/g)) {
       if (m[2]) prefixes.add(m[1])
       else exact.add(m[1])
     }

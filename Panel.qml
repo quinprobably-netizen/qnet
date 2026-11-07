@@ -19,9 +19,12 @@ import "components"
 // shell shares; the bar makes one widget per monitor, and each of them reads
 // that one service and tells it when its panel opens and closes.
 //
-// Layout, top to bottom (components/PanelBody.qml): Header, DnsHero,
-// LeakLines, DnsRow, NetworkList, IpFooter. One keyboard cursor runs through them
-// (Model.focusRows), and the pointer moves the same cursor.
+// Three views, as Sound Hub has: the main one (components/MainView.qml:
+// connection, hero, Pause, a DNS row, a Wi-Fi row, the address) and two it
+// pushes, DNS (DnsView.qml) and Wi-Fi (WifiView.qml). Which is up, and what
+// entering it does, is Model.navOpen/navBack. One keyboard cursor runs
+// through the rows of the view that is up (Model.focusRows), and the pointer
+// moves the same cursor.
 Panel {
   id: root
   moduleName: "qqq.qnet"
@@ -69,52 +72,32 @@ Panel {
   property var pending: Model.emptyPending()
   property double nowMs: Date.now()
   readonly property var view: Model.effective(rawState, pending, QnetService.appliedMs, nowMs, QnetService.down)
-  readonly property var hero: Model.heroState(view)
+  readonly property var hero: Model.heroState(view, nowMs / 1000)
   readonly property var header: Model.headerInfo(view, formatNumber)
   readonly property var tiles: Model.dnsTiles(view)
   readonly property var chip: Model.pauseChip(view)
   readonly property var footer: Model.ipFooter(view)
   readonly property var netList: Model.orderNetworks(view.networks)
   readonly property var leaks: Model.leakGroups(view, pending)
+  readonly property var leakExtra: Model.extraResolver(view)
 
-  // The graphs are rebuilt when their data changes, not on every snapshot.
-  property var historySeries: null
-  // The newest probe's verdict, for the head dot at the graph's right edge.
-  property var probeHead: ({ ok: null, ms: null })
-  // Seconds of history the graph holds (it fits its x-axis to that).
-  property real historySpan: 0
-  property string historySig: ""
-  property string probeSig: ""
-
-  function syncSeries(force) {
-    var p = rawState.pihole
-    var now = Date.now() / 1000
-    var span = p.historySpanS > 0 ? p.historySpanS : Model.dataSpan(p.history, now)
-    var hs = Model.seriesSignature(p.history) + ":" + span
-    if (force || hs !== historySig) {
-      historySig = hs
-      historySpan = span
-      historySeries = Model.historySeries(p.history, now, span)
-    }
-    var ps = Model.seriesSignature(p.probes)
-    if (force || ps !== probeSig) {
-      probeSig = ps
-      probeHead = Model.headState(p.probes)
-    }
-  }
+  // When the Pi-hole's numbers were last known to be good: with the link
+  // down they are old, and the hero says how old.
+  property double statsGoodAt: 0
 
   onRawStateChanged: {
     nowMs = Date.now()
     pending = Model.reconcilePending(pending, rawState, nowMs)
-    syncSeries(false)
+    var p = rawState.pihole
+    if (p.api === "ok" && p.reachable && rawState.link.kind !== "none") statsGoodAt = nowMs
   }
 
-  // Counts the pause down and lets pending requests expire, only while the
-  // panel is open and there is something to count.
+  // Counts a pause or a failover down and lets pending requests expire, only
+  // while the panel is open and there is something to count.
   Timer {
     interval: 1000
     repeat: true
-    running: root.opened && (root.view.pihole.blocking === "disabled" || Model.hasPending(root.pending))
+    running: root.opened && Model.needsClock(root.view, root.pending, root.nowMs / 1000)
     onTriggered: {
       root.nowMs = Date.now()
       root.pending = Model.reconcilePending(root.pending, root.rawState, root.nowMs)
@@ -126,12 +109,113 @@ Panel {
   property bool settled: false
   Timer { id: settleTimer; interval: 320; onTriggered: root.settled = root.opened }
 
+  // ------------------------------------------------------------- views
+  // "main" | "dns" | "wifi"; the views are pushed and popped as Sound Hub's
+  // Bluetooth view is, and the main view's cursor is put back on the way out.
+  property var nav: Model.navInit()
+  readonly property string page: nav.view
+  readonly property int headerBackSize: Style.space(30)
+
+  function openView(name) {
+    if (name !== "dns" && name !== "wifi") return
+    var r = Model.navOpen(nav, name, cursor)
+    if (r.nav === nav) return
+    nav = r.nav
+    cursorActive = true
+    cursorMemory = ({})
+    cursor = Model.initialCursor(rows, page)
+    pointerGate.reset()
+    for (var i = 0; i < r.effects.length; i++) if (r.effects[i].run === "scan") scanIfStale(r.effects[i].ifStaleS)
+    Qt.callLater(function() { wifiView.networks.flick.contentY = 0 })
+  }
+
+  function goBack() {
+    var r = Model.navBack(nav)
+    if (!r.left) return
+    closeTransients()
+    nav = r.nav
+    cursorMemory = ({})
+    cursor = r.cursor !== null && Model.rowIndex(rows, r.cursor.row) >= 0 ? r.cursor : Model.initialCursor(rows, "main")
+    pointerGate.reset()
+  }
+
+  // The words on the main view's two rows.
+  function ageText(a) {
+    if (a === null) return ""
+    if (a.unit === "now") return strings.t("age.now")
+    return strings.t("age." + a.unit).arg(a.n)
+  }
+
+  readonly property string scanAgeText: {
+    if (!view.radio.wifiEnabled) return ""
+    var a = ageText(Model.ageParts(view.scan.lastScanAgeS))
+    return a === "" ? "" : strings.t("wifi.scanned").arg(a)
+  }
+
+  readonly property var dnsRowValue: {
+    var sm = Model.dnsSummary(view, pending)
+    var parts = []
+    switch (sm.mode) {
+    case "pihole": parts.push(strings.t("dns.pihole")); break
+    case "fallback": parts.push(strings.t("hero.fallback").arg(strings.t("fallback." + sm.arg))); break
+    case "auto": parts.push(strings.t("dns.auto")); break
+    case "custom": parts.push(strings.t("dns.custom").arg(sm.arg)); break
+    case "none": parts.push(strings.t("hero.none")); break
+    default: parts.push(strings.t("hero.checking"))
+    }
+    for (var i = 0; i < sm.suffix.length; i++) {
+      if (sm.suffix[i] === "bypassed") parts.push(strings.t("dns.bypassedWord"))
+      else parts.push(strings.tn("dns.leaksWord", sm.leaks).arg(sm.leaks))
+    }
+    return { text: parts.join(" · "), tone: sm.tone }
+  }
+
+  readonly property string wifiRowValue: {
+    var w = Model.wifiSummary(view)
+    var name = w.state === "off" ? strings.t("header.wifiOff") : w.state === "offline" ? strings.t("header.offline")
+      : w.wired ? strings.t("header.ethernet") : (w.name !== "" ? w.name : strings.t("header.wifi"))
+    return scanAgeText !== "" && !w.wired ? name + " · " + scanAgeText : name
+  }
+
+  readonly property string dnsSubtitle: hero.via !== "" ? strings.t("hero.via").arg(hero.via) : ""
+  readonly property string wifiSubtitle: {
+    var w = Model.wifiSummary(view)
+    if (w.state === "off") return strings.t("header.wifiOff")
+    if (w.state === "offline") return strings.t("header.state.offline")
+    return w.wired ? strings.t("header.ethernet") : w.name
+  }
+
+  // The age of the Pi-hole's numbers while the link is down, once it is a
+  // minute or more.
+  readonly property string statsAgeText: {
+    if (statsGoodAt <= 0 || view.link.kind !== "none") return ""
+    var a = Model.ageParts((nowMs - statsGoodAt) / 1000)
+    return a === null || a.unit === "now" ? "" : ageText(a)
+  }
+
+  function formatClock(sec) {
+    return Qt.locale(Commons.I18n.formatLocale).toString(new Date(sec * 1000), "HH:mm")
+  }
+
+  // The DNS view's failover line.
+  readonly property var failoverData: Model.failoverInfo(view)
+  readonly property bool failoverActive: failoverData.state === "active"
+  readonly property string failoverText: {
+    var f = failoverData
+    var name = strings.t("fallback." + f.fallback)
+    if (f.state === "off") return strings.t("failover.off")
+    if (f.state === "armed") return strings.t("failover.armed").arg(name)
+    return f.sinceS > 0 ? strings.t("failover.activeSince").arg(name).arg(formatClock(f.sinceS)) : strings.t("failover.active").arg(name)
+  }
+
   // ------------------------------------------------------ transient UI
   property string passwordFor: ""
   property string passwordError: ""
   property string armedUuid: ""
   property double armedAt: 0
-  property var confirm: ({ open: false, verb: "", servers: "" })
+  // kind: "replace" (DNS the user set by hand is about to be replaced) or
+  // "leave" (switching from the Pi-hole to Automatic: asked first, inline)
+  property var confirm: ({ open: false, verb: "", servers: "", kind: "" })
   property var dnsNote: ({ tone: "", text: "" })
   property string netNote: ""
   property var netFail: ({ id: "", text: "" })
@@ -143,9 +227,9 @@ Panel {
     failId: netFail.id, failText: netFail.text, armedUuid: armedUuid, connectivity: view.link.connectivity
   })
 
-  // How many network rows show before the list scrolls: seven, fewer on a
+  // How many network rows show before the list scrolls: eight, fewer on a
   // short screen.
-  readonly property int listRows: Math.max(3, Math.min(7, Math.floor((panel.availableCardHeight - Style.space(430)) / Style.space(40))))
+  readonly property int listRows: Math.max(3, Math.min(8, Math.floor((panel.availableCardHeight - Style.space(300)) / Style.space(36))))
 
   Timer { id: noteTimer; interval: 7000; onTriggered: { root.dnsNote = ({ tone: "", text: "" }); root.netNote = ""; root.netFail = ({ id: "", text: "" }) } }
   Timer { id: armTimer; interval: 4000; onTriggered: root.armedUuid = "" }
@@ -161,12 +245,16 @@ Panel {
     noteTimer.restart()
   }
 
+  // The words for a failed action. "skipped" is the backend finding nothing
+  // to do: no words.
   function failureText(f) {
     switch (f.code) {
     case "wrongPassword": return strings.t("err.wrongPassword")
     case "noAnswer": return strings.t("err.noAnswer")
     case "timeout": return strings.t("err.timeout")
-    case "tooSoon": return strings.t("err.tooSoon")
+    case "tooSoon": return f.retryInS > 0 ? strings.t("err.tooSoonIn").arg(f.retryInS) : strings.t("err.tooSoon")
+    case "busy": return strings.t("err.busy")
+    case "skipped": return ""
     default: return f.text !== "" ? strings.t("err.failed").arg(f.text) : strings.t("err.generic")
     }
   }
@@ -175,15 +263,22 @@ Panel {
   // not kept anywhere but in its field, which clears itself when its row
   // closes.
   function resetUi() {
-    passwordFor = ""
-    passwordError = ""
-    armedUuid = ""
-    confirm = ({ open: false, verb: "", servers: "" })
+    nav = Model.navInit()
+    closeTransients()
     dnsNote = ({ tone: "", text: "" })
     netNote = ""
     netFail = ({ id: "", text: "" })
     copied = false
     wipeSecrets()
+  }
+
+  // What belongs to the view being left: a passphrase row, an armed Forget,
+  // the DNS confirm.
+  function closeTransients() {
+    passwordFor = ""
+    passwordError = ""
+    armedUuid = ""
+    confirm = ({ open: false, verb: "", servers: "", kind: "" })
   }
 
   function wipeSecrets() {
@@ -199,12 +294,10 @@ Panel {
       settleTimer.restart()
       nowMs = Date.now()
       pending = Model.reconcilePending(pending, rawState, nowMs)
-      syncSeries(true)
       cursorActive = false
-      cursor = Model.initialCursor(rows)
+      cursor = Model.initialCursor(rows, "main")
       cursorMemory = ({})
       pointerGate.reset()
-      Qt.callLater(function() { body.networks.flick.contentY = 0 })
     } else {
       settleTimer.stop()
       settled = false
@@ -212,7 +305,6 @@ Panel {
     }
   }
 
-  Component.onCompleted: syncSeries(true)
   Component.onDestruction: QnetService.setOpen(root, false)
 
   // ------------------------------------------------------------- cursor
@@ -224,10 +316,11 @@ Panel {
   property var cursorMemory: ({})
   property int lastRowIndex: 0
 
-  readonly property var rows: Model.focusRows(view, { confirm: confirm.open }, pending, netList)
-  readonly property string rowsSig: rows.map(function(r) { return r.id }).join(",")
-  readonly property var headerItems: rows[Math.max(0, Model.rowIndex(rows, "header"))].items
-  readonly property var heroItems: rows[Math.max(0, Model.rowIndex(rows, "hero"))].items
+  readonly property var rows: Model.focusRows(view, { view: page, confirm: confirm.open }, pending, netList)
+  readonly property string rowsSig: page + ":" + rows.map(function(r) { return r.id }).join(",")
+  // The header's own stops, whichever view is up (the header is on the main
+  // view's face).
+  readonly property var headerItems: Model.focusRows(view, { view: "main" }, pending, netList)[0].items
 
   onRowsChanged: {
     var c = Model.settleCursor(rows, cursor, lastRowIndex)
@@ -303,12 +396,14 @@ Panel {
     if (keyAutoRepeat) Qt.callLater(function() { root.keyAutoRepeat = false })
   }
 
-  // Esc steps back one level: an armed Forget, the DNS confirm, the
-  // passphrase row, then the panel.
+  // Esc steps back one level (Model.escapeStep): an armed Forget, the DNS
+  // confirm, the passphrase row, a drill-down, then the panel.
   function handleEscape() {
-    if (armedUuid !== "") disarmForget()
-    else if (confirm.open) confirmCancel()
-    else if (passwordFor !== "") cancelPassword()
+    var step = Model.escapeStep({ armed: armedUuid !== "", confirm: confirm.open, password: passwordFor !== "", view: page })
+    if (step === "disarm") disarmForget()
+    else if (step === "confirm") confirmCancel()
+    else if (step === "password") cancelPassword()
+    else if (step === "back") goBack()
     else close()
   }
 
@@ -318,18 +413,20 @@ Panel {
     var row = rows[i]
     var item = row.items[Math.min(cursor.item, row.items.length - 1)]
     var id = row.id
-    if (id === "header") {
-      if (item === "conn") disconnectNet()
-      else if (item === "portal") openPortal()
+    if (id === "back") goBack()
+    else if (id === "header") {
+      if (item === "portal") openPortal()
       else if (item === "qr") summonQr()
       else if (item === "speed") summonSpeed()
       else if (item === "radio") toggleRadio()
-    } else if (id === "hero") {
-      if (item === "setup") setup()
-      else if (item === "pause") togglePause()
-      else if (item === "admin") openAdmin()
-    } else if (id === "bypass") fixBypass()
-    else if (id === "profiles") pinAll()
+    } else if (id === "hero") heroAction()
+    else if (id === "pause") togglePause()
+    else if (id === "goto:dns") openView("dns")
+    else if (id === "goto:wifi") openView("wifi")
+    else if (id === "bypass") fixBypass()
+    else if (id.indexOf("leak:") === 0) pinOne(parseInt(id.substring(5), 10))
+    else if (id === "pinall") pinAll()
+    else if (id === "admin") openAdmin()
     else if (id === "confirm") { if (item === "replace") confirmReplace(); else confirmCancel() }
     else if (id === "dns") {
       if (item === "tile:pihole") tapTile("pihole")
@@ -340,7 +437,6 @@ Panel {
   }
 
   function deleteKey() {
-    if (cursorActive && cursor.row === "header" && headerItems[cursor.item] === "conn") { disconnectNet(); return }
     if (!cursorActive || cursor.row.indexOf("net:") !== 0) return
     var i = parseInt(cursor.row.substring(4), 10)
     var net = netList[i]
@@ -362,7 +458,7 @@ Panel {
     var hasSecret = o.secret !== undefined
     var r = runnerComp.createObject(root, {
       command: argv, hasSecret: hasSecret, secret: hasSecret ? o.secret : "",
-      timeoutMs: o.timeoutMs ? o.timeoutMs : 15000, done: cb
+      timeoutMs: o.timeoutMs ? o.timeoutMs : Model.ACTION_DEADLINE_MS, done: cb
     })
     if (!r) return false
     if (hasSecret) secretRun = r
@@ -373,7 +469,9 @@ Panel {
   function setPending(patch) { pending = Model.withPending(pending, patch, Date.now()) }
 
   // -- DNS
+  // One DNS change at a time: while one is pending, no new one starts.
   function runDns(verb, force) {
+    if (pending.dns !== "") return
     var argv = Model.argvDns(bin, verb, force)
     if (!argv) return
     dnsNote = ({ tone: "", text: "" })
@@ -389,69 +487,99 @@ Panel {
       setPending({ dns: "" })
       var f = Model.failure(res)
       if (f.code === "confirm") {
-        confirm = ({ open: true, verb: verb, servers: Model.confirmServers(res.detail, view) })
+        confirm = ({ open: true, verb: verb, servers: Model.confirmServers(res.detail, view), kind: "replace" })
         return
       }
-      setDnsNote("urgent", failureText(f))
+      var words = failureText(f)
+      if (words !== "") setDnsNote("urgent", words)
     })
   }
 
+  // A tap on a mode tile (Model.tapPlan). Leaving the Pi-hole is two steps:
+  // the tap only asks ("Stop using Pi-hole? Use automatic DNS · Cancel"),
+  // and nothing runs until that is answered.
   function tapTile(name) {
-    var t = Model.tapDns(name, view)
-    if (!t) return
-    if (name === "pihole" && !view.pihole.configured) { setup(); return }
-    confirm = ({ open: false, verb: "", servers: "" })
-    runDns(t.verb, false)
+    var plan = Model.tapPlan(name, view)
+    if (plan.action === "none") return
+    if (plan.action === "setup") { setup(); return }
+    if (pending.dns !== "") return
+    if (plan.action === "confirm") {
+      confirm = ({ open: true, verb: plan.verb, servers: "", kind: plan.kind })
+      return
+    }
+    confirm = ({ open: false, verb: "", servers: "", kind: "" })
+    runDns(plan.verb, false)
   }
 
+  // The yes of the inline confirm: switch away from the Pi-hole (a "leave"),
+  // or replace the DNS that was set by hand (--force).
   function confirmReplace() {
     if (!confirm.open) return
     var verb = confirm.verb
-    confirm = ({ open: false, verb: "", servers: "" })
-    runDns(verb, true)
+    var force = confirm.kind !== "leave"
+    confirm = ({ open: false, verb: "", servers: "", kind: "" })
+    runDns(verb, force)
   }
 
   function confirmCancel() {
-    confirm = ({ open: false, verb: "", servers: "" })
+    confirm = ({ open: false, verb: "", servers: "", kind: "" })
   }
 
   function togglePause() {
     if (!chip.enabled) return
     var now = Date.now()
+    var done = function(patch) {
+      return function(res) {
+        if (res.ok) { QnetService.refresh(); return }
+        setPending(patch)
+        var words = failureText(Model.failure(res))
+        if (words !== "") setDnsNote("urgent", words)
+      }
+    }
     if (chip.mode === "pause") {
       setPending({ pause: "pause", pauseUntilMs: now + Model.PAUSE_SECONDS * 1000 })
-      runCli(Model.argvPause(bin, Model.PAUSE_SECONDS), {}, function(res) {
-        if (res.ok) return
-        setPending({ pause: "", pauseUntilMs: 0 })
-        setDnsNote("urgent", failureText(Model.failure(res)))
-      })
+      runCli(Model.argvPause(bin, Model.PAUSE_SECONDS), {}, done({ pause: "", pauseUntilMs: 0 }))
     } else {
       setPending({ pause: "resume" })
-      runCli(Model.argvResume(bin), {}, function(res) {
-        if (res.ok) return
-        setPending({ pause: "" })
-        setDnsNote("urgent", failureText(Model.failure(res)))
-      })
+      runCli(Model.argvResume(bin), {}, done({ pause: "" }))
     }
   }
 
   // This link's queries can skip the Pi-hole: apply it to the link in use.
   function fixBypass() { runDns("pihole", false) }
 
-  // Saved profiles that are not in use and would bypass the Pi-hole: pin
-  // them all in one go.
-  function pinAll() {
-    var g = leaks.profiles
-    if (!g || !g.pinnable) return
-    var argv = Model.argvPin(bin, g.uuids)
+  // The one corrective step the hero offers (Model.heroState's `action`).
+  function heroAction() {
+    switch (hero.action) {
+    case "setup":
+    case "signin": setup(); break
+    case "usepihole": tapTile("pihole"); break
+    case "pin": fixBypass(); break
+    }
+  }
+
+  // Pin saved profiles that are not in use: a list of uuids, one command.
+  function pinUuids(uuids) {
+    if (uuids.length === 0 || pending.dns !== "" || pending.pinUuid !== "") return
+    var argv = Model.argvPin(bin, uuids)
     if (!argv) return
-    var ids = g.uuids.join(" ")
-    setPending({ pinUuid: ids })
+    setPending({ pinUuid: uuids.join(" ") })
     runCli(argv, {}, function(res) {
       if (res.ok) return
       setPending({ pinUuid: "" })
-      setDnsNote("urgent", failureText(Model.failure(res)))
+      var words = failureText(Model.failure(res))
+      if (words !== "") setDnsNote("urgent", words)
     })
+  }
+
+  function pinAll() {
+    var g = leaks.profiles
+    if (g && g.pinnable) pinUuids(g.uuids)
+  }
+
+  function pinOne(i) {
+    var g = leaks.profiles
+    if (g && g.items[i] && g.items[i].uuid !== "") pinUuids([g.items[i].uuid])
   }
 
   function openAdmin() {
@@ -471,24 +599,37 @@ Panel {
 
   // -- Wi-Fi
   function toggleRadio() {
-    if (!view.radio.hwEnabled) return
+    if (!view.radio.hwEnabled || pending.radio !== "") return
     var on = !view.radio.wifiEnabled
     setPending({ radio: on ? "on" : "off" })
     runCli(Model.argvRadio(bin, on), {}, function(res) {
       if (res.ok) return
       setPending({ radio: "" })
-      setNetNote(failureText(Model.failure(res)))
+      var words = failureText(Model.failure(res))
+      if (words !== "") setNetNote(words)
     })
   }
 
+  // The scan button forces a scan (the backend throttles it).
   function scan() {
     if (view.scan.running || !view.radio.wifiEnabled) return
     setPending({ scanUntilMs: Date.now() + Model.SCAN_SPIN_MS })
     runCli(Model.argvScan(bin), {}, function(res) {
       if (res.ok) return
       setPending({ scanUntilMs: 0 })
-      var f = Model.failure(res)
-      if (f.code !== "tooSoon") setNetNote(failureText(f))
+      var words = failureText(Model.failure(res))
+      if (words !== "") setNetNote(words)
+    })
+  }
+
+  // Entering the Wi-Fi view: scan only if the last scan is older than
+  // ifStaleS. The backend may decline ("skipped", "too-soon", "busy"), and
+  // then nothing is said: it was not asked for.
+  function scanIfStale(ifStaleS) {
+    if (!view.radio.wifiEnabled) return
+    setPending({ scanUntilMs: Date.now() + Model.SCAN_SPIN_MS })
+    runCli(Model.argvScan(bin, ifStaleS), {}, function(res) {
+      if (!res.ok) setPending({ scanUntilMs: 0 })
     })
   }
 
@@ -540,7 +681,9 @@ Panel {
         passwordError = strings.t("err.wrongPassword")
         return
       }
-      netFail = ({ id: net.id, text: failureText(f) })
+      var said = failureText(f)
+      if (said === "") return
+      netFail = ({ id: net.id, text: said })
       noteTimer.restart()
     })
     passphrase = ""
@@ -553,7 +696,8 @@ Panel {
     runCli(Model.argvDown(bin), {}, function(res) {
       if (res.ok) return
       setPending({ disconnecting: false })
-      setNetNote(failureText(Model.failure(res)))
+      var words = failureText(Model.failure(res))
+      if (words !== "") setNetNote(words)
     })
   }
 
@@ -603,7 +747,8 @@ Panel {
     runCli(argv, {}, function(res) {
       if (res.ok) return
       setPending({ forgetUuid: "" })
-      setNetNote(failureText(Model.failure(res)))
+      var words = failureText(Model.failure(res))
+      if (words !== "") setNetNote(words)
     })
   }
 
@@ -705,7 +850,7 @@ Panel {
     focusTarget: keyGate
     // As wide as Sound Hub: the width of the overclock panel's page column.
     contentWidth: panel.fittedContentWidth(Style.space(488))
-    contentHeight: panel.fittedContentHeight(body.implicitHeight + root.topPad + root.bottomPad, Style.space(820))
+    contentHeight: panel.fittedContentHeight(views.current.implicitHeight + root.topPad + root.bottomPad, Style.space(820))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -718,7 +863,7 @@ Panel {
         // The first key only shows the cursor.
         if (!root.cursorActive) {
           root.cursorActive = true
-          if (Model.rowIndex(root.rows, root.cursor.row) < 0) root.cursor = Model.initialCursor(root.rows)
+          if (Model.rowIndex(root.rows, root.cursor.row) < 0) root.cursor = Model.initialCursor(root.rows, root.page)
           return
         }
         root.moveCursor(dx, dy)
@@ -735,7 +880,11 @@ Panel {
       onTextKey: function(t) {
         var k = t.toLowerCase()
         if (k === "p") { if (root.fresh("key:p")) root.togglePause() }
-        else if (k === "r") { if (root.fresh("key:r")) root.scan() }
+        else if (k === "r") { if (root.page === "wifi" && root.fresh("key:r")) root.scan() }
+        else if (k === "1") { if (root.fresh("key:1")) root.openView("dns") }
+        else if (k === "2") { if (root.fresh("key:2")) root.openView("wifi") }
+        // Backspace goes back a view and never closes the panel.
+        else if (t === "\b") { if (root.fresh("key:bs")) root.goBack() }
       }
 
       // Holds the keyboard focus: sees every key before the catcher (its
@@ -757,10 +906,18 @@ Panel {
         anchors.fill: parent
         opacity: root.cardOpaque ? 1 : 0
 
-        PanelBody {
-          id: body
-          hub: root
+        // The three views, one up at a time (as Sound Hub's panelColumn).
+        Item {
+          id: views
           y: root.topPad
+          width: parent.width
+          readonly property Item current: root.page === "dns" ? dnsView : root.page === "wifi" ? wifiView : mainView
+          implicitHeight: current.implicitHeight
+          height: implicitHeight
+
+          MainView { id: mainView; hub: root; visible: root.page === "main" }
+          DnsView { id: dnsView; hub: root; visible: root.page === "dns" }
+          WifiView { id: wifiView; hub: root; visible: root.page === "wifi" }
         }
       }
     }

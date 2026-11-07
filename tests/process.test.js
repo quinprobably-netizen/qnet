@@ -129,3 +129,32 @@ test("a Pi-hole switch that its canary did not confirm is called out, nothing el
   assert.equal(Model.verifyNote("pihole", Model.parseResult('{"ok":false,"error":"x","verifyError":"y"}', 1)), "", "a failure has its own message")
   assert.equal(Model.verifyNote("pihole", null), "")
 })
+
+// ---- round 3: scans, deadlines and the new error codes -------------------------
+
+test("scan: forced, or only when stale", () => {
+  assert.deepEqual(Model.argvScan(BIN), [BIN, "wifi", "scan"])
+  assert.deepEqual(Model.argvScan(BIN, 60), [BIN, "wifi", "scan", "--if-stale", "60"])
+  assert.deepEqual(Model.argvScan(BIN, 0), [BIN, "wifi", "scan", "--if-stale", "0"])
+  assert.equal(Model.argvScan(BIN, -1), null)
+  assert.equal(Model.argvScan(BIN, "60; reboot"), null)
+  assert.equal(Model.argvScan("qnet", 60), null)
+  assert.equal(Model.SCAN_IF_STALE_S, 60)
+})
+
+test("an action has about 25 s to answer", () => {
+  assert.equal(Model.ACTION_DEADLINE_MS, 25000)
+  const runner = require("fs").readFileSync(require("path").join(__dirname, "..", "components", "ActionRunner.qml"), "utf8")
+  assert.match(runner, /property int timeoutMs: 25000/)
+})
+
+test("too-soon carries how long to wait; busy and skipped are told apart", () => {
+  const soon = Model.parseResult('{"ok":false,"error":"too-soon","retryInS":12}', 1)
+  assert.equal(soon.retryInS, 12)
+  assert.deepEqual(Model.failure(soon), { code: "tooSoon", text: "", retryInS: 12 })
+  assert.equal(Model.failure({ error: "too-soon" }).retryInS, 0)
+  assert.deepEqual(Model.failure(Model.parseResult('{"ok":false,"error":"busy"}', 1)), { code: "busy", text: "", retryInS: 0 })
+  assert.deepEqual(Model.failure(Model.parseResult('{"ok":false,"error":"skipped"}', 0)), { code: "skipped", text: "", retryInS: 0 })
+  assert.equal(Model.parseResult('{"ok":false,"error":"too-soon","retryInS":999999}', 1).retryInS, 3600, "bounded")
+  assert.equal(Model.parseResult('{"ok":false,"error":"too-soon","retryInS":"x"}', 1).retryInS, 0)
+})

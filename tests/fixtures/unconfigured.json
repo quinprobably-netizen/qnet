@@ -13,6 +13,7 @@
     "ip4": "192.168.1.242",
     "gateway": "192.168.1.1",
     "gatewayMs": 4.2,
+    "signalDbm": null,
     "connectivity": "full",
     "portalUrl": ""
   },
@@ -139,6 +140,12 @@
     "pauseRemainingS": 0,
     "api": "unconfigured",
     "historySpanS": 0,
+    "upstreams": [],
+    "answeredBy": {
+      "blocklist": 0,
+      "cache": 0,
+      "forwarded": 0
+    },
     "today": {
       "total": 0,
       "blocked": 0,

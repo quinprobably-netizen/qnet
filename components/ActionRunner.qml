@@ -16,7 +16,7 @@ Process {
   property string secret: ""
   property bool hasSecret: false
   property var done: null
-  property int timeoutMs: 15000
+  property int timeoutMs: 25000
 
   property bool streamDone: false
   property bool exitedDone: false

@@ -22,50 +22,66 @@ Column {
     hub: list.hub
     text: list.hub.strings.t("net.title")
 
-    // The scan action. While a scan runs its glyph turns, steadily.
-    CursorSurface {
-      id: scan
-      width: Style.space(28)
-      height: Style.space(24)
-      hasCursor: list.hub.has("scan")
-      onHasCursorChanged: if (hasCursor) list.hub.ensureCursorVisible(scan)
-      foreground: list.hub.fg
-      fill: list.hub.hoverFill
-      scale: scanArea.pressed ? list.hub.pressScale : 1
-      Behavior on scale { NumberAnimation { duration: Style.duration(80); easing.type: Easing.OutCubic } }
+    Row {
+      spacing: Style.space(6)
 
+      // When the list was last scanned, then the scan action.
       Text {
-        id: scanGlyph
-        anchors.centerIn: parent
+        visible: list.hub.scanAgeText !== ""
+        anchors.verticalCenter: parent.verticalCenter
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
-        text: list.hub.glyphs.refresh
-        color: list.hub.view.scan.running ? list.hub.accent : (scan.hasCursor ? list.hub.fg : list.hub.dim)
+        text: list.hub.scanAgeText
+        color: list.hub.dim
         font.family: list.hub.fontFamily
-        font.pixelSize: list.hub.typeBody
-        RotationAnimator on rotation {
-          from: 0; to: 360
-          duration: Style.duration(900)
-          loops: Animation.Infinite
-          // A spinner is constant motion; with animations off it just sits.
-          running: list.hub.view.scan.running && list.hub.opened && !Style.reduceMotion
-          onRunningChanged: if (!running) scanGlyph.rotation = 0
+        font.pixelSize: list.hub.typeSmall
+      }
+
+      // The scan action. While a scan runs its glyph turns, steadily.
+      CursorSurface {
+        id: scan
+        width: Style.space(28)
+        height: Style.space(24)
+        hasCursor: list.hub.has("scan")
+        onHasCursorChanged: if (hasCursor) list.hub.ensureCursorVisible(scan)
+        foreground: list.hub.fg
+        fill: list.hub.hoverFill
+        scale: scanArea.pressed ? list.hub.pressScale : 1
+        Behavior on scale { NumberAnimation { duration: Style.duration(80); easing.type: Easing.OutCubic } }
+
+        Text {
+          id: scanGlyph
+          anchors.centerIn: parent
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+          text: list.hub.glyphs.refresh
+          color: list.hub.view.scan.running ? list.hub.accent : (scan.hasCursor ? list.hub.fg : list.hub.dim)
+          font.family: list.hub.fontFamily
+          font.pixelSize: list.hub.typeBody
+          RotationAnimator on rotation {
+            from: 0; to: 360
+            duration: Style.duration(900)
+            loops: Animation.Infinite
+            // A spinner is constant motion; with animations off it just sits.
+            running: list.hub.view.scan.running && list.hub.opened && !Style.reduceMotion
+            onRunningChanged: if (!running) scanGlyph.rotation = 0
+          }
         }
-      }
 
-      MouseArea {
-        id: scanArea
-        anchors.fill: parent
-        hoverEnabled: true
-        cursorShape: Qt.PointingHandCursor
-        onPositionChanged: function(mouse) { list.hub.hoverCursor(scanArea, mouse, "scan", 0) }
-        onClicked: list.hub.scan()
-      }
+        MouseArea {
+          id: scanArea
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onPositionChanged: function(mouse) { list.hub.hoverCursor(scanArea, mouse, "scan", 0) }
+          onClicked: list.hub.scan()
+        }
 
-      PanelToolTip {
-        visible: scanArea.containsMouse || scan.hasCursor
-        text: list.hub.strings.t("net.scanTip")
-        fontFamily: list.hub.fontFamily
+        PanelToolTip {
+          visible: scanArea.containsMouse || scan.hasCursor
+          text: list.hub.strings.t("net.scanTip")
+          fontFamily: list.hub.fontFamily
+        }
       }
     }
   }

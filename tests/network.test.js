@@ -5,32 +5,31 @@ const { Model, view, state } = require("./helpers.js")
 
 // ---- header --------------------------------------------------------------
 
-test("connected Wi-Fi: SSID, then Connected, band, signal, rate and gateway latency", () => {
+test("connected Wi-Fi: SSID, then just band and signal; 'Connected' is left out when all is well", () => {
   const h = Model.headerInfo(view("healthy"))
   assert.equal(h.kind, "wifi")
   assert.equal(h.title, "Redwood")
   assert.equal(h.urgent, false)
-  assert.equal(h.disconnectable, true)
-  assert.deepEqual(h.status, [
-    { k: "state", key: "connected" }, { k: "text", text: "5 GHz" }, { k: "text", text: "72%" },
-    { k: "text", text: "866 Mb/s" }, { k: "text", text: "gw 4 ms" }
-  ])
+  assert.deepEqual(h.status, [{ k: "text", text: "5 GHz" }, { k: "text", text: "72%" }])
 })
 
-test("gw appears only while the backend measures it (gatewayMs is not null)", () => {
+test("gw appears only when the gateway is slow (over 50 ms) or its probe fails", () => {
+  const texts = (s) => Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0)).status.map((p) => p.text)
   const s = state("healthy")
-  s.link.gatewayMs = null
-  const h = Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0))
-  assert.equal(h.status.some((p) => /gw/.test(p.text || "")), false)
-  s.link.gatewayMs = 0.4
-  assert.equal(Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0)).status.pop().text, "gw <1 ms")
+  assert.deepEqual(texts(s), ["5 GHz", "72%"], "4 ms is routine noise")
+  s.link.gatewayMs = 50
+  assert.deepEqual(texts(s), ["5 GHz", "72%"], "50 is the edge")
   s.link.gatewayMs = 61.7
-  assert.equal(Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0)).status.pop().text, "gw 62 ms")
+  assert.deepEqual(texts(s), ["5 GHz", "72%", "gw 62 ms"])
+  s.link.gatewayMs = null
+  assert.deepEqual(texts(s), ["5 GHz", "72%"], "not measured while the panel is closed")
+  s.link.gatewayOk = false
+  assert.equal(texts(s).pop().startsWith("gw"), true, "a failing probe is worth a word")
+  assert.deepEqual(texts(state("slow-gateway")).pop(), "gw 120 ms")
 })
 
-test("the partial-history fixture's status line is the real panel's", () => {
-  const texts = Model.headerInfo(view("partial")).status.map((p) => p.text || p.key)
-  assert.deepEqual(texts, ["connected", "5 GHz", "61%", "122 Mb/s", "gw 4 ms"])
+test("the real panel's status line", () => {
+  assert.deepEqual(Model.headerInfo(view("partial")).status.map((p) => p.text), ["5 GHz", "61%"])
 })
 
 test("a captive portal reads Sign in required, urgent, and offers the portal", () => {
@@ -41,24 +40,27 @@ test("a captive portal reads Sign in required, urgent, and offers the portal", (
   assert.equal(h.restricted, true)
 })
 
-test("limited and no-internet read urgent; unknown connectivity reads Connected", () => {
+test("limited and no-internet read urgent; unknown connectivity is as good as full", () => {
   const s = state("healthy")
   s.link.connectivity = "limited"
   assert.equal(Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0)).status[0].key, "limited")
+  assert.equal(Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0)).status[1].text, "5 GHz", "the state word first, then the rest")
   s.link.connectivity = "none"
   const n = Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0))
   assert.equal(n.status[0].key, "nointernet")
   assert.equal(n.urgent, true)
   s.link.connectivity = "unknown"
-  assert.equal(Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0)).status[0].key, "connected")
+  assert.deepEqual(Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0)).status.map((p) => p.text), ["5 GHz", "72%"])
 })
 
-test("Ethernet has no title of its own, shows its rate, and cannot be dropped from here", () => {
+test("Ethernet has no title of its own and shows its rate; a wire with no rate says Connected", () => {
   const h = Model.headerInfo(view("ethernet"))
   assert.equal(h.kind, "ethernet")
   assert.equal(h.title, "")
-  assert.equal(h.disconnectable, false)
-  assert.deepEqual(h.status, [{ k: "state", key: "connected" }, { k: "text", text: "1 Gb/s" }, { k: "text", text: "gw <1 ms" }])
+  assert.deepEqual(h.status, [{ k: "text", text: "1 Gb/s" }])
+  const s = state("ethernet")
+  s.link.bitrateMbps = 0
+  assert.deepEqual(Model.headerInfo(Model.effective(s, Model.emptyPending(), 0, 0)).status, [{ k: "state", key: "connected" }])
 })
 
 test("offline and radio off", () => {
@@ -103,23 +105,22 @@ test("the bar icon turns urgent for a restricted link and for DNS that went wron
 
 // ---- footer --------------------------------------------------------------
 
-test("the IP footer is the address alone, with a stable placeholder", () => {
-  assert.equal(Model.ipFooter(view("healthy")).text, "192.168.1.242")
-  assert.equal(Model.ipFooter(view("offline")).text, "--")
+test("the footer is the address and the gateway, with stable placeholders", () => {
+  assert.equal(Model.ipFooter(view("healthy")).text, "192.168.1.242 · gw 192.168.1.1")
+  assert.equal(Model.ipFooter(view("offline")).text, "-- · gw --")
   assert.equal(Model.ipFooter(view("offline")).copyable, false)
   assert.equal(Model.ipFooter(view("healthy")).copyable, true)
 })
 
 // ---- networks ------------------------------------------------------------
 
-test("order: saved networks first, then the rest, strongest first; the active one is the header's", () => {
+test("order: the one in use first, then saved, then the rest, strongest first", () => {
   const ordered = Model.orderNetworks(view("healthy").networks)
-  assert.deepEqual(ordered.map((n) => n.ssid), ["Home-Guest", "Neighbor-5G", "CoffeeShop", "Uni-8021X", "Cafe-OWE"])
-  assert.equal(ordered.some((n) => n.active), false, "nothing repeats the connected network")
-  assert.equal(Model.orderNetworks(view("ethernet").networks)[0].ssid, "Redwood", "with no active network every one is listed")
+  assert.deepEqual(ordered.map((n) => n.ssid), ["Redwood", "Home-Guest", "Neighbor-5G", "CoffeeShop", "Uni-8021X", "Cafe-OWE"])
+  assert.equal(ordered[0].active, true)
 })
 
-test("hidden networks are left out unless asked for, an active hidden one included", () => {
+test("hidden networks are left out unless one is in use or they are asked for", () => {
   const nets = view("healthy").networks
   assert.equal(Model.orderNetworks(nets).some((n) => n.hidden), false)
   assert.equal(Model.orderNetworks(nets, true).some((n) => n.hidden), true)
@@ -127,16 +128,16 @@ test("hidden networks are left out unless asked for, an active hidden one includ
   s.networks[3].hidden = true
   s.networks[3].active = true
   s.networks[0].active = false
-  assert.equal(Model.orderNetworks(s.networks).some((n) => n.hidden), false)
+  assert.equal(Model.orderNetworks(s.networks)[0].hidden, true)
 })
 
-test("a repeated SSID keeps the strongest entry, and none of the connected network's", () => {
+test("a repeated SSID keeps the active or the strongest entry", () => {
   const a = { id: "/org/freedesktop/NetworkManager/AccessPoint/1", ssid: "X", hidden: false, signal: 30, security: "psk", known: false, active: false, uuid: "" }
   const b = Object.assign({}, a, { id: "/org/freedesktop/NetworkManager/AccessPoint/2", signal: 80 })
   const c = Object.assign({}, a, { id: "/org/freedesktop/NetworkManager/AccessPoint/3", signal: 10, active: true })
   assert.equal(Model.orderNetworks([a, b]).length, 1)
   assert.equal(Model.orderNetworks([a, b])[0].signal, 80)
-  assert.equal(Model.orderNetworks([a, b, c]).length, 0, "the other AP of the connected SSID is not a second row")
+  assert.equal(Model.orderNetworks([a, b, c])[0].id, c.id)
 })
 
 test("what a tap on a row does", () => {
@@ -174,4 +175,29 @@ test("captions: transient states win, a failure is urgent text", () => {
   assert.equal(Model.rowCaption(rust, { connectivity: "portal" }).key, "portal")
   assert.equal(Model.rowCaption(rust, { connectivity: "limited" }).key, "limited")
   assert.equal(Model.rowCaption(rust, { connectivity: "portal" }).tone, "urgent")
+})
+
+// ---- the Wi-Fi row -----------------------------------------------------------
+
+test("scan ages read as just now, minutes, hours", () => {
+  assert.deepEqual(Model.ageParts(12), { unit: "now", n: 0 })
+  assert.deepEqual(Model.ageParts(59), { unit: "now", n: 0 })
+  assert.deepEqual(Model.ageParts(240), { unit: "min", n: 4 })
+  assert.deepEqual(Model.ageParts(3599), { unit: "min", n: 59 })
+  assert.deepEqual(Model.ageParts(7300), { unit: "hour", n: 2 })
+  assert.equal(Model.ageParts(-1), null)
+  assert.equal(Model.ageParts(NaN), null)
+})
+
+test("the Wi-Fi row: the network, and when the list was last scanned", () => {
+  const s = state("healthy")
+  s.scan.lastScanAgeS = 240
+  assert.deepEqual(Model.wifiSummary(Model.effective(s, Model.emptyPending(), 0, 0)), { state: "connected", name: "Redwood", age: { unit: "min", n: 4 }, wired: false })
+  assert.equal(Model.wifiSummary(view("offline")).state, "offline")
+  assert.equal(Model.wifiSummary(view("radio-off")).state, "off")
+  assert.equal(Model.wifiSummary(view("radio-off")).age, null, "no age with the radio off")
+  assert.equal(Model.wifiSummary(view("ethernet")).wired, true)
+  const never = state("healthy")
+  never.scan.lastScanAgeS = null
+  assert.equal(Model.wifiSummary(Model.effective(never, Model.emptyPending(), 0, 0)).age, null)
 })

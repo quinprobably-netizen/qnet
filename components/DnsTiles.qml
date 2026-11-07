@@ -3,14 +3,15 @@ import QtQuick
 import qs.Ui
 import qs.Commons
 
-// The DNS row: two segmented tiles, Pi-hole and Automatic, alone in their row.
-// (Pause and Admin are in the hero.) The lit tile is the resolver in use, read from
+// The mode tiles: Pi-hole and Automatic, alone in their row of the DNS view.
+// The lit tile is the resolver in use, read from
 // systemd-resolved: a runtime failover lights Pi-hole in the warning colour
 // as "Pi-hole (fallback)", and custom servers light nothing and show a
 // "Custom: 9.9.9.9" caption. Tapping the lit tile does nothing.
-// Under the row, when there is something to say: the confirm line (replacing
-// DNS the user set by hand), an error, or a note that the Pi-hole did not
-// confirm blocking when it was switched to.
+// Under the row, when there is something to say: the confirm line (leaving the
+// Pi-hole for Automatic is asked first: "Stop using Pi-hole? Use automatic
+// DNS · Cancel"; so is replacing DNS the user set by hand), an error, or a note
+// that the Pi-hole did not confirm blocking when it was switched to.
 Column {
   id: dns
 
@@ -115,7 +116,7 @@ Column {
       anchors.verticalCenter: parent.verticalCenter
       textFormat: Text.PlainText
       renderType: Text.NativeRendering
-      text: dns.hub.strings.t("dns.replaceQ").arg(dns.hub.confirm.servers)
+      text: dns.hub.confirm.kind === "leave" ? dns.hub.strings.t("dns.leaveQ") : dns.hub.strings.t("dns.replaceQ").arg(dns.hub.confirm.servers)
       color: dns.hub.fg
       font.family: dns.hub.fontFamily
       font.pixelSize: dns.hub.typeSmall
@@ -129,7 +130,7 @@ Column {
       anchors.verticalCenter: parent.verticalCenter
       padX: Style.space(8)
       padY: Style.space(4)
-      text: dns.hub.strings.t("dns.replace")
+      text: dns.hub.confirm.kind === "leave" ? dns.hub.strings.t("dns.leaveYes") : dns.hub.strings.t("dns.replace")
       textColor: dns.hub.urgent
       weight: Font.DemiBold
       cursorRow: "confirm"
