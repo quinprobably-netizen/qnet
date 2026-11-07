@@ -511,6 +511,7 @@ pub mod fixtures {
                 state: 2,
             }),
             ip4: active.then(|| "192.168.1.242".parse().unwrap()),
+            prefix: active.then_some(24),
             gateway: active.then(|| GW.parse().unwrap()),
             speed_mbps: 0,
             wifi: Some(WifiDev {

@@ -398,6 +398,29 @@ fn parse_global_current(v: &Value<'_>) -> Option<IpAddr> {
     ip_from(family, &addr)
 }
 
+/// NM's IP4Config `AddressData` (`aa{sv}`): the first entry's `address` and
+/// the `prefix` next to it (0..=32).
+fn parse_address_data(v: &Value<'_>) -> Option<(Ipv4Addr, Option<u32>)> {
+    let Value::Array(a) = unwrap_variant(v) else { return None };
+    a.inner().iter().find_map(|e| {
+        let Value::Dict(dict) = unwrap_variant(e) else { return None };
+        let addr: Ipv4Addr = dict
+            .get::<_, Value>(&Value::new("address"))
+            .ok()
+            .flatten()
+            .and_then(|v| as_string(&v))?
+            .parse()
+            .ok()?;
+        let prefix = dict
+            .get::<_, Value>(&Value::new("prefix"))
+            .ok()
+            .flatten()
+            .and_then(|v| as_u32(&v))
+            .filter(|p| *p <= 32);
+        Some((addr, prefix))
+    })
+}
+
 /// `a(sb)` domains: true when one is the root routing domain.
 fn has_root_route(v: &Value<'_>) -> bool {
     let Value::Array(arr) = unwrap_variant(v) else { return false };
@@ -593,20 +616,13 @@ impl DbusBackend {
             })
         });
 
-        let (mut ip4, mut gateway) = (None, None);
+        let (mut ip4, mut gateway, mut prefix) = (None, None, None);
         if let Some(cfg) = d_path(&d, "Ip4Config") {
             if let Ok(c) = self.get_all(NM, &cfg, "org.freedesktop.NetworkManager.IP4Config") {
                 gateway = d_string(&c, "Gateway").and_then(|g| g.parse().ok());
-                if let Some(Value::Array(a)) = c.get("AddressData").map(|v| unwrap_variant(v)) {
-                    ip4 = a.inner().iter().find_map(|e| match unwrap_variant(e) {
-                        Value::Dict(dict) => dict
-                            .get::<_, Value>(&Value::new("address"))
-                            .ok()
-                            .flatten()
-                            .and_then(|v| as_string(&v))
-                            .and_then(|s| s.parse().ok()),
-                        _ => None,
-                    });
+                if let Some((a, p)) = c.get("AddressData").and_then(|v| parse_address_data(v)) {
+                    ip4 = Some(a);
+                    prefix = p;
                 }
             }
         }
@@ -664,6 +680,7 @@ impl DbusBackend {
             state,
             active,
             ip4,
+            prefix,
             gateway,
             speed_mbps,
             wifi,
@@ -1177,6 +1194,30 @@ mod tests {
         assert_eq!(got[0], (4, "192.168.1.153".parse().unwrap()));
         assert_eq!(got[1].0, 0);
         assert!(got[1].1.is_ipv6());
+    }
+
+    #[test]
+    fn address_data_gives_the_address_and_its_prefix() {
+        use std::collections::HashMap;
+        use zbus::zvariant::Dict;
+        let entry = |addr: &str, prefix: Option<u32>| {
+            let mut m: HashMap<&str, Value> = HashMap::new();
+            m.insert("address", Value::from(addr.to_string()));
+            if let Some(p) = prefix {
+                m.insert("prefix", Value::from(p));
+            }
+            Value::Dict(Dict::from(m))
+        };
+        let v = Value::from(vec![entry("192.168.1.242", Some(24)), entry("10.0.0.2", Some(8))]);
+        assert_eq!(parse_address_data(&v), Some(("192.168.1.242".parse().unwrap(), Some(24))), "the first entry");
+        let v = Value::from(vec![entry("192.168.1.242", None)]);
+        assert_eq!(parse_address_data(&v), Some(("192.168.1.242".parse().unwrap(), None)));
+        let v = Value::from(vec![entry("192.168.1.242", Some(99))]);
+        assert_eq!(parse_address_data(&v), Some(("192.168.1.242".parse().unwrap(), None)), "out of range is no prefix");
+        let v = Value::from(vec![entry("not-an-ip", Some(24)), entry("172.16.0.9", Some(16))]);
+        assert_eq!(parse_address_data(&v), Some(("172.16.0.9".parse().unwrap(), Some(16))), "skips a bad entry");
+        assert_eq!(parse_address_data(&Value::from(Vec::<Value>::new())), None);
+        assert_eq!(parse_address_data(&Value::from(3u32)), None);
     }
 
     #[test]

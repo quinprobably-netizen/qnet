@@ -145,6 +145,8 @@ subtracts it from `today` and from each `history` bucket.
     "signal": 72,
     "band": "5 GHz",
     "bitrateMbps": 866,
+    "frequencyMhz": 5180,
+    "prefix": 24,
     "signalDbm": null,
     "ip4": "192.168.1.242",
     "gateway": "192.168.1.1",
@@ -163,7 +165,8 @@ subtracts it from `today` and from each `history` bucket.
       "known": true,
       "uuid": "…",
       "active": true,
-      "band": "5 GHz"
+      "band": "5 GHz",
+      "frequencyMhz": 5180
     }
   ],
   "scan": { "running": false, "lastScanAgeS": 12 },
@@ -218,6 +221,11 @@ Field rules:
   line sent, at most 4 per second. While the panel is closed `pihole.probes`,
   `pihole.latencyMs` and `link.bitrateMbps` do not count, so a healthy closed
   probe produces only a heartbeat. `open` always sends the full state.
+- **`link.frequencyMhz`, `link.prefix`:** the active access point's channel
+  frequency in MHz (`null` off Wi-Fi), and the IPv4 prefix length of `ip4`
+  (`null` without an address); both straight from NetworkManager's D-Bus
+  (`AccessPoint.Frequency`, `IP4Config.AddressData` `prefix`). Each
+  `networks[]` entry has its own `frequencyMhz`.
 - **`link.signalDbm`:** always `null`. NetworkManager's D-Bus API gives only
   the percentage (`link.signal`); qnet does not poll `iw` or the supplicant.
 - **`pihole.upstreams`:** from `GET /api/stats/upstreams`, refreshed on open

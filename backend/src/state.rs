@@ -120,6 +120,10 @@ pub struct LinkOut {
     pub signal: u32,
     pub band: String,
     pub bitrate_mbps: u32,
+    /// Channel frequency of the active access point, MHz; null off Wi-Fi.
+    pub frequency_mhz: Option<u32>,
+    /// IPv4 prefix length of `ip4`; null without an address.
+    pub prefix: Option<u32>,
     /// Signal strength in dBm. NetworkManager does not expose it over D-Bus
     /// (only a percentage), and polling `iw` is off the table: always null.
     pub signal_dbm: Option<i32>,
@@ -138,6 +142,7 @@ pub struct RadioOut {
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct NetworkOut {
     pub id: String,
     pub ssid: String,
@@ -148,6 +153,7 @@ pub struct NetworkOut {
     pub uuid: String,
     pub active: bool,
     pub band: String,
+    pub frequency_mhz: u32,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -311,6 +317,8 @@ pub fn build_link(net: Option<&NetSnapshot>, profiles: &[Profile], gateway_ms: O
         signal: 0,
         band: String::new(),
         bitrate_mbps: 0,
+        frequency_mhz: None,
+        prefix: None,
         signal_dbm: None,
         ip4: String::new(),
         gateway: String::new(),
@@ -329,6 +337,7 @@ pub fn build_link(net: Option<&NetSnapshot>, profiles: &[Profile], gateway_ms: O
     let _ = profiles;
     out.device = dev.iface.clone();
     out.ip4 = dev.ip4.map(|a| a.to_string()).unwrap_or_default();
+    out.prefix = dev.ip4.and(dev.prefix);
     out.gateway = dev.gateway.map(|a| a.to_string()).unwrap_or_default();
     out.gateway_ms = gateway_ms.map(round1);
     if let Some(a) = &dev.active {
@@ -348,6 +357,7 @@ pub fn build_link(net: Option<&NetSnapshot>, profiles: &[Profile], gateway_ms: O
                     out.ssid = display_ssid(&ap.ssid).0;
                     out.signal = ap.strength as u32;
                     out.band = band_of(ap.freq).to_string();
+                    out.frequency_mhz = Some(ap.freq).filter(|f| *f > 0);
                 }
             }
         }
@@ -401,6 +411,7 @@ pub fn build_networks(net: Option<&NetSnapshot>, profiles: &[Profile]) -> Vec<Ne
                 uuid: profile.map(|p| p.uuid.clone()).unwrap_or_default(),
                 active: active_ap.is_some() && dev.is_up(),
                 band: band_of(shown.freq).to_string(),
+                frequency_mhz: shown.freq,
             }
         })
         .collect();
@@ -867,26 +878,26 @@ mod tests {
             "link": {
                 "kind": "wifi", "device": "wlp7s0", "connection": "Redwood",
                 "uuid": U_WIFI, "ssid": "Redwood", "signal": 72, "band": "5 GHz",
-                "bitrateMbps": 866, "signalDbm": null, "ip4": "192.168.1.242", "gateway": "192.168.1.1",
+                "bitrateMbps": 866, "frequencyMhz": 5180, "prefix": 24, "signalDbm": null, "ip4": "192.168.1.242", "gateway": "192.168.1.1",
                 "gatewayMs": 3.8, "connectivity": "full", "portalUrl": ""
             },
             "radio": {"wifiEnabled": true, "hwEnabled": true},
             "networks": [
                 {"id": "/org/freedesktop/NetworkManager/AccessPoint/12", "ssid": "Redwood",
                  "hidden": false, "signal": 72, "security": "psk", "known": true,
-                 "uuid": U_WIFI, "active": true, "band": "5 GHz"},
+                 "uuid": U_WIFI, "active": true, "band": "5 GHz", "frequencyMhz": 5180},
                 {"id": "/org/freedesktop/NetworkManager/AccessPoint/41", "ssid": "Corp",
                  "hidden": false, "signal": 60, "security": "enterprise", "known": false,
-                 "uuid": "", "active": false, "band": "5 GHz"},
+                 "uuid": "", "active": false, "band": "5 GHz", "frequencyMhz": 5180},
                 {"id": "/org/freedesktop/NetworkManager/AccessPoint/40", "ssid": "Cafe",
                  "hidden": false, "signal": 50, "security": "psk", "known": false,
-                 "uuid": "", "active": false, "band": "2.4 GHz"},
+                 "uuid": "", "active": false, "band": "2.4 GHz", "frequencyMhz": 2437},
                 {"id": "/org/freedesktop/NetworkManager/AccessPoint/42", "ssid": "Lobby",
                  "hidden": false, "signal": 40, "security": "open", "known": false,
-                 "uuid": "", "active": false, "band": "2.4 GHz"},
+                 "uuid": "", "active": false, "band": "2.4 GHz", "frequencyMhz": 2437},
                 {"id": "/org/freedesktop/NetworkManager/AccessPoint/43", "ssid": "",
                  "hidden": true, "signal": 30, "security": "psk", "known": false,
-                 "uuid": "", "active": false, "band": "2.4 GHz"}
+                 "uuid": "", "active": false, "band": "2.4 GHz", "frequencyMhz": 2437}
             ],
             "scan": {"running": false, "lastScanAgeS": 12},
             "dns": {
@@ -1654,5 +1665,42 @@ mod tests {
         assert!(!st.dns.bypassed, "it is a leak line, not the hero's bypass");
         f.resolver.global_current = None;
         assert!(build(&f).dns.leaks.iter().all(|l| l.kind != "resolved-fallback"));
+    }
+
+    #[test]
+    fn channel_frequency_and_prefix_for_the_active_card() {
+        let f = fixture();
+        let st = build(&f);
+        assert_eq!(st.link.frequency_mhz, Some(5180));
+        assert_eq!(st.link.prefix, Some(24));
+        let j = to_json(&st);
+        assert_eq!(j["link"]["frequencyMhz"], 5180);
+        assert_eq!(j["link"]["prefix"], 24);
+        // The scan list carries each network's own channel.
+        let by = |ssid: &str| st.networks.iter().find(|n| n.ssid == ssid).unwrap().frequency_mhz;
+        assert_eq!((by("Redwood"), by("Cafe")), (5180, 2437));
+        assert_eq!(j["networks"][0]["frequencyMhz"], 5180);
+
+        // Ethernet: no channel, but the prefix is still there.
+        let mut f = fixture();
+        let mut eth = f.net.devices[0].clone();
+        eth.kind = DeviceKind::Ethernet;
+        eth.wifi = None;
+        f.net.devices = vec![eth];
+        let st = build(&f);
+        assert_eq!((st.link.kind, st.link.frequency_mhz, st.link.prefix), ("ethernet", None, Some(24)));
+        assert_eq!(to_json(&st)["link"]["frequencyMhz"], Value::Null);
+
+        // No address yet: no prefix, whatever NM left lying about.
+        let mut f = fixture();
+        f.net.devices[0].ip4 = None;
+        assert_eq!(build(&f).link.prefix, None);
+        // Offline: both null.
+        let mut f = fixture();
+        f.net.devices[0].state = 30;
+        f.net.devices[0].active = None;
+        f.net.primary_conn = None;
+        let st = build(&f);
+        assert_eq!((st.link.frequency_mhz, st.link.prefix), (None, None));
     }
 }

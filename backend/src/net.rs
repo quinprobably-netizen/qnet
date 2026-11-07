@@ -169,6 +169,8 @@ pub struct Device {
     pub state: u32,
     pub active: Option<ActiveConn>,
     pub ip4: Option<Ipv4Addr>,
+    /// IPv4 prefix length next to `ip4` (the "prefix" of NM's AddressData).
+    pub prefix: Option<u32>,
     pub gateway: Option<Ipv4Addr>,
     pub speed_mbps: u32,
     pub wifi: Option<WifiDev>,
