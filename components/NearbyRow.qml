@@ -3,20 +3,15 @@ import qs.Ui
 import qs.Commons
 import "../Model.js" as Model
 
-// One network. A glyph for its signal (the one in use leads the list: its
-// glyph and "Connected" are the accent, and "Disconnect" is on the row), its
-// name, and on the right a dim caption: "Saved", "Open" (an unsaved open
-// network is marked), "802.1X", or what is happening ("Connecting…", an error
-// in urgent). There is no lock on the others.
+// One nearby network: four signal bars, its name, and on the right a band chip
+// ("5G"), then a lock when it is secured and not saved, or a dim caption
+// ("Saved", what is happening, an error in urgent).
 //
 //   press / Enter     saved or open: connect; secured and unknown: the
 //                     passphrase row opens under this one; 802.1X that is not
-//                     saved: nmtui in a terminal. On the one in use a press
-//                     does nothing (Disconnect is its own button; Enter on it
-//                     disconnects).
-//   right-click / Delete   saved networks, the one in use included: Forget,
-//                     asked again in place ("Forget  Cancel"; Enter forgets,
-//                     Esc cancels)
+//                     saved: nmtui in a terminal
+//   right-click / Delete   saved networks: Forget, asked again in place
+//                     ("Forget  Cancel"; Enter forgets, Esc cancels)
 //
 // The passphrase row lives here, under its network, so it stays with that
 // network if the list reorders. The text is cleared when it closes.
@@ -32,6 +27,8 @@ Item {
   readonly property bool armed: net.uuid !== "" && hub.armedUuid === net.uuid
   readonly property bool cursor: hub.has("net:" + index)
   readonly property var caption: Model.rowCaption(net, hub.captionContext)
+  readonly property string chip: Model.bandChip(net.band, net.frequencyMhz)
+  readonly property bool lock: Model.showLock(net)
 
   readonly property string captionText: {
     if (armed) return ""
@@ -61,29 +58,25 @@ Item {
     id: surface
     width: row.width
     height: Style.space(36)
-    property bool hover: false
     hasCursor: row.cursor
     onHasCursorChanged: if (hasCursor) row.hub.ensureCursorVisible(row)
     foreground: row.hub.fg
     fill: row.hub.hoverFill
 
-    Text {
-      id: glyph
+    SignalBars {
+      id: bars
       anchors.left: parent.left
-      anchors.leftMargin: row.hub.gutter + Style.space(2)
+      anchors.leftMargin: row.hub.gutter + Style.space(4)
       anchors.verticalCenter: parent.verticalCenter
-      textFormat: Text.PlainText
-      renderType: Text.NativeRendering
-      text: row.net.active ? Model.linkGlyph(row.hub.view) : Model.wifiGlyph(row.net.signal)
-      color: row.net.active ? row.hub.accent : row.hub.dim
-      font.family: row.hub.fontFamily
-      font.pixelSize: row.hub.typeBody + Style.space(3)
+      level: Model.signalBars(row.net.signal)
+      lit: row.hub.fg
+      unlit: Qt.rgba(row.hub.fg.r, row.hub.fg.g, row.hub.fg.b, 0.2)
     }
 
     Text {
       id: name
-      anchors.left: glyph.right
-      anchors.leftMargin: Style.space(12)
+      anchors.left: bars.right
+      anchors.leftMargin: Style.space(14)
       anchors.right: tail.left
       anchors.rightMargin: Style.space(10)
       anchors.verticalCenter: parent.verticalCenter
@@ -96,53 +89,90 @@ Item {
       elide: Text.ElideRight
     }
 
-    // The right edge: a caption, or the forget question in its place.
-    Item {
+    // The right edge: the band chip, then a lock or a caption, each in a
+    // column of its own so the chips and the words line up down the list; the
+    // forget question in their place.
+    Row {
       id: tail
       anchors.right: parent.right
       anchors.rightMargin: row.hub.gutter
       anchors.verticalCenter: parent.verticalCenter
-      width: row.armed ? armedRow.width
-        : Math.min(captionLabel.implicitWidth, surface.width * 0.4) + (disconnect.visible ? disconnect.width - disconnect.padX + Style.space(6) : 0)
-      height: surface.height
+      spacing: Style.space(8)
 
       Text {
-        id: captionLabel
-        visible: !row.armed
-        anchors.right: disconnect.visible ? disconnect.left : parent.right
-        anchors.rightMargin: disconnect.visible ? Style.space(6) - disconnect.padX : 0
-        anchors.verticalCenter: parent.verticalCenter
-        width: Math.min(implicitWidth, surface.width * 0.4)
-        horizontalAlignment: Text.AlignRight
+        id: chipMeasure
+        visible: false
         textFormat: Text.PlainText
-        renderType: Text.NativeRendering
-        text: row.captionText
-        color: row.captionColor
+        text: "2.4G"
         font.family: row.hub.fontFamily
         font.pixelSize: row.hub.typeSmall
-        elide: Text.ElideRight
       }
 
-      // The one in use can be dropped from its own row.
-      TextButton {
-        id: disconnect
-        visible: row.net.active && !row.armed && !row.hub.pending.disconnecting
-        hub: row.hub
-        anchors.right: parent.right
-        anchors.rightMargin: -padX
-        anchors.verticalCenter: parent.verticalCenter
-        padX: Style.space(6)
-        padY: Style.space(4)
-        text: row.hub.strings.t("net.disconnect")
-        textColor: row.hub.dim
-        hotColor: row.hub.fg
-        onClicked: row.hub.disconnectNet()
+      Item {
+        visible: !row.armed
+        width: chipMeasure.implicitWidth + Style.space(10)
+        height: surface.height
+
+        Rectangle {
+          visible: row.chip !== ""
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          width: chipLabel.implicitWidth + Style.space(8)
+          height: chipLabel.implicitHeight + Style.space(2)
+          radius: Style.space(4)
+          color: "transparent"
+          border.width: 1
+          border.color: row.hub.lineColor
+          Text {
+            id: chipLabel
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            renderType: Text.NativeRendering
+            text: row.chip
+            color: row.hub.dim
+            font.family: row.hub.fontFamily
+            font.pixelSize: row.hub.typeSmall
+          }
+        }
+      }
+
+      Item {
+        visible: !row.armed
+        width: Math.max(Style.space(52), Math.min(captionLabel.implicitWidth, surface.width * 0.4))
+        height: surface.height
+
+        Text {
+          visible: row.lock && row.captionText === ""
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+          text: row.hub.glyphs.lock
+          color: row.hub.dim
+          font.family: row.hub.fontFamily
+          font.pixelSize: row.hub.typeSmall
+        }
+
+        Text {
+          id: captionLabel
+          visible: row.captionText !== ""
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          width: Math.min(implicitWidth, surface.width * 0.4)
+          horizontalAlignment: Text.AlignRight
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+          text: row.captionText
+          color: row.captionColor
+          font.family: row.hub.fontFamily
+          font.pixelSize: row.hub.typeSmall
+          elide: Text.ElideRight
+        }
       }
 
       Row {
         id: armedRow
         visible: row.armed
-        anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(2)
         TextButton {
@@ -172,12 +202,11 @@ Item {
       hoverEnabled: true
       acceptedButtons: Qt.LeftButton | Qt.RightButton
       cursorShape: row.net.hidden ? Qt.ArrowCursor : Qt.PointingHandCursor
-      onContainsMouseChanged: surface.hover = containsMouse
       onPositionChanged: function(mouse) { row.hub.hoverCursor(area, mouse, "net:" + row.index, 0) }
       onClicked: function(mouse) {
         row.hub.setCursor("net:" + row.index, 0)
         if (mouse.button === Qt.RightButton) row.hub.armForget(row.index)
-        else if (!row.net.active) row.hub.activateNet(row.index)
+        else row.hub.activateNet(row.index)
       }
     }
 

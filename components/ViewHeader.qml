@@ -3,8 +3,8 @@ import QtQuick
 import qs.Ui
 import qs.Commons
 
-// The head of a drill-down view, as Sound Hub's: a back button, the title,
-// one dim line under it. The back button is a cursor stop ("back"); its
+// The head of a drill-down view: a back button, the title, and, when there
+// is one, a dim line under it. The back button is a cursor stop ("back"); its
 // tooltip names the key. Esc and Backspace go back too (Panel.qml).
 Item {
   id: vh
@@ -46,7 +46,7 @@ Item {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onPositionChanged: function(m) { vh.hub.hoverCursor(backMouse, m, "back", 0) }
-      onClicked: vh.hub.goBack()
+      onClicked: vh.hub.goBack(true)
     }
 
     PanelToolTip {

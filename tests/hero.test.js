@@ -246,9 +246,11 @@ test("the panel wires it: the tap opens the confirm, only the confirm's yes runs
   const yes = panel.slice(panel.indexOf("function confirmReplace()"), panel.indexOf("function confirmCancel()"))
   assert.match(yes, /runDns\(verb, force\)/)
   assert.match(yes, /force = confirm\.kind !== "leave"/, "leaving is not a --force")
-  const tiles = require("fs").readFileSync(require("path").join(__dirname, "..", "components", "DnsTiles.qml"), "utf8")
-  assert.match(tiles, /dns\.leaveQ/)
-  assert.match(tiles, /dns\.leaveYes/)
+  const choices = require("fs").readFileSync(require("path").join(__dirname, "..", "components", "ResolverChoices.qml"), "utf8")
+  assert.match(choices, /dns\.leaveQ/)
+  assert.match(choices, /dns\.leaveYes/)
+  assert.match(choices, /hub\.tapTile\(row\.name\)/, "a row only ever goes through tapTile")
+  assert.doesNotMatch(choices, /runDns|confirmReplace\(\)\s*\n\s*pick\.hub\.tapTile/, "no row runs a DNS change itself")
 })
 
 test("a pending request lights the tile it asked for at once, and the other goes out", () => {
@@ -444,20 +446,29 @@ test("a resolved-fallback leak is the link's, never an unused profile", () => {
   assert.equal(Model.normalizeState({ dns: { leaks: [{ kind: "resolved-fallback", where: "x" }] } }).dns.leaks[0].kind, "resolved-fallback")
 })
 
-// ---- the DNS row's value ------------------------------------------------------
+// ---- the leak count on the Pi-hole's node ---------------------------------------
 
-test("the DNS row says what the resolver is, and colours what is wrong", () => {
-  const sum = (n) => Model.dnsSummary(view(n))
-  assert.deepEqual(sum("healthy"), { mode: "pihole", arg: "", suffix: [], tone: "dim", leaks: 0 })
-  assert.deepEqual(sum("leaks"), { mode: "pihole", arg: "", suffix: ["leaks"], tone: "warning", leaks: 2 })
-  assert.deepEqual(sum("bypassed").suffix, ["bypassed"])
-  assert.equal(sum("bypassed").tone, "urgent")
-  assert.deepEqual(sum("fallback"), { mode: "fallback", arg: "router", suffix: [], tone: "warning", leaks: 0 })
-  assert.equal(sum("none").tone, "urgent")
-  assert.deepEqual(sum("custom"), { mode: "custom", arg: "9.9.9.9", suffix: [], tone: "dim", leaks: 0 })
-  assert.deepEqual(sum("ethernet-bypassed").suffix, ["bypassed"])
-  assert.equal(sum("ethernet-bypassed").mode, "auto")
-  assert.equal(Model.dnsSummary(Model.effective(state("healthy"), Model.emptyPending(), 0, 0, true)).mode, "unknown")
+test("the count of what bypasses the Pi-hole: profiles that would, and this link when it does", () => {
+  assert.equal(Model.leakCount(view("healthy")), 0)
+  assert.equal(Model.leakCount(view("leaks")), 2)
+  assert.equal(Model.leakCount(view("bypassed")), 1, "this link itself")
+  assert.equal(Model.leakCount(view("markup")), 1)
+  const pend = Model.withPending(Model.emptyPending(), { pinUuid: Model.leakGroups(view("leaks")).profiles.uuids.join(" ") }, NOW_MS)
+  assert.equal(Model.leakCount(view("leaks"), pend), 0, "pinned ones are gone at once")
+})
+
+test("the resolver choices: two radio rows lit by what resolved reports", () => {
+  const c = (n) => Model.dnsChoices(view(n))
+  assert.deepEqual(c("healthy").map((r) => [r.id, r.lit]), [["pihole", "on"], ["auto", "off"]])
+  assert.equal(c("healthy")[0].detail, "192.168.1.153")
+  assert.deepEqual(c("fallback").map((r) => [r.id, r.lit, r.warn]), [["pihole", "warn", true], ["auto", "off", false]])
+  assert.deepEqual(c("custom").map((r) => r.lit), ["off", "off"], "custom servers light neither")
+  assert.deepEqual(c("unconfigured").map((r) => [r.id, r.lit, r.configured]), [["pihole", "off", false], ["auto", "on", true]])
+  assert.equal(c("unconfigured")[0].detail, "")
+  const down = Model.effective(state("healthy"), Model.emptyPending(), 0, 0, true)
+  assert.deepEqual(Model.dnsChoices(down).map((r) => r.lit), ["off", "off"], "nothing is lit without the backend")
+  const pend = Model.withPending(Model.emptyPending(), { dns: "auto" }, NOW_MS)
+  assert.deepEqual(Model.dnsChoices(view("healthy", pend)).map((r) => r.lit), ["off", "on"], "a request in flight lights its row")
 })
 
 test("failover on the DNS view: off, armed or active, with the effective fallback and the reason", () => {

@@ -64,6 +64,8 @@ var GLYPH = {
   shieldOff: "\u{f099c}",
   earth: "\u{f01e7}",
   plus: "\u{f0415}",
+  lock: "\u{f033e}",
+  resolver: "\u{f048d}",
   check: "\u{f012c}"
 }
 
@@ -160,7 +162,8 @@ function normalizeState(raw) {
       signal: clamp(toInt(nw[k].signal, 0), 0, 100),
       security: oneOf(nw[k].security, ["open", "psk", "sae", "owe", "enterprise"], "psk"),
       known: nw[k].known === true, uuid: UUID_RE.test(nuuid) ? nuuid : "",
-      active: nw[k].active === true, band: clean(nw[k].band, 12)
+      active: nw[k].active === true, band: clean(nw[k].band, 12),
+      frequencyMhz: clamp(toInt(nw[k].frequencyMhz, 0), 0, 8000)
     })
   }
 
@@ -221,6 +224,8 @@ function normalizeState(raw) {
       uuid: UUID_RE.test(String(l.uuid || "")) ? String(l.uuid) : "",
       ssid: clean(l.ssid, 64), signal: clamp(toInt(l.signal, 0), 0, 100), band: clean(l.band, 12),
       bitrateMbps: Math.max(0, toInt(l.bitrateMbps, 0)), ip4: ip(l.ip4), gateway: ip(l.gateway),
+      frequencyMhz: clamp(toInt(l.frequencyMhz, 0), 0, 8000),
+      prefix: toInt(l.prefix, 0) >= 1 && toInt(l.prefix, 0) <= 32 ? toInt(l.prefix, 0) : 0,
       gatewayMs: isFinite(gms) && gms >= 0 ? gms : null,
       gatewayOk: typeof l.gatewayOk === "boolean" ? l.gatewayOk : null,
       signalDbm: isFinite(dbm) && dbm < 0 && dbm >= -130 ? Math.round(dbm) : null,
@@ -705,6 +710,36 @@ function shortAddr(a) {
   return o !== "" && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a) ? o : a
 }
 
+// How the Pi-hole looks in the hero and in the DNS view's chain, by state:
+// { tone, glyph, mark, text, stat, statTone } -- text is its address with the
+// mark (".153 ✓"), stat the word under it (latency, "paused 4:30", the
+// failover countdown).
+function piholeLook(v, h) {
+  var p = v.pihole
+  var short = shortAddr(p.address)
+  if (h.kind === "paused") {
+    return { tone: "dim", glyph: "shieldOutline", mark: "", text: short,
+      stat: word("route.paused", [h.pauseS > 0 ? formatCountdown(h.pauseS) : ""], "warning"), statTone: "warning" }
+  }
+  if (h.kind === "fallback") return { tone: "dim", glyph: "shieldOff", mark: "\u2715", text: short + " \u2715", stat: null, statTone: "" }
+  if (h.kind === "unreachable") {
+    var fi = h.failoverIn
+    return { tone: "urgent", glyph: "shieldOff", mark: "\u2715", text: short + " \u2715",
+      stat: fi !== null ? (fi > 0 ? word("hero.failoverIn", [formatCountdown(fi)], "warning") : word("hero.failingOver", [], "warning")) : word("hero.noAnswer", [], "urgent"),
+      statTone: fi !== null ? "warning" : "urgent" }
+  }
+  var ms = p.latencyMs !== null ? formatLatency(p.latencyMs) : ""
+  return { tone: "accent", glyph: "shield", mark: "\u2713", text: short + " \u2713", stat: ms !== "" ? part(ms) : null,
+    statTone: h.latencyBad ? "urgent" : "" }
+}
+
+// How many things bypass the Pi-hole, for the count on its node: the saved
+// profiles that would, and this link itself when it does.
+function leakCount(v, pending) {
+  var g = leakGroups(v, pending)
+  return (g.profiles ? g.profiles.count : 0) + (g.bypass ? 1 : 0)
+}
+
 // The hero's picture, as data: the route a DNS query takes from this machine
 // out to the internet, hop by hop, and what state each hop is in. HeroViz
 // only draws it. Slots, left to right: pc, ap, ph (the Pi-hole's place), up
@@ -717,9 +752,14 @@ function shortAddr(a) {
 //                     up is the resolver
 //            none     the link has no DNS servers: pc, ap, then a note
 //            offline  pc alone
-//   nodes    [{ id, glyph, tone, label, stat, statTone, mark, tip }]
+//   nodes    [{ id, glyph, tone, label, stat, statTone, mark, tip, open, badge }]
 //            label and stat are parts: { text } or { key, args } to be worded
 //            by the panel; tone accent | dim | warning | urgent
+//            open  "wifi" | "dns" | "": the view the node opens (the route is
+//                  the navigation: the AP opens Wi-Fi, the Pi-hole's place
+//                  opens DNS)
+//            badge null or { n, tone }: the count of things that bypass the
+//                  Pi-hole, on its node
 //   links    [{ a, b, state, tone, thin }] state flow | stalled | dim |
 //            dashed; thin: after the Pi-hole, where the blocked share has
 //            peeled off
@@ -727,10 +767,10 @@ function shortAddr(a) {
 //            the Pi-hole to the internet (failover, or a bypass)
 //   sink     null or { pct, empty, label }: the drain under the Pi-hole into
 //            the pool of what was blocked
-//   note     the words for the none/offline kinds
+//   note     the words for the none kind, under the DNS node
 //   ghost    true when the ph slot offers setup
 //   flow     { live, density, share }: live is whether traffic is moving
-function routeModel(v, nowS) {
+function routeModel(v, nowS, pending) {
   var h = heroState(v, nowS)
   var l = v.link
   var p = v.pihole
@@ -743,7 +783,7 @@ function routeModel(v, nowS) {
   if (h.kind === "nobackend") { out.kind = "nobackend"; out.flow.density = 0; return out }
 
   function node(id, glyph, tone, label, stat, extra) {
-    var n = { id: id, glyph: glyph, tone: tone, label: label, stat: stat || null, statTone: "", mark: "", tip: "" }
+    var n = { id: id, glyph: glyph, tone: tone, label: label, stat: stat || null, statTone: "", mark: "", tip: "", open: "", badge: null }
     if (extra) for (var k in extra) n[k] = extra[k]
     out.nodes.push(n)
     return n
@@ -755,8 +795,10 @@ function routeModel(v, nowS) {
 
   if (!online) {
     out.kind = "offline"
+    // the access point stands dim at the end of a dashed link, and still
+    // opens the Wi-Fi view (to join something)
+    node("ap", "ap", "dim", word(v.radio.wifiEnabled ? "route.offline" : "route.wifiOff", [], "dim"), null, { open: "wifi" })
     out.links.push({ a: "pc", b: "ap", state: "dashed", tone: "dim", thin: false })
-    out.note = word(v.radio.wifiEnabled ? "route.offline" : "route.wifiOff", [], "dim")
     out.flow.density = 0
     return out
   }
@@ -768,14 +810,16 @@ function routeModel(v, nowS) {
   var apStatTone = ""
   if (l.gatewayOk === false) { apStat = part("gw ✗"); apStatTone = "urgent" }
   else if (l.gatewayMs !== null) { apStat = part(formatLatency(l.gatewayMs)); apStatTone = l.gatewayMs > GW_SLOW_MS ? "urgent" : "" }
-  var ap = node("ap", wired ? "wire" : "ap", isRestricted(v) ? "urgent" : "accent", apLabel, apStat, { tip: wired ? "" : l.ssid })
+  var ap = node("ap", wired ? "wire" : "ap", isRestricted(v) ? "urgent" : "accent", apLabel, apStat, { tip: wired ? "" : l.ssid, open: "wifi" })
   ap.statTone = apStatTone
 
   var live = p.configured && h.kind !== "unreachable" && h.kind !== "fallback" && out.flow.density > 0
 
   if (h.kind === "none") {
     out.kind = "none"
+    node("ph", "shieldOff", "urgent", part(""), null, { mark: "\u2715", open: "dns" })
     out.links.push({ a: "pc", b: "ap", state: "flow", tone: "accent", thin: false, flow: false })
+    out.links.push({ a: "ap", b: "ph", state: "dashed", tone: "urgent", thin: false, flow: false })
     out.note = word("route.none", [d.resolvedFallback], "urgent")
     out.flow.density = 0
     return out
@@ -792,7 +836,7 @@ function routeModel(v, nowS) {
 
   if (h.kind === "checking") {
     out.kind = "route"
-    node("ph", "shield", "dim", part(p.address !== "" ? shortAddr(p.address) : "…"), null, {})
+    node("ph", "shield", "dim", part(p.address !== "" ? shortAddr(p.address) : "…"), null, { open: "dns" })
     node("up", "earth", "dim", part("…"), null, {})
     out.links.push({ a: "pc", b: "ap", state: "dim", tone: "dim", thin: false }, { a: "ap", b: "ph", state: "dim", tone: "dim", thin: false },
       { a: "ph", b: "up", state: "dim", tone: "dim", thin: false }, { a: "up", b: "end", state: "dim", tone: "dim", thin: false })
@@ -807,9 +851,9 @@ function routeModel(v, nowS) {
     var bypassed = h.kind === "bypassed"
     if (!p.configured) {
       out.ghost = true
-      node("ph", "ghost", "dim", part(p.detected !== "" ? shortAddr(p.detected) + "?" : ""), null, { tip: p.detected })
+      node("ph", "ghost", "dim", part(p.detected !== "" ? shortAddr(p.detected) + "?" : ""), null, { tip: p.detected, open: "dns" })
     } else {
-      node("ph", "shield", "dim", part(shortAddr(p.address)), word("route.idle", [], ""), { tip: p.address })
+      node("ph", "shield", "dim", part(shortAddr(p.address)), word("route.idle", [], ""), { tip: p.address, open: "dns" })
     }
     resolverNode(bypassed ? "urgent" : "accent")
     var liveDirect = out.flow.density > 0 || p.today.total > 0
@@ -822,24 +866,11 @@ function routeModel(v, nowS) {
   }
 
   // the Pi-hole is the resolver
-  var piholeNode = { tone: "accent", glyph: "shield", mark: "✓", label: part(shortAddr(p.address) + " ✓"), stat: null, statTone: "" }
-  var ms = p.latencyMs !== null ? formatLatency(p.latencyMs) : ""
-  if (h.kind === "paused") {
-    piholeNode = { tone: "dim", glyph: "shieldOutline", mark: "", label: part(shortAddr(p.address)),
-      stat: word("route.paused", [h.pauseS > 0 ? formatCountdown(h.pauseS) : ""], "warning"), statTone: "warning" }
-  } else if (h.kind === "fallback") {
-    piholeNode = { tone: "dim", glyph: "shieldOff", mark: "✕", label: part(shortAddr(p.address) + " ✕"), stat: null, statTone: "" }
-  } else if (h.kind === "unreachable") {
-    var fi = h.failoverIn
-    piholeNode = { tone: "urgent", glyph: "shieldOff", mark: "✕", label: part(shortAddr(p.address) + " ✕"),
-      stat: fi !== null ? (fi > 0 ? word("hero.failoverIn", [formatCountdown(fi)], "warning") : word("hero.failingOver", [], "warning")) : word("hero.noAnswer", [], "urgent"),
-      statTone: fi !== null ? "warning" : "urgent" }
-  } else {
-    piholeNode.stat = ms !== "" ? part(ms) : null
-    piholeNode.statTone = h.latencyBad ? "urgent" : ""
-  }
-  var ph = node("ph", piholeNode.glyph, piholeNode.tone, piholeNode.label, piholeNode.stat, { mark: piholeNode.mark, tip: p.address })
-  ph.statTone = piholeNode.statTone
+  var look = piholeLook(v, h)
+  var ph = node("ph", look.glyph, look.tone, part(look.text), look.stat, { mark: look.mark, tip: p.address, open: "dns" })
+  ph.statTone = look.statTone
+  var nLeaks = leakCount(v, pending)
+  if (nLeaks > 0) ph.badge = { n: nLeaks, tone: h.kind === "bypassed" ? "urgent" : "warning" }
 
   // the resolver beyond: the Pi-hole's busiest upstream
   var upstream = p.upstreams.length ? p.upstreams[0] : null
@@ -902,6 +933,154 @@ function routeModel(v, nowS) {
   return out
 }
 
+// The route's stops for the keyboard, left to right: the nodes that open a
+// view ("ap" opens Wi-Fi, "ph" opens DNS; offline only the AP). Nothing when
+// there is no route to draw.
+function routeStops(v) {
+  var nodes = routeModel(v, 0).nodes
+  var ids = []
+  for (var i = 0; i < nodes.length; i++) if (nodes[i].open !== "") ids.push(nodes[i].id)
+  return ids
+}
+
+// The view a route node opens: "wifi" | "dns" | "".
+function routeTarget(v, id) {
+  var nodes = routeModel(v, 0).nodes
+  for (var i = 0; i < nodes.length; i++) if (nodes[i].id === id) return nodes[i].open
+  return ""
+}
+
+// ------------------------------------------------------ the resolver chain
+
+// The DNS view's picture: the same route as the hero, drawn top to bottom and
+// compact, one row a node: this PC, systemd-resolved, the Pi-hole, and the
+// resolvers the Pi-hole forwards to, one node each with its share of the
+// queries and its response time. What is wrong is on the chain: a bypass or a
+// failover is a side node off the trunk (dashed, urgent or warning), a paused
+// Pi-hole is an outline, an unreachable one a cross with its countdown.
+//
+//   kind     as heroState: pihole | paused | degraded | fallback | bypassed |
+//            unreachable | none | router | custom | checking | offline |
+//            nobackend
+//   nodes    top to bottom: [{ id, glyph, tone, label, sub, stat, statTone,
+//            mark, tip, depth, via, viaTone, counts }]
+//            label, sub, stat: parts ({ text } or { key, args })
+//            depth 0 is the trunk, 1 a node hanging off it (the upstreams
+//            under the Pi-hole; a bypass or the fallback beside it)
+//            via the tube into the node: flow | stalled | dim | dashed, and
+//            viaTone: accent | dim | warning | urgent
+//            counts (the Pi-hole's) how its answers divide, today:
+//            [{ key: blocklist | cache | forwarded, n }], as labelled counts
+//            on its branch (not a meter)
+//   flow     { density, share }
+function chainModel(v, nowS) {
+  var h = heroState(v, nowS)
+  var l = v.link
+  var p = v.pihole
+  var d = v.dns
+  var out = { kind: h.kind, nodes: [], flow: { density: queryDensity(v), share: blockedShare(v) } }
+  if (h.kind === "nobackend") { out.flow.density = 0; return out }
+
+  function add(id, glyph, tone, label, sub, stat, extra) {
+    var n = {
+      id: id, glyph: glyph, tone: tone, label: label, sub: sub || null, stat: stat || null, statTone: "",
+      mark: "", tip: "", depth: 0, via: "flow", viaTone: "accent", counts: null
+    }
+    if (extra) for (var k in extra) n[k] = extra[k]
+    out.nodes.push(n)
+    return n
+  }
+
+  var online = l.kind !== "none"
+  var pc = add("pc", "pc", online ? "accent" : "dim", word("chain.pc"), part(l.ip4 !== "" ? l.ip4 : "\u2014"))
+  if (!online) {
+    out.kind = "offline"
+    pc.stat = word(v.radio.wifiEnabled ? "route.offline" : "route.wifiOff", [], "dim")
+    pc.statTone = "dim"
+    out.flow.density = 0
+    return out
+  }
+  var res = add("res", "resolver", "accent", word("chain.resolved"), null, null, {})
+
+  if (h.kind === "none") {
+    res.tone = "urgent"
+    res.sub = word("route.none", [d.resolvedFallback], "urgent")
+    out.flow.density = 0
+    return out
+  }
+
+  var cur = currentServer(v)
+  if (h.kind === "checking") {
+    add("ph", "shield", "dim", word("chain.pihole"), part(p.address !== "" ? shortAddr(p.address) : "\u2026"), null, { via: "dim", viaTone: "dim" })
+    out.flow.density = 0
+    return out
+  }
+
+  var through = p.configured && d.mode !== "auto" && d.mode !== "custom"
+  if (!through) {
+    // no Pi-hole in the path: the resolver in use is the end of the chain
+    var bypassed = h.kind === "bypassed"
+    var role = cur ? cur.role : "other"
+    add("dest", "earth", bypassed ? "urgent" : "accent", part(cur ? cur.addr : "\u2014"),
+      role !== "other" && role !== "pihole" ? word("route.role." + role) : null,
+      bypassed ? word("hero.bypassed", [], "urgent") : null,
+      { tip: cur ? cur.addr : "", statTone: bypassed ? "urgent" : "", viaTone: bypassed ? "urgent" : "accent" })
+    return out
+  }
+
+  var dead = h.kind === "unreachable"
+  var moved = h.kind === "fallback"
+
+  // beside the trunk, above the Pi-hole: where the queries go when they do
+  // not go through it
+  if (h.kind === "fallback") {
+    var fr = cur ? cur.role : "other"
+    add("side", "earth", "warning", part(cur ? cur.addr : "\u2014"),
+      fr !== "other" && fr !== "pihole" ? word("route.role." + fr) : null, word("chain.inUse", [], "warning"),
+      { depth: 1, via: "flow", viaTone: "warning", statTone: "warning", tip: cur ? cur.addr : "" })
+  } else if (h.kind === "bypassed") {
+    var ex = h.extra
+    var who = ex ? ex.who : (cur ? shortAddr(cur.addr) : "")
+    add("side", "earth", "urgent", part(who), ex && ex.viaRa ? word("chain.viaRa") : null, word("chain.bypass", [], "urgent"),
+      { depth: 1, via: "dashed", viaTone: "urgent", statTone: "urgent", tip: cur ? cur.addr : "" })
+  }
+
+  var look = piholeLook(v, h)
+  var ph = add("ph", look.glyph, look.tone, word("chain.pihole"), part(look.text), look.stat, {
+    mark: look.mark, tip: p.address, via: dead ? "stalled" : (moved ? "dim" : "flow"), viaTone: moved ? "dim" : "accent"
+  })
+  ph.statTone = look.statTone
+
+  if (moved) return out
+
+  // what its answers were, today, as labelled counts
+  var ab = p.answeredBy
+  if (!dead && ab.blocklist + ab.cache + ab.forwarded > 0) {
+    ph.counts = [{ key: "blocklist", n: ab.blocklist }, { key: "cache", n: ab.cache }, { key: "forwarded", n: ab.forwarded }]
+  }
+
+  // the resolvers it forwards to
+  var ups = p.upstreams
+  var total = 0
+  var i
+  for (i = 0; i < ups.length; i++) total += ups[i].count
+  for (i = 0; i < ups.length; i++) {
+    var u = ups[i]
+    var pct = total > 0 ? Math.round(u.count * 100 / total) : 0
+    var text = (total > 0 ? pct + "%" : "") + (u.responseMs !== null ? (total > 0 ? " \u00b7 " : "") + formatLatency(u.responseMs) : "")
+    var stat = text !== "" ? part(text) : null
+    var tone = dead ? "dim" : (h.kind === "degraded" ? "warning" : "accent")
+    var node = add("up:" + i, "earth", tone, part(u.ip !== "" ? u.ip : u.name), u.ip !== "" && u.name !== "" ? part(u.name) : null, stat, {
+      depth: 1, via: dead ? "dashed" : "flow", viaTone: dead ? "dim" : "accent", tip: u.name + (u.count > 0 ? "  " + u.count : "")
+    })
+    if (h.kind === "degraded" && i === 0) {
+      node.stat = p.healthReason !== "" ? part(p.healthReason) : word("route.servfail", [], "warning")
+      node.statTone = "warning"
+    }
+  }
+  return out
+}
+
 // ---------------------------------------------------------------- leaks
 
 // What bypasses the Pi-hole, as at most two lines:
@@ -949,10 +1128,10 @@ function leakGroups(v, pending) {
   return { bypass: bypass, profiles: profiles }
 }
 
-// ------------------------------------------------------------- DNS row
+// -------------------------------------------------------- DNS choices
 
-// Which segmented tile is lit, and in what colour. Never lights a wrong
-// tile: a custom resolver lights neither, a runtime failover lights Pi-hole
+// Which resolver choice is lit, and in what colour. Never lights a wrong
+// row: a custom resolver lights neither, a runtime failover lights Pi-hole
 // in the warning colour with its own label, and while the mode is unknown
 // (no probe yet) or there are no servers, nothing is lit.
 //   pihole: "on" | "warn" | "off"; auto: "on" | "off"
@@ -981,7 +1160,23 @@ function customServers(v) {
   return list.slice(0, 2)
 }
 
-// A tap on a tile: the verb to run, or null when the tile is already lit.
+// The resolver choices of the DNS view, a selectable list (radio rows): the
+// Pi-hole and Automatic. Lit by what systemd-resolved reports, never by what
+// was last asked for (see dnsTiles).
+//   [{ id, lit: "on" | "warn" | "off", warn, configured, detail }]
+// detail is the address a row names (the Pi-hole's); Automatic's is worded by
+// the panel ("router").
+function dnsChoices(v) {
+  var t = dnsTiles(v)
+  var p = v.pihole
+  return [
+    { id: "pihole", lit: t.pihole, warn: t.fallbackLabel, configured: p.configured, detail: p.configured ? p.address : "" },
+    { id: "auto", lit: t.auto, warn: false, configured: true, detail: "" }
+  ]
+}
+
+// A tap on a choice ("pihole" | "auto"): the verb to run, or null when that
+// choice is already lit.
 // `leaves` is set when the verb moves DNS off the Pi-hole (Automatic while
 // the Pi-hole, or its failover, is in use): the risky direction.
 function tapDns(tile, v) {
@@ -991,9 +1186,9 @@ function tapDns(tile, v) {
   return null
 }
 
-// What a tap on a tile does:
-//   none      the tile is already lit (or unknown): nothing
-//   setup     the Pi-hole tile without a Pi-hole: run setup
+// What a tap on a choice does:
+//   none      it is already lit (or unknown): nothing
+//   setup     the Pi-hole choice without a Pi-hole: run setup
 //   confirm   leaving the Pi-hole: ask first, inline (two steps: the tap, then
 //             "Use automatic DNS"); nothing runs yet
 //   run       anything else: run the verb now (towards the Pi-hole, or from a
@@ -1146,10 +1341,91 @@ function ipFooter(v) {
 
 // ------------------------------------------------------------- networks
 
-// The Wi-Fi view's list: the network in use first, then saved ones, then the
-// rest; strongest first within each group, ties by name. Hidden networks (no
-// SSID) are left out unless one is in use or they are asked for; a duplicate
-// SSID keeps its best entry (the backend groups, this is a guard).
+// The channel for a frequency in MHz, 0 when it is none: 2.4 GHz 1..14,
+// 5 GHz 32..177 (5180 -> 36), 6 GHz 1..233 (5955 -> 1).
+function channelOf(mhz) {
+  var f = num(mhz, 0)
+  if (f === 2484) return 14
+  if (f >= 2412 && f <= 2472) return Math.round((f - 2407) / 5)
+  if (f >= 5160 && f <= 5885) return Math.round((f - 5000) / 5)
+  if (f >= 5955 && f <= 7115) return Math.round((f - 5950) / 5)
+  return 0
+}
+
+// "2.4 GHz" | "5 GHz" | "6 GHz" for a frequency in MHz, "" when it is none.
+function bandOfMhz(mhz) {
+  var f = num(mhz, 0)
+  if (f >= 2400 && f <= 2500) return "2.4 GHz"
+  if (f >= 5150 && f <= 5895) return "5 GHz"
+  if (f >= 5925 && f <= 7125) return "6 GHz"
+  return ""
+}
+
+// The chip on a network row: "2.4G" | "5G" | "6G" from the band the backend
+// names (or from the frequency when it does not), "" when neither is known.
+function bandChip(band, mhz) {
+  var b = String(band || "") !== "" ? String(band) : bandOfMhz(mhz)
+  var m = /^(2\.4|5|6)\s*GHz$/i.exec(b)
+  return m ? m[1] + "G" : ""
+}
+
+// How many of the four bars of the signal glyph are filled: 0..4.
+function signalBars(signal) {
+  var s = clamp(num(signal, 0), 0, 100)
+  if (s <= 0) return 0
+  return s >= 75 ? 4 : (s >= 50 ? 3 : (s >= 25 ? 2 : 1))
+}
+
+// The Wi-Fi view's card for the connection in use, in monospace key/value
+// lines:
+//   { kind, title, glyph, urgent, rows: [{ k, v, key }], canDisconnect, uuid }
+//   kind   wifi | ethernet | none | off | nobackend
+//   title  the SSID ("" for a wire: the panel names it)
+//   rows   k link | signal | ip | gateway | dns. v is the text; key (when set)
+//          is a translated word to show in v's place ("no DNS")
+//   link   "5 GHz . ch 149 . 866 Mb/s"; signal "72% . -58 dBm"; ip with its
+//          prefix when it is known ("192.168.1.242/24"); gateway with its
+//          latency; dns the resolvers in use ("192.168.1.153")
+//   canDisconnect  a Wi-Fi link can be dropped from the card
+function connectionCard(v, fmt) {
+  var l = v.link
+  var out = { kind: "none", title: "", glyph: linkGlyph(v), urgent: isRestricted(v), rows: [], canDisconnect: false, uuid: l.uuid }
+  if (v.backendDown) { out.kind = "nobackend"; out.urgent = false; return out }
+  if (l.kind === "none") { out.kind = v.radio.wifiEnabled ? "none" : "off"; out.urgent = false; return out }
+  out.kind = l.kind
+  out.title = l.kind === "wifi" ? (l.ssid || l.connection) : ""
+  out.canDisconnect = l.kind === "wifi"
+  var parts = []
+  if (l.kind === "wifi") {
+    var band = l.band !== "" ? l.band : bandOfMhz(l.frequencyMhz)
+    if (band !== "") parts.push(band)
+    var ch = channelOf(l.frequencyMhz)
+    if (ch > 0) parts.push("ch " + ch)
+  }
+  var rate = formatRate(l.bitrateMbps, fmt)
+  if (rate !== "") parts.push(rate)
+  if (parts.length) out.rows.push({ k: "link", v: parts.join(" \u00b7 "), key: "" })
+  if (l.kind === "wifi" && l.signal > 0) {
+    out.rows.push({ k: "signal", v: formatDecimal(l.signal, 0, fmt) + "%" + (l.signalDbm !== null ? " \u00b7 " + l.signalDbm + " dBm" : ""), key: "" })
+  }
+  if (l.ip4 !== "") out.rows.push({ k: "ip", v: l.ip4 + (l.prefix > 0 ? "/" + l.prefix : ""), key: "" })
+  if (l.gateway !== "") {
+    out.rows.push({ k: "gateway", v: l.gateway + (l.gatewayMs !== null ? " \u00b7 " + formatLatency(l.gatewayMs, fmt) : ""), key: "" })
+  }
+  var servers = []
+  var sv = v.dns.servers
+  var i
+  for (i = 0; i < sv.length; i++) if (sv[i].current && servers.indexOf(sv[i].addr) < 0) servers.push(sv[i].addr)
+  if (servers.length === 0) for (i = 0; i < sv.length; i++) if (servers.indexOf(sv[i].addr) < 0) servers.push(sv[i].addr)
+  if (servers.length) out.rows.push({ k: "dns", v: servers.slice(0, 2).join(", "), key: "" })
+  else if (v.dns.mode === "none") out.rows.push({ k: "dns", v: "", key: "card.noDns" })
+  return out
+}
+
+// The Wi-Fi view's "Nearby" list: every visible network but the one in use
+// (the card has that), strongest first, ties by name. Hidden networks (no
+// SSID) are left out unless they are asked for; a duplicate SSID keeps its
+// best entry (the backend groups, this is a guard).
 function orderNetworks(networks, showHidden) {
   var best = {}
   var order = []
@@ -1157,24 +1433,25 @@ function orderNetworks(networks, showHidden) {
   var i
   for (i = 0; i < list.length; i++) {
     var n = list[i]
-    if (n.hidden && !n.active && !showHidden) continue
+    if (n.active) continue
+    if (n.hidden && !showHidden) continue
     var key = n.hidden ? "\u0000" + n.id : n.ssid
     if (best[key] === undefined) { best[key] = n; order.push(key) }
-    else {
-      var b = best[key]
-      if ((n.active && !b.active) || (n.active === b.active && n.signal > b.signal)) best[key] = n
-    }
+    else if (n.signal > best[key].signal) best[key] = n
   }
   var out = []
   for (i = 0; i < order.length; i++) out.push(best[order[i]])
-  function rank(n) { return n.active ? 0 : (n.known ? 1 : 2) }
   out.sort(function(a, b) {
-    var ra = rank(a), rb = rank(b)
-    if (ra !== rb) return ra - rb
     if (a.signal !== b.signal) return b.signal - a.signal
     return a.ssid < b.ssid ? -1 : (a.ssid > b.ssid ? 1 : 0)
   })
   return out
+}
+
+// Whether a nearby network wears a lock: secured and not saved. (A saved one
+// says "Saved"; an open one has nothing.)
+function showLock(net) {
+  return !net.known && !net.hidden && net.security !== "open" && net.security !== "owe" ? true : false
 }
 
 // What a tap on a network row does.
@@ -1203,14 +1480,8 @@ function rowCaption(net, ctx) {
   if (c.connectId && c.connectId === net.id) return { key: "connecting", tone: "dim", text: "" }
   if (c.disconnecting && net.active) return { key: "disconnecting", tone: "dim", text: "" }
   if (c.forgetUuid && net.uuid && c.forgetUuid === net.uuid) return { key: "forgetting", tone: "dim", text: "" }
-  if (net.active) {
-    if (c.connectivity === "portal") return { key: "portal", tone: "urgent", text: "" }
-    if (c.connectivity === "limited") return { key: "limited", tone: "urgent", text: "" }
-    return { key: "connected", tone: "accent", text: "" }
-  }
   if (net.hidden) return { key: "hidden", tone: "dim", text: "" }
   if (net.known) return { key: "saved", tone: "dim", text: "" }
-  if (net.security === "open") return { key: "open", tone: "dim", text: "" }
   if (net.security === "enterprise") return { key: "enterprise", tone: "dim", text: "" }
   return { key: "", tone: "none", text: "" }
 }
@@ -1352,27 +1623,7 @@ function verifyNote(verb, result) {
   return result.verifyError
 }
 
-// ------------------------------------------------------- the two rows
-
-// The right-hand side of the main view's DNS row: what the resolver is, and
-// what is wrong with it. { mode, arg, suffix, tone, leaks }
-//   mode   pihole | fallback | auto | custom | none | unknown
-//   arg    the custom servers or the fallback's name, where the word takes one
-//   suffix ["bypassed", "leaks"] in the order they are said
-//   tone   dim | warning | urgent: warning for a fallback or leaking
-//          profiles, urgent for a bypass or no DNS at all
-function dnsSummary(v, pending) {
-  var g = leakGroups(v, pending)
-  var out = { mode: v.dns.mode, arg: "", suffix: [], tone: "dim", leaks: g.profiles ? g.profiles.count : 0 }
-  if (v.backendDown) { out.mode = "unknown"; return out }
-  if (out.mode === "custom") out.arg = customServers(v).join(", ")
-  if (out.mode === "fallback") out.arg = v.dns.failover.fallback
-  if (out.mode === "fallback") out.tone = "warning"
-  if (out.mode === "none") out.tone = "urgent"
-  if (g.bypass && out.mode !== "none") { out.suffix.push("bypassed"); out.tone = "urgent" }
-  if (out.leaks > 0) { out.suffix.push("leaks"); if (out.tone === "dim") out.tone = "warning" }
-  return out
-}
+// ------------------------------------------------------------ ages
 
 // Seconds as { unit, n }: "now" under a minute, then minutes, then hours.
 function ageParts(sec) {
@@ -1381,17 +1632,6 @@ function ageParts(sec) {
   if (s < 60) return { unit: "now", n: 0 }
   if (s < 3600) return { unit: "min", n: Math.floor(s / 60) }
   return { unit: "hour", n: Math.floor(s / 3600) }
-}
-
-// The Wi-Fi row's value: { state, name, age } -- state connected | offline |
-// off; name the SSID (or ""); age ageParts() of the last scan, only with the
-// radio on.
-function wifiSummary(v) {
-  var l = v.link
-  var age = v.radio.wifiEnabled ? ageParts(v.scan.lastScanAgeS) : null
-  if (v.backendDown) return { state: "offline", name: "", age: null }
-  if (l.kind === "none") return { state: v.radio.wifiEnabled ? "offline" : "off", name: "", age: age }
-  return { state: "connected", name: l.kind === "wifi" ? (l.ssid || l.connection) : "", age: l.kind === "wifi" ? age : null, wired: l.kind === "ethernet" }
 }
 
 // The DNS view's failover line: { state, fallback, reason, sinceS }
@@ -1411,8 +1651,8 @@ function failoverInfo(v) {
 // ----------------------------------------------------------- the views
 
 // Which view is up: the main one, or a drill-down the main one pushed (DNS,
-// Wi-Fi), as Sound Hub pushes its Bluetooth view. returnCursor is where the
-// cursor was on the main view, put back when the drill-down is left.
+// Wi-Fi) from a node of the route. returnCursor is where the cursor was on
+// the main view, put back when the drill-down is left.
 function navInit() { return { view: "main", returnCursor: null } }
 
 // Open a drill-down. effects says what entering it does: the Wi-Fi view runs
@@ -1450,19 +1690,21 @@ function escapeStep(ctx) {
 // left/right walk, for the view that is up. ctx: { view, confirm }.
 //   main     header: portal?, qr?, speed?, radio
 //            hero: the one corrective action, when the state has one
+//            route: the nodes that open a view, left to right (ap -> Wi-Fi,
+//            ph -> DNS)
 //            pause: the Pause tile
-//            goto:dns, goto:wifi: the two drill-down rows
 //            ip: the footer
-//   dns      back, dns (tile:pihole, tile:auto), confirm? (replace, cancel),
-//            bypass? (fix), leak:N (pin) one per profile, pinall? (two or
-//            more), admin?
-//   wifi     back, scan, net:N one per listed network
+//   dns      back, choice:pihole, choice:auto (the resolver choices),
+//            confirm? (replace, cancel), bypass? (fix), leak:N (pin) one per
+//            profile, pinall? (two or more), admin?
+//   wifi     back, card? (disconnect), scan, net:N one per nearby network
 function focusRows(v, ctx, pending, nets) {
   var c = ctx || {}
   var rows = []
   if (c.view === "dns") {
     rows.push({ id: "back", items: ["back"] })
-    rows.push({ id: "dns", items: ["tile:pihole", "tile:auto"] })
+    rows.push({ id: "choice:pihole", items: ["pick"] })
+    rows.push({ id: "choice:auto", items: ["pick"] })
     if (c.confirm) rows.push({ id: "confirm", items: ["replace", "cancel"] })
     var g = leakGroups(v, pending)
     if (g.bypass) rows.push({ id: "bypass", items: ["fix"] })
@@ -1475,6 +1717,7 @@ function focusRows(v, ctx, pending, nets) {
   }
   if (c.view === "wifi") {
     rows.push({ id: "back", items: ["back"] })
+    if (connectionCard(v).canDisconnect) rows.push({ id: "card", items: ["disconnect"] })
     rows.push({ id: "scan", items: ["scan"] })
     var list = nets || orderNetworks(v.networks)
     for (var n = 0; n < list.length; n++) rows.push({ id: "net:" + n, items: ["row"] })
@@ -1487,9 +1730,9 @@ function focusRows(v, ctx, pending, nets) {
   items.push("radio")
   rows.push({ id: "header", items: items })
   if (heroState(v).action !== "") rows.push({ id: "hero", items: ["action"] })
+  var stops = routeStops(v)
+  if (stops.length) rows.push({ id: "route", items: stops })
   rows.push({ id: "pause", items: ["pause"] })
-  rows.push({ id: "goto:dns", items: ["go"] })
-  rows.push({ id: "goto:wifi", items: ["go"] })
   rows.push({ id: "ip", items: ["ip"] })
   return rows
 }
@@ -1499,16 +1742,18 @@ function rowIndex(rows, id) {
   return -1
 }
 
-// Where the cursor starts: on the Wi-Fi row of the main view, the way back on
-// the DNS view (never on a mode tile: a stray Enter or Space as the view opens
-// must not change DNS), the first network of the Wi-Fi view.
+// Where the cursor starts: on the route of the main view (the first node
+// only opens the Wi-Fi view), the way back on the DNS view (never on a
+// resolver choice: a stray Enter or Space as the view opens must not change
+// DNS) and the scan button on the Wi-Fi view (never on a network, the card's
+// Disconnect or anything else that changes the connection).
 function initialCursor(rows, view) {
-  var order = view === "dns" ? ["back"] : (view === "wifi" ? ["net:0", "scan", "back"] : ["goto:wifi", "pause", "header"])
+  var order = view === "dns" ? ["back"] : (view === "wifi" ? ["scan", "back"] : ["route", "pause", "header"])
   for (var i = 0; i < order.length; i++) {
     var at = rowIndex(rows, order[i])
     if (at >= 0) return { row: rows[at].id, item: 0 }
   }
-  return { row: rows[0].id === "dns" && rows.length > 1 ? rows[1].id : rows[0].id, item: 0 }
+  return { row: rows[0].id, item: 0 }
 }
 
 // One key. cursor { row, item }; memory { rowId: itemIndex } remembers where
@@ -1570,14 +1815,16 @@ if (typeof module !== "undefined") {
     emptyPending: emptyPending, hasPending: hasPending, withPending: withPending,
     currentServer: currentServer, heroState: heroState, blockingWord: blockingWord,
     failoverIn: failoverIn, extraResolver: extraResolver, needsClock: needsClock,
-    dnsSummary: dnsSummary, ageParts: ageParts, wifiSummary: wifiSummary, failoverInfo: failoverInfo,
+    ageParts: ageParts, failoverInfo: failoverInfo,
     navInit: navInit, navOpen: navOpen, navBack: navBack, escapeStep: escapeStep,
     queryDensity: queryDensity, blockedShare: blockedShare, lastOctet: lastOctet, answeredShares: answeredShares,
-    routeModel: routeModel, leakGroups: leakGroups, dnsTiles: dnsTiles, tapPlan: tapPlan,
+    routeModel: routeModel, routeStops: routeStops, routeTarget: routeTarget, chainModel: chainModel,
+    piholeLook: piholeLook, leakCount: leakCount, leakGroups: leakGroups, dnsTiles: dnsTiles, dnsChoices: dnsChoices, tapPlan: tapPlan,
     customServers: customServers, tapDns: tapDns, confirmServers: confirmServers, pauseChip: pauseChip,
     wifiGlyph: wifiGlyph, isRestricted: isRestricted, linkGlyph: linkGlyph, headerInfo: headerInfo,
     barTip: barTip, barActive: barActive, canShareWifi: canShareWifi, ipFooter: ipFooter,
-    orderNetworks: orderNetworks, connectPlan: connectPlan, rowCaption: rowCaption,
+    orderNetworks: orderNetworks, showLock: showLock, channelOf: channelOf, bandOfMhz: bandOfMhz, bandChip: bandChip,
+    signalBars: signalBars, connectionCard: connectionCard, connectPlan: connectPlan, rowCaption: rowCaption,
     argvDns: argvDns, argvPin: argvPin, argvPause: argvPause, argvResume: argvResume,
     argvConnect: argvConnect, argvDown: argvDown, argvForget: argvForget, argvScan: argvScan,
     argvRadio: argvRadio, argvPortal: argvPortal, argvTerminal: argvTerminal, argvOpenUrl: argvOpenUrl,

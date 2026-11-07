@@ -19,10 +19,11 @@ import "components"
 // shell shares; the bar makes one widget per monitor, and each of them reads
 // that one service and tells it when its panel opens and closes.
 //
-// Three views, as Sound Hub has: the main one (components/MainView.qml:
-// connection, hero, Pause, a DNS row, a Wi-Fi row, the address) and two it
-// pushes, DNS (DnsView.qml) and Wi-Fi (WifiView.qml). Which is up, and what
-// entering it does, is Model.navOpen/navBack. One keyboard cursor runs
+// Three views: the main one (components/MainView.qml: connection, the hero
+// with its route, Pause, the address) and two it pushes, DNS (DnsView.qml)
+// and Wi-Fi (WifiView.qml). The route is the navigation: its AP node opens
+// the Wi-Fi view and its Pi-hole node the DNS view. Which view is up, and
+// what entering it does, is Model.navOpen/navBack. One keyboard cursor runs
 // through the rows of the view that is up (Model.focusRows), and the pointer
 // moves the same cursor.
 Panel {
@@ -75,6 +76,7 @@ Panel {
   readonly property var hero: Model.heroState(view, nowMs / 1000)
   readonly property var header: Model.headerInfo(view, formatNumber)
   readonly property var tiles: Model.dnsTiles(view)
+  readonly property var choices: Model.dnsChoices(view)
   readonly property var chip: Model.pauseChip(view)
   readonly property var footer: Model.ipFooter(view)
   readonly property var netList: Model.orderNetworks(view.networks)
@@ -110,18 +112,22 @@ Panel {
   Timer { id: settleTimer; interval: 320; onTriggered: root.settled = root.opened }
 
   // ------------------------------------------------------------- views
-  // "main" | "dns" | "wifi"; the views are pushed and popped as Sound Hub's
-  // Bluetooth view is, and the main view's cursor is put back on the way out.
+  // "main" | "dns" | "wifi"; a view is pushed from the main one (by a click
+  // or Enter on a node of the route) and popped by Esc, Backspace or the back
+  // button, which puts the main view's cursor back where it was.
   property var nav: Model.navInit()
   readonly property string page: nav.view
   readonly property int headerBackSize: Style.space(30)
 
-  function openView(name) {
+  // viaPointer: the route's node was clicked, so the new view shows no
+  // keyboard cursor until a key asks for one.
+  function openView(name, viaPointer) {
     if (name !== "dns" && name !== "wifi") return
     var r = Model.navOpen(nav, name, cursor)
     if (r.nav === nav) return
     nav = r.nav
-    cursorActive = true
+    cursorActive = viaPointer !== true
+    cursorPointer = false
     cursorMemory = ({})
     cursor = Model.initialCursor(rows, page)
     pointerGate.reset()
@@ -129,60 +135,38 @@ Panel {
     Qt.callLater(function() { wifiView.networks.flick.contentY = 0 })
   }
 
-  function goBack() {
+  function goBack(viaPointer) {
     var r = Model.navBack(nav)
     if (!r.left) return
     closeTransients()
     nav = r.nav
     cursorMemory = ({})
     cursor = r.cursor !== null && Model.rowIndex(rows, r.cursor.row) >= 0 ? r.cursor : Model.initialCursor(rows, "main")
+    cursorPointer = false
+    if (viaPointer === true) cursorActive = false
     pointerGate.reset()
   }
 
-  // The words on the main view's two rows.
+  // A node of the route was clicked: its cursor stop, then its view.
+  function openRouteNode(id) {
+    var target = Model.routeTarget(view, id)
+    if (target === "") return
+    var at = routeStops.indexOf(id)
+    if (at >= 0) setCursor("route", at)
+    openView(target, true)
+  }
+
   function ageText(a) {
     if (a === null) return ""
     if (a.unit === "now") return strings.t("age.now")
     return strings.t("age." + a.unit).arg(a.n)
   }
 
-  readonly property string scanAgeText: {
-    if (!view.radio.wifiEnabled) return ""
+  // The head of the Wi-Fi view's list: how long ago it was scanned.
+  readonly property string nearbyTitle: {
+    if (view.scan.running) return strings.t("net.titleScanning")
     var a = ageText(Model.ageParts(view.scan.lastScanAgeS))
-    return a === "" ? "" : strings.t("wifi.scanned").arg(a)
-  }
-
-  readonly property var dnsRowValue: {
-    var sm = Model.dnsSummary(view, pending)
-    var parts = []
-    switch (sm.mode) {
-    case "pihole": parts.push(strings.t("dns.pihole")); break
-    case "fallback": parts.push(strings.t("hero.fallback").arg(strings.t("fallback." + sm.arg))); break
-    case "auto": parts.push(strings.t("dns.auto")); break
-    case "custom": parts.push(strings.t("dns.custom").arg(sm.arg)); break
-    case "none": parts.push(strings.t("hero.none")); break
-    default: parts.push(strings.t("hero.checking"))
-    }
-    for (var i = 0; i < sm.suffix.length; i++) {
-      if (sm.suffix[i] === "bypassed") parts.push(strings.t("dns.bypassedWord"))
-      else parts.push(strings.tn("dns.leaksWord", sm.leaks).arg(sm.leaks))
-    }
-    return { text: parts.join(" · "), tone: sm.tone }
-  }
-
-  readonly property string wifiRowValue: {
-    var w = Model.wifiSummary(view)
-    var name = w.state === "off" ? strings.t("header.wifiOff") : w.state === "offline" ? strings.t("header.offline")
-      : w.wired ? strings.t("header.ethernet") : (w.name !== "" ? w.name : strings.t("header.wifi"))
-    return scanAgeText !== "" && !w.wired ? name + " · " + scanAgeText : name
-  }
-
-  readonly property string dnsSubtitle: hero.via !== "" ? strings.t("hero.via").arg(hero.via) : ""
-  readonly property string wifiSubtitle: {
-    var w = Model.wifiSummary(view)
-    if (w.state === "off") return strings.t("header.wifiOff")
-    if (w.state === "offline") return strings.t("header.state.offline")
-    return w.wired ? strings.t("header.ethernet") : w.name
+    return a === "" || !view.radio.wifiEnabled ? strings.t("net.title") : strings.t("net.titleAge").arg(a)
   }
 
   // The age of the Pi-hole's numbers while the link is down, once it is a
@@ -229,7 +213,7 @@ Panel {
 
   // How many network rows show before the list scrolls: eight, fewer on a
   // short screen.
-  readonly property int listRows: Math.max(3, Math.min(8, Math.floor((panel.availableCardHeight - Style.space(300)) / Style.space(36))))
+  readonly property int listRows: Math.max(3, Math.min(8, Math.floor((panel.availableCardHeight - Style.space(360)) / Style.space(36))))
 
   Timer { id: noteTimer; interval: 7000; onTriggered: { root.dnsNote = ({ tone: "", text: "" }); root.netNote = ""; root.netFail = ({ id: "", text: "" }) } }
   Timer { id: armTimer; interval: 4000; onTriggered: root.armedUuid = "" }
@@ -312,9 +296,17 @@ Panel {
   // moves it and so does the pointer (hoverCursor), so the screen never has
   // two highlights. It starts hidden; the first key shows it.
   property bool cursorActive: false
+  // Whether the pointer put the cursor where it is (its ring is the accent;
+  // the keyboard's is grey).
+  property bool cursorPointer: false
   property var cursor: ({ row: "net:0", item: 0 })
   property var cursorMemory: ({})
   property int lastRowIndex: 0
+
+  // The route's nodes that open a view, left to right, and the one the
+  // cursor is on.
+  readonly property var routeStops: Model.routeStops(view)
+  readonly property string routeCursorNode: has("route") && routeStops.length > 0 ? routeStops[Math.min(cursor.item, routeStops.length - 1)] : ""
 
   readonly property var rows: Model.focusRows(view, { view: page, confirm: confirm.open }, pending, netList)
   readonly property string rowsSig: page + ":" + rows.map(function(r) { return r.id }).join(",")
@@ -336,6 +328,7 @@ Panel {
 
   function setCursor(row, item) {
     cursorActive = true
+    cursorPointer = true
     cursor = ({ row: row, item: item === undefined ? 0 : item })
   }
 
@@ -356,6 +349,7 @@ Panel {
   }
 
   function moveCursor(dx, dy) {
+    cursorPointer = false
     var r = Model.moveFocus(rows, cursor, dx, dy, cursorMemory)
     cursor = r.cursor
     cursorMemory = r.memory
@@ -421,30 +415,34 @@ Panel {
       else if (item === "radio") toggleRadio()
     } else if (id === "hero") heroAction()
     else if (id === "pause") togglePause()
-    else if (id === "goto:dns") openView("dns")
-    else if (id === "goto:wifi") openView("wifi")
+    else if (id === "route") openView(Model.routeTarget(view, item), false)
     else if (id === "bypass") fixBypass()
     else if (id.indexOf("leak:") === 0) pinOne(parseInt(id.substring(5), 10))
     else if (id === "pinall") pinAll()
     else if (id === "admin") openAdmin()
     else if (id === "confirm") { if (item === "replace") confirmReplace(); else confirmCancel() }
-    else if (id === "dns") {
-      if (item === "tile:pihole") tapTile("pihole")
-      else if (item === "tile:auto") tapTile("auto")
-    } else if (id === "scan") scan()
+    else if (id.indexOf("choice:") === 0) tapTile(id.substring(7))
+    else if (id === "card") { if (item === "disconnect") disconnectNet() }
+    else if (id === "scan") scan()
     else if (id.indexOf("net:") === 0) activateNet(parseInt(id.substring(4), 10))
     else if (id === "ip") copyIp()
   }
 
+  // Delete asks to forget the saved network under the cursor (the one in
+  // use, on the card, included), and a second press confirms.
   function deleteKey() {
-    if (!cursorActive || cursor.row.indexOf("net:") !== 0) return
-    var i = parseInt(cursor.row.substring(4), 10)
-    var net = netList[i]
-    if (!net) return
-    if (armedUuid !== "" && armedUuid === net.uuid) {
+    if (!cursorActive) return
+    var uuid = ""
+    if (cursor.row === "card") uuid = view.link.uuid
+    else if (cursor.row.indexOf("net:") === 0) {
+      var net = netList[parseInt(cursor.row.substring(4), 10)]
+      if (net) uuid = net.uuid
+    }
+    if (uuid === "") return
+    if (armedUuid !== "" && armedUuid === uuid) {
       // Asked, and answered by a new press, not by the repeat of the first.
       if (!keyAutoRepeat && Date.now() - armedAt > 400) confirmForget()
-    } else armForget(i)
+    } else armForgetUuid(uuid)
   }
 
   // ----------------------------------------------------------- actions
@@ -727,8 +725,12 @@ Panel {
 
   function armForget(i) {
     var net = netList[i]
-    if (!net || !net.known || net.uuid === "") return
-    armedUuid = net.uuid
+    if (net) armForgetUuid(net.uuid)
+  }
+
+  function armForgetUuid(uuid) {
+    if (uuid === "") return
+    armedUuid = uuid
     armedAt = Date.now()
     armTimer.restart()
   }
@@ -863,6 +865,7 @@ Panel {
         // The first key only shows the cursor.
         if (!root.cursorActive) {
           root.cursorActive = true
+          root.cursorPointer = false
           if (Model.rowIndex(root.rows, root.cursor.row) < 0) root.cursor = Model.initialCursor(root.rows, root.page)
           return
         }
@@ -906,7 +909,7 @@ Panel {
         anchors.fill: parent
         opacity: root.cardOpaque ? 1 : 0
 
-        // The three views, one up at a time (as Sound Hub's panelColumn).
+        // The three views, one up at a time.
         Item {
           id: views
           y: root.topPad

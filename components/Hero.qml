@@ -6,7 +6,8 @@ import "../Model.js" as Model
 
 // The hero: one line of words over the route (HeroViz.qml). The picture is
 // its own piece (it takes the view and exposes its height) and can change
-// without touching anything here.
+// without touching anything here. The route is also the navigation: its AP
+// node opens the Wi-Fi view and the Pi-hole's node the DNS view.
 //
 // The line: the state word a step under the connection's name, then what the
 // route cannot say ("blocking" or, urgent, "not blocking", from the canary; a
@@ -68,7 +69,13 @@ Item {
     tr: hero.hub.strings.t
     leftInset: hero.textX
     rightInset: hero.textX
+    pending: hero.hub.pending
+    cursorNode: hero.hub.routeCursorNode
+    cursorPointer: hero.hub.cursorPointer
     visible: hero.info.kind !== "nobackend"
+    // The route is the navigation: the AP opens Wi-Fi, the Pi-hole's place DNS.
+    onNodeMoved: function(id, area, mouse) { hero.hub.hoverCursor(area, mouse, "route", hero.hub.routeStops.indexOf(id)) }
+    onNodeClicked: function(id) { hero.hub.openRouteNode(id) }
   }
 
   // The place the route offers setup: a button under the dashed node.
@@ -235,7 +242,7 @@ Item {
     hoverEnabled: true
     acceptedButtons: Qt.NoButton
     PanelToolTip {
-      visible: tipArea.containsMouse && viz.visible
+      visible: tipArea.containsMouse && viz.visible && viz.hoveredId === ""
       text: hero.t("hero.tip") + (hero.today.selfQueries > 0 ? "\n" + hero.t("hero.tipSelf").arg(hero.today.selfQueries) : "")
       fontFamily: hero.hub.fontFamily
     }

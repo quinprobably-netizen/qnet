@@ -30,7 +30,8 @@
       "known": true,
       "uuid": "0c3d9f12-88aa-4e77-b5d1-72f6e0a1c9d3",
       "active": false,
-      "band": "5 GHz"
+      "band": "5 GHz",
+      "frequencyMhz": 5180
     },
     {
       "id": "/org/freedesktop/NetworkManager/AccessPoint/21",
@@ -41,7 +42,8 @@
       "known": true,
       "uuid": "0c3d9f12-88aa-4e77-b5d1-72f6e0a1c9d3",
       "active": false,
-      "band": "2.4 GHz"
+      "band": "2.4 GHz",
+      "frequencyMhz": 2437
     },
     {
       "id": "/org/freedesktop/NetworkManager/AccessPoint/30",
@@ -52,7 +54,8 @@
       "known": false,
       "uuid": "",
       "active": false,
-      "band": "5 GHz"
+      "band": "5 GHz",
+      "frequencyMhz": 5180
     },
     {
       "id": "/org/freedesktop/NetworkManager/AccessPoint/31",
@@ -63,7 +66,8 @@
       "known": false,
       "uuid": "",
       "active": false,
-      "band": "2.4 GHz"
+      "band": "2.4 GHz",
+      "frequencyMhz": 2437
     },
     {
       "id": "/org/freedesktop/NetworkManager/AccessPoint/32",
@@ -74,7 +78,8 @@
       "known": false,
       "uuid": "",
       "active": false,
-      "band": "2.4 GHz"
+      "band": "2.4 GHz",
+      "frequencyMhz": 2437
     },
     {
       "id": "/org/freedesktop/NetworkManager/AccessPoint/33",
@@ -85,7 +90,8 @@
       "known": false,
       "uuid": "",
       "active": false,
-      "band": "2.4 GHz"
+      "band": "2.4 GHz",
+      "frequencyMhz": 2437
     },
     {
       "id": "/org/freedesktop/NetworkManager/AccessPoint/34",
@@ -96,7 +102,8 @@
       "known": false,
       "uuid": "",
       "active": false,
-      "band": "2.4 GHz"
+      "band": "2.4 GHz",
+      "frequencyMhz": 2437
     }
   ],
   "scan": {

@@ -39,11 +39,19 @@ import "../Model.js" as Model
 //         fontFamily, fontSize               the host's type
 //         tr(key)    the host's words, for the parts the model names by key
 //         leftInset, rightInset              the host's content margins
+//         pending    the panel's pending requests (the leak count uses them)
+//         cursorNode the node the cursor is on ("" for none); cursorPointer
+//                    says the pointer put it there (the ring is the accent;
+//                    the keyboard's is grey)
 //   out   implicitHeight   its height
 //         overlap          px it wants to reach up into the words above (0)
 //         legendColor      the colour of the blocked share (the pool)
 //         ghost, ghostRect where the picture offers "set up" (a dashed node
 //                          in the Pi-hole's place); the host puts the button
+//         nodeMoved(id, area, mouse), nodeClicked(id)   the route is the
+//                    navigation: the nodes that open a view (the AP: Wi-Fi;
+//                    the Pi-hole's place: DNS) take the pointer
+//         hoveredId  the node under the pointer ("" for none)
 Item {
   id: viz
 
@@ -61,15 +69,22 @@ Item {
   property var tr: function(key) { return key }
   property real leftInset: Style.space(22)
   property real rightInset: Style.space(16)
+  property var pending: ({})
+  property string cursorNode: ""
+  property bool cursorPointer: false
+
+  signal nodeMoved(string id, var area, var mouse)
+  signal nodeClicked(string id)
+  property string hoveredId: ""
 
   readonly property real overlap: 0
-  readonly property color legendColor: bandColor
+  readonly property color legendColor: pal.band
   readonly property bool ghost: route.ghost
   readonly property rect ghostRect: Qt.rect(slotX("ph") - Style.space(64), statY - Style.space(1), Style.space(128), Style.space(24))
   implicitHeight: Style.space(138)
 
   // ------------------------------------------------------------- model
-  readonly property var route: Model.routeModel(view, nowS)
+  readonly property var route: Model.routeModel(view, nowS, pending)
 
   function nodeById(id) {
     for (var i = 0; i < route.nodes.length; i++) if (route.nodes[i].id === id) return route.nodes[i]
@@ -92,40 +107,24 @@ Item {
     return p.text
   }
 
+  // What a node's tooltip says: where it goes, or what it is.
+  function tipFor(n) {
+    if (n.open === "wifi") return tr("route.tip.wifi")
+    if (n.open === "dns") return n.glyph === "ghost" && n.tip !== "" ? tr("route.tip.dns") + "\n" + tr("hero.detected").replace("%1", n.tip) : tr("route.tip.dns")
+    return n.tip
+  }
+
   // ------------------------------------------------------------ colours
-  // The theme's accent with plasma in it: more saturation, a second hue
-  // stop, the crest leaning round the colour wheel. Frozen, it is the plain
-  // foreground and everything fades.
-  function shifted(c, dHue, sat, light, satFloor) {
-    var h = c.hslHue < 0 ? 0 : c.hslHue
-    var s = c.hslSaturation < 0.08 ? c.hslSaturation : Math.min(1, Math.max(satFloor, c.hslSaturation * sat))
-    return Qt.hsla((h + dHue + 1) % 1, s, Math.min(0.78, c.hslLightness * light), c.a)
-  }
+  PlasmaPalette { id: pal; accent: viz.accent; fg: viz.fg; dim: viz.dim; frozen: viz.frozen }
 
-  function mix(a, b, k) {
-    return Qt.rgba(a.r + (b.r - a.r) * k, a.g + (b.g - a.g) * k, a.b + (b.b - a.b) * k, a.a + (b.a - a.a) * k)
-  }
-
-  property color baseColor: frozen ? fg : shifted(accent, 0, 1.15, 1.0, 0.5)
-  property color crestColor: frozen ? fg : shifted(accent, 0.09, 1.2, 1.15, 0.6)
-  property color footColor: frozen ? fg : shifted(accent, -0.07, 1.2, 0.9, 0.55)
-  property color bandColor: frozen ? dim : shifted(accent, 0.025, 1.1, 1.3, 0.6)
-  Behavior on baseColor { ColorAnimation { duration: Style.duration(160) } }
-  Behavior on crestColor { ColorAnimation { duration: Style.duration(160) } }
-  Behavior on footColor { ColorAnimation { duration: Style.duration(160) } }
-  Behavior on bandColor { ColorAnimation { duration: Style.duration(160) } }
-
-  // The plasma along the whole route: foot, base, crest, left to right.
-  function plasmaAt(x) {
-    var t = Math.max(0, Math.min(1, (x - x0) / Math.max(1, xEnd - x0)))
-    return t < 0.5 ? mix(footColor, baseColor, t * 2) : mix(baseColor, crestColor, (t - 0.5) * 2)
-  }
+  // The plasma along the whole route.
+  function plasmaAt(x) { return pal.at((x - x0) / Math.max(1, xEnd - x0)) }
 
   function toneColor(tone) {
     if (tone === "urgent") return urgent
     if (tone === "warning") return warning
     if (tone === "dim") return dim
-    return frozen ? dim : crestColor
+    return frozen ? dim : pal.crest
   }
 
   function wordColor(tone) {
@@ -239,7 +238,7 @@ Item {
             gradient: Gradient {
               orientation: Gradient.Horizontal
               GradientStop { position: 0; color: "transparent" }
-              GradientStop { position: 0.5; color: Util.alpha(Qt.lighter(viz.crestColor, 1.9), viz.frozen ? 0.25 : 0.55) }
+              GradientStop { position: 0.5; color: Util.alpha(Qt.lighter(pal.crest, 1.9), viz.frozen ? 0.25 : 0.55) }
               GradientStop { position: 1; color: "transparent" }
             }
 
@@ -269,7 +268,7 @@ Item {
             height: parent.height
             radius: height / 2
             x: body.width - (index + 1) * Style.space(10)
-            color: Util.alpha(viz.crestColor, 0.35)
+            color: Util.alpha(pal.crest, 0.35)
           }
         }
       }
@@ -291,7 +290,7 @@ Item {
         anchors.fill: parent
         preferredRendererType: Shape.CurveRenderer
         ShapePath {
-          strokeColor: Util.alpha(viz.dim, 0.55)
+          strokeColor: tube.lk && tube.lk.tone !== "dim" && tube.lk.tone !== "accent" ? Util.alpha(viz.toneColor(tube.lk.tone), 0.9) : Util.alpha(viz.dim, 0.55)
           strokeWidth: Style.space(2)
           fillColor: "transparent"
           strokeStyle: ShapePath.DashLine
@@ -411,6 +410,9 @@ Item {
   }
 
   // -------------------------------------------------------------- nodes
+  // The nodes that open a view (the AP, the Pi-hole's place) are the route's
+  // navigation: a pointer cursor, a ring under the cursor (grey for the
+  // keyboard, the accent for the pointer), a tooltip that says where it goes.
   Repeater {
     model: ["pc", "ap", "ph", "up"]
 
@@ -420,47 +422,26 @@ Item {
       readonly property var n: viz.nodeById(modelData)
       readonly property color tone: n ? viz.toneColor(n.tone) : "transparent"
       readonly property bool ghostNode: n !== null && n.glyph === "ghost"
+      readonly property bool opens: n !== null && n.open !== ""
+      readonly property bool hasCursor: viz.cursorNode === modelData
       visible: n !== null
       x: viz.slotX(modelData) - viz.badge / 2
       y: viz.rowY - viz.badge / 2
       width: viz.badge
       height: viz.badge
 
-      // the badge: a ring round a glyph, filled to hide the tube behind it
-      Rectangle {
+      RouteBadge {
         anchors.fill: parent
-        radius: width / 2
-        color: Qt.rgba(Commons.Color.popups.background.r, Commons.Color.popups.background.g, Commons.Color.popups.background.b, 0.92)
-      }
-      Rectangle {
-        anchors.fill: parent
-        radius: width / 2
-        visible: !nd.ghostNode
-        color: Util.alpha(nd.tone, 0.14)
-        border.width: 1.5
-        border.color: Util.alpha(nd.tone, nd.n && nd.n.tone === "dim" ? 0.55 : 0.95)
-      }
-      Shape {
-        visible: nd.ghostNode
-        anchors.fill: parent
-        preferredRendererType: Shape.CurveRenderer
-        ShapePath {
-          strokeColor: Util.alpha(viz.accent, 0.8)
-          strokeWidth: 1.5
-          fillColor: "transparent"
-          strokeStyle: ShapePath.DashLine
-          dashPattern: [2.5, 2.5]
-          PathAngleArc { centerX: viz.badge / 2; centerY: viz.badge / 2; radiusX: viz.badge / 2 - 1; radiusY: viz.badge / 2 - 1; startAngle: 0; sweepAngle: 360 }
-        }
-      }
-      Text {
-        anchors.centerIn: parent
-        textFormat: Text.PlainText
-        renderType: Text.NativeRendering
-        text: nd.n ? viz.glyphOf[nd.n.glyph] : ""
-        color: nd.ghostNode ? viz.accent : nd.tone
-        font.family: viz.fontFamily
-        font.pixelSize: Style.space(15)
+        size: viz.badge
+        glyph: nd.n ? viz.glyphOf[nd.n.glyph] : ""
+        tone: nd.tone
+        quiet: nd.n !== null && nd.n.tone === "dim"
+        ghost: nd.ghostNode
+        accent: viz.accent
+        fontFamily: viz.fontFamily
+        ringColor: nd.hasCursor ? (viz.cursorPointer ? viz.accent : Util.alpha(viz.fg, 0.7)) : "transparent"
+        badgeText: nd.n && nd.n.badge ? String(nd.n.badge.n) : ""
+        badgeColor: nd.n && nd.n.badge ? viz.toneColor(nd.n.badge.tone) : viz.warning
       }
 
       // under it: what it is (its address, its signal), then how it is doing
@@ -492,14 +473,27 @@ Item {
         elide: Text.ElideRight
       }
 
+      // The hit area: the badge and the words under it.
       MouseArea {
-        id: tip
-        anchors.fill: parent
+        id: hit
+        readonly property real w: Math.min(viz.step - Style.space(8), Style.space(96))
+        x: (parent.width - w) / 2
+        y: -Style.space(4)
+        width: w
+        height: viz.statY + viz.fontSize + Style.space(4) - nd.y
         hoverEnabled: true
-        acceptedButtons: Qt.NoButton
+        acceptedButtons: nd.opens ? Qt.LeftButton : Qt.NoButton
+        cursorShape: nd.opens ? Qt.PointingHandCursor : Qt.ArrowCursor
+        onContainsMouseChanged: {
+          if (containsMouse) viz.hoveredId = nd.modelData
+          else if (viz.hoveredId === nd.modelData) viz.hoveredId = ""
+        }
+        onPositionChanged: function(mouse) { if (nd.opens) viz.nodeMoved(nd.modelData, hit, mouse) }
+        onClicked: viz.nodeClicked(nd.modelData)
+
         PanelToolTip {
-          visible: tip.containsMouse && nd.n !== null && nd.n.tip !== ""
-          text: !nd.n ? "" : nd.ghostNode ? viz.tr("hero.detected").replace("%1", nd.n.tip) : nd.n.tip
+          visible: (hit.containsMouse || nd.hasCursor) && nd.n !== null && viz.tipFor(nd.n) !== ""
+          text: nd.n ? viz.tipFor(nd.n) : ""
           fontFamily: viz.fontFamily
         }
       }
@@ -529,7 +523,7 @@ Item {
       width: sink.peel
       height: Style.space(5)
       radius: width / 2
-      color: Util.alpha(viz.bandColor, 0.9)
+      color: Util.alpha(pal.band, 0.9)
     }
     Shape {
       visible: sink.peel > 0
@@ -539,7 +533,7 @@ Item {
       height: Style.space(6)
       preferredRendererType: Shape.CurveRenderer
       ShapePath {
-        fillColor: Util.alpha(viz.bandColor, 0.95)
+        fillColor: Util.alpha(pal.band, 0.95)
         strokeWidth: -1
         startX: 0; startY: 0
         PathLine { x: Style.space(8); y: 0 }
@@ -567,8 +561,8 @@ Item {
         width: parent.width
         height: Math.max(Style.space(3), parent.height * (sink.sk ? sink.sk.pct / 100 : 0))
         gradient: Gradient {
-          GradientStop { position: 0; color: Util.alpha(viz.bandColor, 0.95) }
-          GradientStop { position: 1; color: Util.alpha(viz.footColor, 0.7) }
+          GradientStop { position: 0; color: Util.alpha(pal.band, 0.95) }
+          GradientStop { position: 1; color: Util.alpha(pal.foot, 0.7) }
         }
       }
     }
@@ -588,49 +582,17 @@ Item {
     }
   }
 
-  // ---------------------------------------------- notes: no DNS, offline
-  // A stub off the last node, and the words for why the route stops.
+  // -------------------------------------------------------- note: no DNS
+  // The words for why the route stops: "no DNS" over "resolved fallback
+  // 9.9.9.9" under the DNS node's place.
   Item {
     id: note
     visible: viz.route.note !== null
     readonly property var nt: viz.route.note
-    readonly property bool isNone: viz.route.kind === "none"
-    readonly property real xa: viz.tubeLeft(isNone ? "ap" : "pc")
-    readonly property real xb: viz.tubeRight("ph") + Style.space(10)
     anchors.fill: parent
 
-    Shape {
-      visible: note.isNone
-      anchors.fill: parent
-      preferredRendererType: Shape.CurveRenderer
-      ShapePath {
-        strokeColor: Util.alpha(viz.urgent, 0.9)
-        strokeWidth: Style.space(2.5)
-        fillColor: "transparent"
-        strokeStyle: ShapePath.DashLine
-        dashPattern: [3, 2.5]
-        capStyle: ShapePath.RoundCap
-        startX: note.xa; startY: viz.rowY
-        PathLine { x: note.xb - Style.space(16); y: viz.rowY }
-      }
-    }
-    Text {
-      visible: note.isNone
-      x: note.xb - Style.space(12)
-      y: viz.rowY - implicitHeight / 2
-      textFormat: Text.PlainText
-      renderType: Text.NativeRendering
-      text: "✕"
-      color: viz.urgent
-      font.family: viz.fontFamily
-      font.pixelSize: Style.space(15)
-    }
-
-    // the words: "no DNS" over "resolved fallback 9.9.9.9" under the node's
-    // place; "offline" under the stub
     Column {
-      readonly property real cx: note.isNone ? viz.slotX("ph") : (viz.tubeLeft("pc") + viz.slotX("ap") + viz.badge / 2) / 2
-      x: Math.max(viz.leftInset, Math.min(cx - width / 2, viz.xEnd - width))
+      x: Math.max(viz.leftInset, Math.min(viz.slotX("ph") - width / 2, viz.xEnd - width))
       y: viz.labelY - Style.space(1)
       spacing: Style.space(2)
       Repeater {

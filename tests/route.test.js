@@ -224,10 +224,13 @@ test("Ethernet on automatic DNS: the Pi-hole is idle, the way to the resolver is
   assert.equal(r.sink, null)
 })
 
-test("no DNS: the route ends at the AP with the note in urgent", () => {
+test("no DNS: the route ends at an urgent DNS node past the AP, with the note under it", () => {
   const r = route("none")
   assert.equal(r.kind, "none")
-  assert.deepEqual(r.nodes.map((n) => n.id), ["pc", "ap"])
+  assert.deepEqual(r.nodes.map((n) => n.id), ["pc", "ap", "ph"])
+  assert.equal(node(r, "ph").tone, "urgent")
+  assert.equal(node(r, "ph").open, "dns", "the DNS node opens the DNS view")
+  assert.deepEqual(link(r, "ap", "ph"), { a: "ap", b: "ph", state: "dashed", tone: "urgent", thin: false, flow: false })
   assert.equal(r.note.key, "route.none")
   assert.deepEqual(r.note.args, ["9.9.9.9"])
   assert.equal(r.note.tone, "urgent")
@@ -253,16 +256,40 @@ test("custom DNS: direct to the servers, the Pi-hole idle", () => {
   assert.equal(text(node(r, "ph").stat), "route.idle|")
 })
 
-test("offline and radio off: the PC alone with a dashed dim stub", () => {
+test("offline and radio off: the PC and a dim AP at the end of a dashed link, saying why", () => {
   for (const [n, key] of [["offline", "route.offline"], ["radio-off", "route.wifiOff"]]) {
     const r = route(n)
     assert.equal(r.kind, "offline", n)
-    assert.deepEqual(r.nodes.map((x) => x.id), ["pc"], n)
+    assert.deepEqual(r.nodes.map((x) => x.id), ["pc", "ap"], n)
     assert.equal(r.nodes[0].tone, "dim")
+    assert.equal(r.nodes[1].tone, "dim")
+    assert.equal(r.nodes[1].label.key, key, n)
+    assert.equal(r.nodes[1].open, "wifi", n + ": the dim AP still opens Wi-Fi, to join something")
     assert.deepEqual(r.links, [{ a: "pc", b: "ap", state: "dashed", tone: "dim", thin: false }], n)
-    assert.equal(r.note.key, key, n)
+    assert.equal(r.note, null, n)
     assert.equal(r.flow.density, 0)
   }
+})
+
+// ---- the route is the navigation -----------------------------------------
+
+test("the AP opens Wi-Fi and the Pi-hole's place opens DNS, in every state that has them", () => {
+  for (const n of ["healthy", "paused", "fallback", "bypassed", "unreachable", "degraded", "custom", "unconfigured", "none", "unknown", "ethernet"]) {
+    const r = route(n)
+    assert.equal(node(r, "ap").open, "wifi", n)
+    assert.equal(node(r, "ph").open, "dns", n)
+    assert.equal(node(r, "pc").open, "", n)
+    if (node(r, "up")) assert.equal(node(r, "up").open, "", n + ": the upstream is a tooltip, not a door")
+  }
+})
+
+test("leaks are a count on the Pi-hole's node: warning for profiles, urgent for a bypass", () => {
+  assert.equal(node(route("healthy"), "ph").badge, null)
+  assert.deepEqual(node(route("leaks"), "ph").badge, { n: 2, tone: "warning" })
+  assert.deepEqual(node(route("bypassed"), "ph").badge, { n: 1, tone: "urgent" })
+  const pend = Model.withPending(Model.emptyPending(), { pinUuid: Model.leakGroups(view("leaks")).profiles.uuids.join(" ") }, NOW_MS)
+  assert.equal(node(Model.routeModel(view("leaks", pend), NOW_S, pend), "ph").badge, null, "pinned: gone at once")
+  assert.equal(node(route("custom"), "ph").badge, null, "no Pi-hole in the path, no count")
 })
 
 test("before the first probe: the same route, dim, nothing flowing", () => {

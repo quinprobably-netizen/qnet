@@ -1,33 +1,24 @@
 import QtQuick
 import qs.Commons
 
-// A section's top: one hairline across the content column, then a small
-// sentence-case dim label (the same head Sound Hub's sections wear). Whatever
-// is put inside `trailing` sits on the label's row at the right edge.
+// A section's head: a small dim label with its rule running on to the right
+// edge (or to whatever is put inside `trailing`, which sits at the right
+// edge of the same row: the scan button).
 Item {
   id: head
 
   required property var hub
   property string text: ""
-  property int above: Style.space(14)
-  property int below: Style.space(8)
+  property int above: Style.space(12)
+  property int below: Style.space(4)
   default property alias trailing: trailingSlot.data
 
   width: parent ? parent.width : 0
-  implicitHeight: row.y + row.height
-
-  Rectangle {
-    id: line
-    y: head.above
-    x: head.hub.gutter
-    width: head.width - 2 * head.hub.gutter
-    height: 1
-    color: head.hub.lineColor
-  }
+  implicitHeight: above + row.height + below
 
   Item {
     id: row
-    y: line.y + line.height + head.below
+    y: head.above
     width: head.width
     height: Math.max(label.implicitHeight, trailingSlot.childrenRect.height) + Style.space(2)
 
@@ -42,6 +33,16 @@ Item {
       anchors.left: parent.left
       anchors.leftMargin: head.hub.gutter
       anchors.verticalCenter: parent.verticalCenter
+    }
+
+    Rectangle {
+      anchors.left: label.right
+      anchors.leftMargin: Style.space(10)
+      anchors.right: trailingSlot.left
+      anchors.rightMargin: trailingSlot.width > 0 ? Style.space(6) : 0
+      anchors.verticalCenter: parent.verticalCenter
+      height: 1
+      color: head.hub.lineColor
     }
 
     Item {
