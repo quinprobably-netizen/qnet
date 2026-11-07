@@ -56,7 +56,12 @@ impl Ledger {
     }
 
     /// (total, blocked) sent in the bucket that starts at `bucket_start`.
-    pub fn bucket(&self, bucket_start: i64) -> (u64, u64) {
+    ///
+    /// `t` may be anywhere inside the bucket: Pi-hole's history labels its
+    /// 10-minute buckets by their *centre* (t % 600 == 300), the tally by
+    /// their start, so the argument is floored to the start first.
+    pub fn bucket(&self, t: i64) -> (u64, u64) {
+        let bucket_start = t.div_euclid(BUCKET_S) * BUCKET_S;
         self.buckets
             .iter()
             .filter(|b| b.0 == bucket_start)
@@ -118,6 +123,18 @@ mod tests {
         assert_eq!(l.bucket(start(1_000_100)), (2, 1));
         assert_eq!(l.bucket(start(1_000_700)), (5, 5));
         assert_eq!(l.bucket(start(2_000_000)), (0, 0));
+    }
+
+    #[test]
+    fn lookup_accepts_bucket_centres_as_pihole_labels_them() {
+        let mut l = Ledger::default();
+        l.add(1_000_100.0, 3, 2); // bucket 999_600..1_000_200
+        let start = 1_000_100i64.div_euclid(BUCKET_S) * BUCKET_S;
+        assert_eq!(l.bucket(start), (3, 2));
+        assert_eq!(l.bucket(start + 300), (3, 2), "the centre label finds the same bucket");
+        assert_eq!(l.bucket(start + 599), (3, 2));
+        assert_eq!(l.bucket(start + 600), (0, 0), "the next bucket");
+        assert_eq!(l.bucket(start - 1), (0, 0));
     }
 
     #[test]

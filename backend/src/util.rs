@@ -116,6 +116,61 @@ pub fn state_dir() -> PathBuf {
     }
 }
 
+/// `$XDG_RUNTIME_DIR/qnet`, the home of the small cross-process files (the
+/// session id, the DNS lock, the Wi-Fi throttles). Falls back to the state
+/// directory so a missing runtime dir never disables a safety guard.
+pub fn runtime_qnet_dir() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(rt) => PathBuf::from(rt).join("qnet"),
+        None => state_dir(),
+    }
+}
+
+/// An exclusive advisory lock on a file, released when dropped (or when the
+/// process dies, however it dies).
+#[derive(Debug)]
+pub struct FileLock {
+    _file: fs::File,
+}
+
+/// Try to take the lock without waiting. `Ok(None)` means someone else holds
+/// it.
+pub fn try_lock(path: &Path) -> io::Result<Option<FileLock>> {
+    use std::os::fd::AsRawFd;
+    if let Some(dir) = path.parent() {
+        ensure_private_dir(dir)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    // SAFETY: flock on a descriptor we own; no memory is passed.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(FileLock { _file: file }));
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(err)
+    }
+}
+
+/// A flag that SIGTERM, SIGINT and SIGHUP set instead of killing the process,
+/// so a verb can finish or undo its current step and log out. Not for
+/// interactive prompts: a restarted `read` would swallow Ctrl-C.
+pub fn term_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [SIGTERM, SIGINT, SIGHUP] {
+        let _ = signal_hook::flag::register(sig, flag.clone());
+    }
+    flag
+}
+
 /// Refuse core dumps and same-user memory reads of this process. Called by
 /// the verbs that handle secrets.
 pub fn harden_process() {
@@ -251,5 +306,24 @@ mod tests {
         assert_eq!(mode, 0o600);
         let leftovers = fs::read_dir(p.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1);
+    }
+
+    #[test]
+    fn try_lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("qnet").join("dns.lock");
+        let first = try_lock(&p).unwrap().expect("free lock");
+        assert!(try_lock(&p).unwrap().is_none(), "busy while held");
+        drop(first);
+        assert!(try_lock(&p).unwrap().is_some(), "free again");
+        let mode = fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn runtime_dir_falls_back_to_state() {
+        // Only the shape is checked; the environment is the test runner's.
+        let d = runtime_qnet_dir();
+        assert!(d.ends_with("qnet"));
     }
 }

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crate::config;
 use crate::dnswire::{self, DnsError};
 use crate::icmp;
-use crate::pihole::{ApiError, Blocking, Bucket, Pihole, Summary};
+use crate::pihole::{ApiError, Blocking, Bucket, Pihole, Summary, Upstreams};
 use crate::setup::DEDICATED_CANARY;
 use crate::util;
 
@@ -44,14 +44,41 @@ pub struct OwnQueries {
     pub blocked: u32,
 }
 
+/// What the Pi-hole's pinned web API said when asked whether its host is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiLiveness {
+    /// A TLS handshake with the pinned certificate completed: the host is
+    /// alive, whatever it thinks of DNS.
+    Alive,
+    /// Connection refused, unreachable or timed out.
+    Dead,
+    /// Something answered with a different certificate.
+    Mismatch,
+    /// It answered, but not in a way that proves the Pi-hole is up.
+    Other,
+}
+
+impl ApiLiveness {
+    /// Anything that answered at all argues against calling it an outage.
+    pub fn answered(self) -> bool {
+        !matches!(self, ApiLiveness::Dead)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProbeReport {
     pub target: IpAddr,
     pub t: f64,
     /// The canary probe.
     pub pihole: ProbeOutcome,
-    /// Gateway DNS probe; only taken when the Pi-hole probe failed.
+    /// Gateway DNS probe; taken when the Pi-hole probe failed or its upstream
+    /// check did.
     pub gateway: Option<bool>,
+    /// The gateway answered the canary with 0.0.0.0: it forwards to the
+    /// Pi-hole, so it is no alternative to it.
+    pub gateway_blocked: Option<bool>,
+    /// The pinned web API, asked when the canary went unanswered.
+    pub api: Option<ApiLiveness>,
     /// Upstream-resolution check (random name); only when it was due and the
     /// canary answered. `Some(false)` means SERVFAIL or timeout.
     pub upstream: Option<bool>,
@@ -66,6 +93,8 @@ pub struct ApiReport {
     pub summary: Option<Summary>,
     pub blocking: Option<Blocking>,
     pub history: Option<Vec<Bucket>>,
+    /// Per-upstream statistics; fetched on the history schedule and on open.
+    pub upstreams: Option<Upstreams>,
     pub at: f64,
 }
 
@@ -77,6 +106,8 @@ pub enum Event {
     NmLost,
     Probe(ProbeReport),
     Api(ApiReport),
+    /// systemd-resolved's view of the Pi-hole: Some(reason) if downgraded.
+    Downgrade(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,10 +115,36 @@ pub struct ProbeTarget {
     pub addr: IpAddr,
     /// DNS port of the Pi-hole (53; tests use a local fake).
     pub port: u16,
+    /// DNS port of the gateway (53).
+    pub gateway_port: u16,
+    /// Port and pinned certificate of the Pi-hole's web API, when configured.
+    pub api: Option<ApiProbe>,
     /// The configured canary: a real blocklisted name. Used when the
     /// dedicated one is not on the deny list.
     pub canary: String,
     pub gateway: Option<IpAddr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiProbe {
+    pub port: u16,
+    pub pin: [u8; 32],
+}
+
+/// Is the Pi-hole's host up? One pinned HTTPS GET; any answer from the pinned
+/// certificate (even 401) says yes.
+pub fn check_api(addr: IpAddr, probe: &ApiProbe, timeout: Duration) -> ApiLiveness {
+    use crate::https::{HttpError, HttpsClient};
+    let Ok(client) = HttpsClient::new(SocketAddr::new(addr, probe.port), Some(probe.pin)) else {
+        return ApiLiveness::Other;
+    };
+    let mut client = client.with_timeout(timeout);
+    match client.request("GET", "/api/dns/blocking", &[], None) {
+        Ok(_) => ApiLiveness::Alive,
+        Err(HttpError::Connect(_)) | Err(HttpError::Timeout) => ApiLiveness::Dead,
+        Err(HttpError::PinMismatch(_)) => ApiLiveness::Mismatch,
+        Err(_) => ApiLiveness::Other,
+    }
 }
 
 /// What one probe cycle should include besides the canary.
@@ -269,17 +326,24 @@ pub fn run_probe(t: &ProbeTarget, req: &ProbeRequest, st: &mut CanaryState) -> P
     let started = util::unix_now();
     let mut own = OwnQueries::default();
     let pihole = canary_probe(t, st, &mut own);
-    let gateway = if pihole.ok {
-        None
-    } else {
-        t.gateway.map(|g| {
-            matches!(
-                dnswire::probe_server(g, &t.canary, PROBE_TIMEOUT),
-                Ok(p) if p.reply.rcode == dnswire::RCODE_NOERROR || p.reply.rcode == dnswire::RCODE_NXDOMAIN
-            )
-        })
-    };
     let upstream = (req.upstream && pihole.ok).then(|| upstream_probe(t.addr, t.port, &mut own));
+    // The gateway gate: asked whenever the Pi-hole is in trouble, whether it
+    // is silent or merely cannot resolve.
+    let in_trouble = !pihole.ok || upstream == Some(false);
+    let (gateway, gateway_blocked) = match (in_trouble, t.gateway) {
+        (true, Some(g)) => {
+            let mut spent = OwnQueries::default();
+            let r = probe_name(g, t.gateway_port, &t.canary, false, &mut spent);
+            // Whether the *gateway* answers the way a resolver should: the
+            // rcode is what `probe_name` already judged as `ok`.
+            (Some(r.ok), Some(r.ok && r.blocked))
+        }
+        _ => (None, None),
+    };
+    let api = match (&t.api, pihole.ok) {
+        (Some(a), false) => Some(check_api(t.addr, a, Duration::from_millis(1500))),
+        _ => None,
+    };
     let gateway_ms = match (req.icmp, t.gateway) {
         (true, Some(IpAddr::V4(g))) => {
             icmp::echo_rtt(g, GATEWAY_ICMP_TIMEOUT).map(|d| d.as_secs_f64() * 1000.0)
@@ -291,6 +355,8 @@ pub fn run_probe(t: &ProbeTarget, req: &ProbeRequest, st: &mut CanaryState) -> P
         t: started,
         pihole,
         gateway,
+        gateway_blocked,
+        api,
         upstream,
         own,
         gateway_ms,
@@ -425,19 +491,23 @@ fn failure(e: &ApiError) -> ApiReport {
         summary: None,
         blocking: None,
         history: None,
+        upstreams: None,
         at: util::unix_now(),
     }
 }
 
-fn poll(api: &mut Pihole, with_history: bool) -> Result<ApiReport, ApiError> {
+fn poll(api: &mut Pihole, with_history: bool, with_upstreams: bool) -> Result<ApiReport, ApiError> {
     let summary = api.summary()?;
     let blocking = api.blocking()?;
     let history = if with_history { Some(api.history()?) } else { None };
+    // Nice to have: an older Pi-hole or an odd answer must not fail the poll.
+    let upstreams = if with_upstreams { api.upstreams().ok() } else { None };
     Ok(ApiReport {
         status: "ok",
         summary: Some(summary),
         blocking: Some(blocking),
         history,
+        upstreams,
         at: util::unix_now(),
     })
 }
@@ -453,6 +523,7 @@ pub fn spawn_api(tx: Sender<Event>, timing: ApiTiming, factory: ApiFactory) -> (
         let mut next_poll = Instant::now();
         let mut last_poll = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
         let mut last_history: Option<Instant> = None;
+        let mut last_upstreams: Option<Instant> = None;
         // A failure's backoff: neither `Kick` nor `Open` may shorten it.
         let mut backoff_until: Option<Instant> = None;
         loop {
@@ -469,12 +540,15 @@ pub fn spawn_api(tx: Sender<Event>, timing: ApiTiming, factory: ApiFactory) -> (
                     }
                     cfg = c;
                     last_history = None;
+                    last_upstreams = None;
                     backoff_until = None;
                     next_poll = Instant::now();
                 }
                 Ok(ApiCtl::Open(o)) => {
                     open = o;
                     if o {
+                        // The Route view wants fresh upstream figures on open.
+                        last_upstreams = None;
                         next_poll = backoff_until.unwrap_or_else(Instant::now).max(Instant::now());
                     } else if let Some(c) = client.as_mut() {
                         c.close_idle();
@@ -506,12 +580,16 @@ pub fn spawn_api(tx: Sender<Event>, timing: ApiTiming, factory: ApiFactory) -> (
                     let api = client.as_mut().expect("just created");
                     last_poll = Instant::now();
                     let history_due = last_history.is_none_or(|t| t.elapsed() >= timing.history_every);
-                    let res = poll(api, history_due);
+                    let upstreams_due = last_upstreams.is_none_or(|t| t.elapsed() >= timing.history_every);
+                    let res = poll(api, history_due, upstreams_due);
                     api.close_idle();
                     match res {
                         Ok(report) => {
                             if report.history.is_some() {
                                 last_history = Some(Instant::now());
+                            }
+                            if report.upstreams.is_some() {
+                                last_upstreams = Some(Instant::now());
                             }
                             backoff_until = None;
                             next_poll = Instant::now() + timing.every;
@@ -651,6 +729,8 @@ mod tests {
         ProbeTarget {
             addr: "127.0.0.1".parse().unwrap(),
             port,
+            gateway_port: port,
+            api: None,
             canary: "doubleclick.net".into(),
             gateway: None,
         }
@@ -662,6 +742,8 @@ mod tests {
             t: util::unix_now(),
             pihole: ProbeOutcome { ok: true, ms: Some(1.0), blocked: true },
             gateway: None,
+            gateway_blocked: None,
+            api: None,
             upstream: req.upstream.then_some(true),
             own: OwnQueries { total: 1, blocked: 1 },
             gateway_ms: req.icmp.then_some(0.5),
@@ -897,6 +979,8 @@ mod tests {
     struct FakeDns {
         port: u16,
         names: Arc<Mutex<Vec<String>>>,
+        /// For each query: did it carry an EDNS0 OPT record?
+        edns: Arc<Mutex<Vec<bool>>>,
     }
 
     /// Answer every query with `reply(name)`. `None` drops it silently.
@@ -907,7 +991,8 @@ mod tests {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = sock.local_addr().unwrap().port();
         let names: Arc<Mutex<Vec<String>>> = Arc::default();
-        let n2 = names.clone();
+        let edns_seen: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let (n2, e2) = (names.clone(), edns_seen.clone());
         thread::spawn(move || {
             let mut buf = [0u8; 512];
             while let Ok((n, from)) = sock.recv_from(&mut buf) {
@@ -921,25 +1006,37 @@ mod tests {
                     p += l + 1;
                 }
                 let name = labels.join(".");
+                let question_end = p + 1 + 4; // root label + type + class
+                let edns = q.len() > question_end && q[question_end] == 0 && q[question_end + 1] == 0 && q[question_end + 2] == 41;
+                e2.lock().unwrap().push(edns);
                 let idx = {
                     let mut g = n2.lock().unwrap();
                     g.push(name.clone());
                     g.len()
                 };
                 let Some((rcode, ips)) = reply(&name, idx) else { continue };
-                let mut r = q.to_vec();
+                // Echo the header and question only (the probes ask with an
+                // EDNS0 OPT record, which the answers must not be glued after).
+                let mut r = q[..question_end].to_vec();
                 r[2] = 0x81;
                 r[3] = 0x80 | rcode;
                 r[6] = 0;
                 r[7] = ips.len() as u8;
+                r[10] = 0;
+                r[11] = 0;
                 for ip in ips {
                     r.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 2, 0, 4]);
                     r.extend_from_slice(&ip.octets());
                 }
+                if edns {
+                    // Answer with an OPT record too, as a real server does.
+                    r[11] = 1;
+                    r.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]);
+                }
                 let _ = sock.send_to(&r, from);
             }
         });
-        FakeDns { port, names }
+        FakeDns { port, names, edns: edns_seen }
     }
 
     const NULL: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
@@ -1088,6 +1185,118 @@ mod tests {
         assert_eq!(r.gateway_ms, None);
     }
 
+    #[test]
+    fn every_probe_carries_an_edns0_opt_record() {
+        let dns = fake_dns(|name, _| {
+            if name.ends_with(".example.com") {
+                Some((3, vec![]))
+            } else {
+                Some((0, vec![NULL]))
+            }
+        });
+        let t = tgt(dns.port);
+        let mut st = CanaryState::default();
+        let r = run_probe(&t, &req(true), &mut st);
+        assert!(r.pihole.ok && r.upstream == Some(true));
+        let seen = dns.edns.lock().unwrap();
+        assert!(seen.len() >= 2, "canary and upstream were both asked");
+        assert!(seen.iter().all(|e| *e), "{seen:?}: EDNS0 like systemd-resolved, so a server that mishandles it shows up here");
+    }
+
+    #[test]
+    fn the_gateway_is_asked_when_the_canary_works_but_upstream_does_not() {
+        // The Pi-hole blocks the canary but SERVFAILs everything else; the
+        // gateway (here the same fake) answers the canary normally.
+        let dns = fake_dns(|name, _| {
+            if name.ends_with(".example.com") {
+                Some((2, vec![]))
+            } else {
+                Some((0, vec![REAL]))
+            }
+        });
+        let mut t = tgt(dns.port);
+        t.gateway = Some("127.0.0.1".parse().unwrap());
+        let mut st = CanaryState::default();
+        let r = run_probe(&t, &req(true), &mut st);
+        assert!(r.pihole.ok);
+        assert_eq!(r.upstream, Some(false));
+        assert_eq!(r.gateway, Some(true), "gate evidence collected for a degraded Pi-hole too");
+        assert_eq!(r.gateway_blocked, Some(false), "this router resolves for real");
+        assert_eq!(r.api, None, "the canary was answered: no need to ask the web API");
+        // A healthy Pi-hole is not bothering the router at all.
+        let mut st = CanaryState::default();
+        let dns2 = fake_dns(|_, _| Some((0, vec![NULL])));
+        let mut t2 = tgt(dns2.port);
+        t2.gateway = Some("127.0.0.1".parse().unwrap());
+        let r = run_probe(&t2, &req(true), &mut st);
+        assert_eq!((r.gateway, r.gateway_blocked), (None, None));
+        assert_eq!(dns2.names.lock().unwrap().iter().filter(|n| *n == "doubleclick.net").count(), 0);
+    }
+
+    #[test]
+    fn a_router_that_blocks_the_canary_forwards_to_the_pihole() {
+        // Pi-hole silent; the "router" answers 0.0.0.0, i.e. it forwards to it.
+        let pihole = fake_dns(|_, _| None);
+        let router = fake_dns(|_, _| Some((0, vec![NULL])));
+        let mut t = tgt(pihole.port);
+        t.gateway = Some("127.0.0.1".parse().unwrap());
+        t.gateway_port = router.port;
+        let mut st = CanaryState::default();
+        let r = run_probe(&t, &req(false), &mut st);
+        assert!(!r.pihole.ok);
+        assert_eq!(r.gateway, Some(true));
+        assert_eq!(r.gateway_blocked, Some(true));
+    }
+
+    #[test]
+    fn the_web_api_is_asked_only_when_the_canary_goes_unanswered() {
+        let srv = serve(3, |_, _| Some(ok_json("{}")));
+        let silent = fake_dns(|_, _| None);
+        let mut t = tgt(silent.port);
+        t.api = Some(ApiProbe { port: srv.addr.port(), pin: srv.fingerprint });
+        let mut st = CanaryState::default();
+        let r = run_probe(&t, &req(false), &mut st);
+        assert!(!r.pihole.ok);
+        assert_eq!(r.api, Some(ApiLiveness::Alive), "DNS dead, web API alive");
+        // Answering canary: the API is left alone.
+        let fine = fake_dns(|_, _| Some((0, vec![NULL])));
+        let mut t = tgt(fine.port);
+        t.api = Some(ApiProbe { port: srv.addr.port(), pin: srv.fingerprint });
+        assert_eq!(run_probe(&t, &req(false), &mut CanaryState::default()).api, None);
+    }
+
+    #[test]
+    fn api_liveness_cases() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let t = Duration::from_millis(600);
+        // Pinned handshake completes: alive, even if the page is a 401.
+        let srv = serve(1, |_, _| Some(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}".to_vec()));
+        assert_eq!(check_api(ip, &ApiProbe { port: srv.addr.port(), pin: srv.fingerprint }, t), ApiLiveness::Alive);
+        // Another certificate: not the Pi-hole.
+        let srv = serve(1, |_, _| Some(ok_json("{}")));
+        let mut wrong = srv.fingerprint;
+        wrong[0] ^= 1;
+        assert_eq!(check_api(ip, &ApiProbe { port: srv.addr.port(), pin: wrong }, t), ApiLiveness::Mismatch);
+        // Nothing listening: dead.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        assert_eq!(check_api(ip, &ApiProbe { port, pin: [0; 32] }, t), ApiLiveness::Dead);
+        // A host that accepts and never speaks: the deadline makes it dead.
+        let srv = serve(1, |_, _| {
+            thread::sleep(Duration::from_secs(2));
+            None
+        });
+        let t0 = Instant::now();
+        assert_eq!(
+            check_api(ip, &ApiProbe { port: srv.addr.port(), pin: srv.fingerprint }, Duration::from_millis(300)),
+            ApiLiveness::Dead
+        );
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert!(ApiLiveness::Alive.answered() && ApiLiveness::Mismatch.answered() && ApiLiveness::Other.answered());
+        assert!(!ApiLiveness::Dead.answered());
+    }
+
     // -- API poller ----------------------------------------------------------
 
     const LOGIN: &str = r#"{"session":{"valid":true,"sid":"SID-1","validity":300}}"#;
@@ -1104,6 +1313,8 @@ mod tests {
                 Some(ok_json(r#"{"queries":{"total":10,"blocked":2,"percent_blocked":20.0}}"#))
             } else if first.starts_with("GET /api/dns/blocking") {
                 Some(ok_json(r#"{"blocking":"enabled","timer":null}"#))
+            } else if first.starts_with("GET /api/stats/upstreams") {
+                Some(ok_json(r#"{"upstreams":[{"ip":"blocklist","name":"blocklist","port":-1,"count":5},{"ip":"9.9.9.9","name":"dns9.quad9.net","port":53,"count":9,"statistics":{"response":0.05}}],"forwarded_queries":9}"#))
             } else if first.starts_with("GET /api/history") {
                 Some(ok_json(r#"{"history":[{"timestamp":600,"total":3,"blocked":1}]}"#))
             } else if first.starts_with("DELETE /api/auth") {
@@ -1185,6 +1396,75 @@ mod tests {
     }
 
     #[test]
+    fn upstreams_come_on_open_and_then_on_the_slow_schedule_only_while_open() {
+        let log: Log = Arc::default();
+        let srv = fake_api(log.clone());
+        let (tx, rx) = mpsc::channel();
+        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        sleep(150);
+        assert_eq!(count(&log, "GET /api/stats/upstreams"), 0, "closed: nothing");
+        ctl.send(ApiCtl::Open(true)).unwrap();
+        sleep(250);
+        let first = api_events(&rx);
+        let with_up: Vec<_> = first.iter().filter(|r| r.upstreams.is_some()).collect();
+        assert_eq!(with_up.len(), 1, "once on open, not on every 80 ms poll");
+        let u = with_up[0].upstreams.as_ref().unwrap();
+        assert_eq!(u.answered_by.blocklist, 5);
+        assert_eq!(u.list[0].response_ms, Some(50.0));
+        assert_eq!(count(&log, "GET /api/stats/upstreams"), 1);
+        // The history cadence (500 ms in this test) brings the next one.
+        sleep(600);
+        assert_eq!(count(&log, "GET /api/stats/upstreams"), 2);
+        // Closing and reopening fetches again straight away.
+        ctl.send(ApiCtl::Open(false)).unwrap();
+        sleep(120);
+        let frozen = count(&log, "GET /api/stats/upstreams");
+        sleep(300);
+        assert_eq!(count(&log, "GET /api/stats/upstreams"), frozen);
+        ctl.send(ApiCtl::Open(true)).unwrap();
+        sleep(200);
+        assert_eq!(count(&log, "GET /api/stats/upstreams"), frozen + 1);
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn a_broken_upstreams_endpoint_does_not_fail_the_poll() {
+        let log: Log = Arc::default();
+        let l2 = log.clone();
+        let srv = serve(40, move |_, req| {
+            let first = req.lines().next().unwrap_or("").to_string();
+            l2.lock().unwrap().push(first.clone());
+            if first.starts_with("POST /api/auth") {
+                Some(ok_json(LOGIN))
+            } else if first.starts_with("GET /api/stats/summary") {
+                Some(ok_json(r#"{"queries":{"total":10,"blocked":2,"percent_blocked":20.0}}"#))
+            } else if first.starts_with("GET /api/dns/blocking") {
+                Some(ok_json(r#"{"blocking":"enabled","timer":null}"#))
+            } else if first.starts_with("GET /api/history") {
+                Some(ok_json(r#"{"history":[]}"#))
+            } else if first.starts_with("GET /api/stats/upstreams") {
+                Some(ok_json(r#"{"surprise": true}"#))
+            } else if first.starts_with("DELETE") {
+                Some(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec())
+            } else {
+                None
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        ctl.send(ApiCtl::Open(true)).unwrap();
+        sleep(250);
+        let reports = api_events(&rx);
+        assert!(!reports.is_empty());
+        assert!(reports.iter().all(|r| r.status == "ok" && r.upstreams.is_none()));
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
     fn history_is_refreshed_on_its_own_slower_schedule() {
         let log: Log = Arc::default();
         let srv = fake_api(log.clone());
@@ -1197,7 +1477,7 @@ mod tests {
         h.join().unwrap();
         let polls = count(&log, "GET /api/stats/summary");
         let hist = count(&log, "GET /api/history");
-        assert!(polls >= 8, "{polls}");
+        assert!(polls >= 5, "polls every ~80 ms over 900 ms, got {polls}");
         assert!((2..=3).contains(&hist), "history every ~500 ms, got {hist} for {polls} polls");
     }
 
@@ -1327,5 +1607,24 @@ mod tests {
         ctl.send(ApiCtl::Stop).unwrap();
         h.join().unwrap();
         assert!(t0.elapsed() < Duration::from_secs(8), "bounded by the 3 s request timeout: {:?}", t0.elapsed());
+    }
+
+    /// Read-only checks against the real machine: `cargo test live_ -- --ignored`.
+    #[test]
+    #[ignore = "needs the owner's live network and config"]
+    fn live_api_liveness_and_the_gateway_mac() {
+        let cfg = crate::config::load(&util::config_path()).expect("config");
+        let p = cfg.pihole.expect("a configured Pi-hole");
+        let probe = ApiProbe { port: 443, pin: p.tls_sha256 };
+        assert_eq!(check_api(p.address, &probe, Duration::from_millis(1500)), ApiLiveness::Alive);
+        let mut wrong = probe;
+        wrong.pin[0] ^= 1;
+        assert_eq!(check_api(p.address, &wrong, Duration::from_millis(1500)), ApiLiveness::Mismatch);
+        let gw: Ipv4Addr = std::env::var("QNET_LIVE_GATEWAY").unwrap_or_else(|_| "192.168.1.1".into()).parse().unwrap();
+        let iface = std::env::var("QNET_LIVE_IFACE").unwrap_or_else(|_| "wlp7s0".into());
+        let mac = crate::neigh::mac_of(gw, &iface).expect("gateway in the neighbour table");
+        eprintln!("gateway {gw} on {iface} is {}", crate::neigh::format_mac(&mac));
+        let q = crate::rstate::real_check(p.address);
+        eprintln!("resolved's view of {}: {q:?}", p.address);
     }
 }

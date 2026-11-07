@@ -9,7 +9,8 @@
 //!   * the probes have been failing continuously for FAIL_WINDOW_MS (and at
 //!     least two in a row, so one slow probe never counts),
 //!   * the gateway answered a DNS probe at the same time (so a dead Wi-Fi
-//!     card or an unplugged cable is never mistaken for a Pi-hole outage).
+//!     card or an unplugged cable is never mistaken for a Pi-hole outage),
+//!   * the Pi-hole's pinned web API is not answering either.
 //!
 //! Recover after GOODS_TO_RECOVER consecutive good probes sent straight to
 //! the Pi-hole. A link change while failed over clears the state without
@@ -41,8 +42,12 @@ pub struct Obs {
     pub link: Option<LinkKey>,
     pub eligible: bool,
     pub pihole_ok: bool,
-    /// Gateway probe result; only meaningful when `pihole_ok` is false.
+    /// Gateway probe result; only meaningful when the Pi-hole is in trouble.
     pub gateway_ok: Option<bool>,
+    /// The Pi-hole's pinned web API answered while its DNS did not. The host
+    /// is alive, so this smells of packet loss or spoofed replies, not an
+    /// outage: do not fail over (yet).
+    pub api_alive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +174,7 @@ impl Failover {
         if self.fails >= FAILS_TO_ENGAGE
             && o.now_ms.saturating_sub(since) >= FAIL_WINDOW_MS
             && o.gateway_ok == Some(true)
+            && !o.api_alive
             && o.now_ms >= self.retry_after_ms
             && o.now_ms >= self.holddown_until_ms
         {
@@ -263,6 +269,7 @@ mod tests {
                 eligible: self.eligible,
                 pihole_ok: ok,
                 gateway_ok: gw,
+                api_alive: false,
             });
             self.t += 15_000;
             d
@@ -356,6 +363,7 @@ mod tests {
                 eligible: true,
                 pihole_ok: false,
                 gateway_ok: Some(true),
+                api_alive: false,
             }));
         }
         assert!(decisions.iter().all(|d| *d == Decision::Idle), "{decisions:?}");
@@ -369,6 +377,7 @@ mod tests {
                 eligible: true,
                 pihole_ok: false,
                 gateway_ok: Some(true),
+                api_alive: false,
             });
         }
         assert_eq!(got, Decision::Engage);
@@ -467,6 +476,7 @@ mod tests {
                 eligible: true,
                 pihole_ok: false,
                 gateway_ok: Some(true),
+                api_alive: false,
             });
             assert_eq!(d, Decision::Idle, "first 5 s after start");
         }
@@ -482,6 +492,7 @@ mod tests {
                 eligible: self.eligible,
                 pihole_ok: ok,
                 gateway_ok: gw,
+                api_alive: false,
             })
         }
     }
@@ -582,5 +593,38 @@ mod tests {
             got = r.step(15_000, false, Some(true));
         }
         assert_eq!(got, Decision::Engage);
+    }
+
+    #[test]
+    fn a_live_web_api_blocks_the_failover_until_it_goes_quiet_too() {
+        let mut r = Rig::new();
+        let alive = |r: &mut Rig| {
+            r.t += 15_000;
+            r.f.observe(&Obs {
+                now_ms: r.t,
+                link: r.link.clone(),
+                eligible: true,
+                pihole_ok: false,
+                gateway_ok: Some(true),
+                api_alive: true,
+            })
+        };
+        // DNS keeps failing for minutes, but the pinned API answers: packet
+        // loss or spoofed replies, not a dead host.
+        for _ in 0..12 {
+            assert_eq!(alive(&mut r), Decision::Idle);
+        }
+        // The API stops answering as well: now it is an outage, at once
+        // (the window of failures is long since over).
+        assert_eq!(r.fail(), Decision::Engage);
+    }
+
+    #[test]
+    fn a_degraded_pihole_is_not_held_back_by_its_own_web_api() {
+        // Canary fine, upstream failing: the API is not consulted (false).
+        let mut r = Rig::new();
+        r.fail();
+        r.fail();
+        assert_eq!(r.fail(), Decision::Engage);
     }
 }

@@ -5,7 +5,10 @@
 //! before overwriting manual DNS, active profile only, no-ops) are tested
 //! against a fake and never need the live network.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -14,7 +17,9 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{Config, DEFAULT_CANARY};
 use crate::dnsmodel::{detect_mode, manual_override, profile_pinned, Mode};
+use crate::neigh::{self, Mac};
 use crate::net::*;
+use crate::threads::{ApiLiveness, ApiProbe};
 use crate::pihole::{ApiError, Blocking, BlockingState};
 use crate::util;
 
@@ -70,12 +75,25 @@ impl From<ApiError> for ActionErr {
 
 pub type ActionResult = Result<Value, ActionErr>;
 
+/// Asks the Pi-hole's pinned web API whether its host is alive.
+pub type ApiCheck = Arc<dyn Fn(IpAddr, &ApiProbe) -> ApiLiveness + Send + Sync>;
+/// The MAC address behind an IPv4 neighbour on an interface.
+pub type MacLookup = Arc<dyn Fn(Ipv4Addr, &str) -> Option<Mac> + Send + Sync>;
+
 pub struct Ctx<'a> {
     pub be: &'a dyn NetBackend,
     pub cfg: &'a Config,
     pub state_dir: PathBuf,
+    /// `$XDG_RUNTIME_DIR/qnet`: the DNS lock and the Wi-Fi throttles.
+    pub runtime_dir: PathBuf,
     /// How long to wait for resolved to reflect a change.
     pub settle: Duration,
+    /// Set by SIGTERM/SIGINT/SIGHUP; steps finish, the next one is skipped.
+    pub term: Arc<AtomicBool>,
+    /// Fixed "now" (unix seconds) for tests.
+    pub now: Option<f64>,
+    pub api_check: ApiCheck,
+    pub mac_lookup: MacLookup,
 }
 
 impl<'a> Ctx<'a> {
@@ -84,7 +102,38 @@ impl<'a> Ctx<'a> {
             be,
             cfg,
             state_dir: util::state_dir(),
+            runtime_dir: util::runtime_qnet_dir(),
             settle: Duration::from_secs(3),
+            term: Arc::new(AtomicBool::new(false)),
+            now: None,
+            api_check: Arc::new(|addr, probe| crate::threads::check_api(addr, probe, Duration::from_millis(1500))),
+            mac_lookup: Arc::new(neigh::mac_of),
+        }
+    }
+
+    pub fn now(&self) -> f64 {
+        self.now.unwrap_or_else(util::unix_now)
+    }
+
+    pub fn interrupted(&self) -> bool {
+        self.term.load(Ordering::SeqCst)
+    }
+
+    fn check_not_interrupted(&self) -> Result<(), ActionErr> {
+        if self.interrupted() {
+            Err(ActionErr::new("interrupted", "stopped before changing anything"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Only one DNS-changing operation at a time, across processes: this
+    /// verb, another verb, or the watcher's failover.
+    fn lock_dns(&self) -> Result<util::FileLock, ActionErr> {
+        match util::try_lock(&self.runtime_dir.join("dns.lock")) {
+            Ok(Some(l)) => Ok(l),
+            Ok(None) => Err(ActionErr::new("busy", "another qnet operation is changing DNS right now")),
+            Err(e) => Err(ActionErr::new("io", format!("could not take the DNS lock: {e}"))),
         }
     }
 
@@ -125,6 +174,9 @@ pub struct PrevDns {
     /// Gateway recorded when the profile was pinned (or first seen healthy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<String>,
+    /// The gateway's MAC address when that was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_mac: Option<String>,
     /// The file only carries the gateway; there is no undo state in it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gateway_only: bool,
@@ -141,6 +193,10 @@ impl PrevDns {
     /// The recorded gateway, if it parses.
     pub fn gateway_addr(&self) -> Option<Ipv4Addr> {
         self.gateway.as_deref().and_then(|g| g.parse().ok())
+    }
+
+    pub fn gateway_mac_addr(&self) -> Option<Mac> {
+        self.gateway_mac.as_deref().and_then(neigh::parse_mac)
     }
 }
 
@@ -170,6 +226,7 @@ pub fn save_prev(dir: &Path, uuid: &str, dns: &DnsSettings, gateway: Option<Ipv4
             ipv6_dns: dns.v6_dns.iter().map(|a| a.to_string()).collect(),
             ipv6_ignore_auto_dns: dns.v6_ignore_auto,
             gateway: gateway.map(|g| g.to_string()),
+            gateway_mac: None,
             gateway_only: false,
         },
     )
@@ -183,8 +240,11 @@ pub fn load_prev(dir: &Path, uuid: &str) -> Option<PrevDns> {
     serde_json::from_str(&t).ok()
 }
 
-/// Record the gateway for a pinned profile without touching undo state.
-pub fn record_gateway(dir: &Path, uuid: &str, gateway: Ipv4Addr) -> Result<(), ActionErr> {
+/// Record which router a pinned profile belongs to: its IP *and* MAC. Keeps
+/// the undo state. Callers record this only after the Pi-hole's pinned web
+/// API has answered on that link, so a look-alike network cannot get itself
+/// trusted.
+pub fn record_link_trust(dir: &Path, uuid: &str, gateway: Ipv4Addr, mac: Mac) -> Result<(), ActionErr> {
     if !util::is_uuid(uuid) {
         return Err(ActionErr::new("invalid", "bad connection uuid"));
     }
@@ -196,10 +256,66 @@ pub fn record_gateway(dir: &Path, uuid: &str, gateway: Ipv4Addr) -> Result<(), A
         ipv6_dns: vec![],
         ipv6_ignore_auto_dns: false,
         gateway: None,
+        gateway_mac: None,
         gateway_only: true,
     });
     prev.gateway = Some(gateway.to_string());
+    prev.gateway_mac = Some(neigh::format_mac(&mac));
     write_prev(dir, &prev)
+}
+
+// ---- "Automatic is my choice" ----------------------------------------------------
+
+fn auto_path(dir: &Path) -> PathBuf {
+    dir.join("auto-dns.json")
+}
+
+/// Profiles whose Automatic DNS was chosen with `qnet dns auto`.
+pub fn auto_choices(dir: &Path) -> HashSet<String> {
+    std::fs::read_to_string(auto_path(dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+        .map(|v| v.into_iter().filter(|u| util::is_uuid(u)).collect())
+        .unwrap_or_default()
+}
+
+/// Record (or forget) that Automatic is the user's choice for `uuid`.
+pub fn set_auto_choice(dir: &Path, uuid: &str, on: bool) -> Result<(), ActionErr> {
+    if !util::is_uuid(uuid) {
+        return Err(ActionErr::new("invalid", "bad connection uuid"));
+    }
+    let mut set = auto_choices(dir);
+    let changed = if on { set.insert(uuid.to_string()) } else { set.remove(uuid) };
+    if !changed {
+        return Ok(());
+    }
+    let mut list: Vec<String> = set.into_iter().collect();
+    list.sort();
+    let bytes = serde_json::to_vec(&list).map_err(|e| ActionErr::new("io", e.to_string()))?;
+    util::atomic_write(&auto_path(dir), &bytes, 0o600)
+        .map_err(|e| ActionErr::new("io", format!("could not save the choice: {e}")))
+}
+
+#[cfg(test)]
+impl PrevDns {
+    pub fn default_for_tests(uuid: &str) -> Self {
+        PrevDns {
+            uuid: uuid.to_string(),
+            saved_at: 1,
+            ipv4_dns: vec![],
+            ipv4_ignore_auto_dns: false,
+            ipv6_dns: vec![],
+            ipv6_ignore_auto_dns: false,
+            gateway: None,
+            gateway_mac: None,
+            gateway_only: true,
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn write_prev_for_tests(dir: &Path, prev: &PrevDns) {
+    write_prev(dir, prev).unwrap();
 }
 
 fn remove_prev(dir: &Path, uuid: &str) {
@@ -369,10 +485,34 @@ fn dns_supported(dns: &DnsSettings) -> Result<(), ActionErr> {
     }
 }
 
+/// After a verified pin: record this network's router (IP and MAC), but only
+/// once the Pi-hole's pinned web API has answered here.
+fn record_trust(ctx: &Ctx<'_>, a: &Active) {
+    let (Some(gw), Some(p)) = (a.gateway, ctx.cfg.pihole.as_ref()) else { return };
+    let probe = ApiProbe { port: 443, pin: p.tls_sha256 };
+    if (ctx.api_check)(p.address, &probe) != ApiLiveness::Alive {
+        return;
+    }
+    let Some(mac) = (ctx.mac_lookup)(gw, &a.iface) else { return };
+    let _ = record_link_trust(&ctx.state_dir, &a.uuid, gw, mac);
+}
+
 /// `qnet dns pihole`: pin the active connection's saved profile to the
 /// Pi-hole and apply it. Success means the canary came back blocked through
 /// the system resolver, and only then is `verifiedVia` reported.
 pub fn dns_pihole(ctx: &Ctx<'_>, force: bool) -> ActionResult {
+    let _lock = ctx.lock_dns()?;
+    dns_pihole_locked(ctx, force)
+}
+
+fn interrupted_result(mut base: Map<String, Value>) -> Value {
+    base.insert("interrupted".into(), json!(true));
+    base.insert("blocked".into(), json!(false));
+    base.insert("verifyError".into(), json!("interrupted before the result could be checked"));
+    Value::Object(base)
+}
+
+fn dns_pihole_locked(ctx: &Ctx<'_>, force: bool) -> ActionResult {
     let pihole = ctx.pihole()?;
     let a = active_link(ctx)?;
     let servers = link_servers(ctx, &a);
@@ -382,11 +522,11 @@ pub fn dns_pihole(ctx: &Ctx<'_>, force: bool) -> ActionResult {
 
     // Already exactly in this mode: pinned, and nothing else in use.
     if mode == Mode::Pihole && pinned && expect(&servers) {
+        // Pinning is the opposite of "Automatic is my choice".
+        set_auto_choice(&ctx.state_dir, &a.uuid, false)?;
         let v = verify(ctx, &a, &expect);
         if v.blocked {
-            if let Some(gw) = a.gateway {
-                let _ = ensure_gateway_recorded(&ctx.state_dir, &a.uuid, gw);
-            }
+            record_trust(ctx, &a);
         }
         return Ok(with_verification(
             obj(&[("ok", json!(true)), ("noop", json!(true)), ("mode", json!("pihole"))]),
@@ -398,42 +538,36 @@ pub fn dns_pihole(ctx: &Ctx<'_>, force: bool) -> ActionResult {
     if manual_override(&a.profile.dns, pihole) && !force {
         return Err(confirm_err(&a.profile, Some(pihole), "pinning the Pi-hole"));
     }
+    ctx.check_not_interrupted()?;
     let mut wrote_profile = false;
     if !pinned {
-        save_prev(&ctx.state_dir, &a.uuid, &a.profile.dns, a.gateway)?;
+        // The router is recorded later, once the pinned API has answered.
+        save_prev(&ctx.state_dir, &a.uuid, &a.profile.dns, None)?;
         ctx.be.set_profile_dns(&a.uuid, &a.profile.dns.pinned_to(pihole))?;
         wrote_profile = true;
     }
-    // Also when the profile was already pinned but the device is running
-    // something else (a runtime failover): apply the saved profile.
+    set_auto_choice(&ctx.state_dir, &a.uuid, false)?;
+    // A written profile is always applied, signal or not: half a step would
+    // leave the saved and the running DNS disagreeing.
     ctx.be.reapply_saved(&a.iface)?;
+    let base = obj(&[
+        ("ok", json!(true)),
+        ("mode", json!("pihole")),
+        ("profileChanged", json!(wrote_profile)),
+    ]);
+    if ctx.interrupted() {
+        return Ok(interrupted_result(base));
+    }
     let v = verify(ctx, &a, &expect);
-    if v.blocked && !wrote_profile {
-        if let Some(gw) = a.gateway {
-            let _ = ensure_gateway_recorded(&ctx.state_dir, &a.uuid, gw);
-        }
+    if v.blocked {
+        record_trust(ctx, &a);
     }
-    Ok(with_verification(
-        obj(&[
-            ("ok", json!(true)),
-            ("mode", json!("pihole")),
-            ("profileChanged", json!(wrote_profile)),
-        ]),
-        v,
-        true,
-    ))
-}
-
-/// Record the gateway for `uuid` unless one is already on file.
-pub fn ensure_gateway_recorded(dir: &Path, uuid: &str, gw: Ipv4Addr) -> Result<(), ActionErr> {
-    if load_prev(dir, uuid).and_then(|p| p.gateway_addr()).is_some() {
-        return Ok(());
-    }
-    record_gateway(dir, uuid, gw)
+    Ok(with_verification(base, v, true))
 }
 
 /// `qnet dns auto`: back to automatic DNS on the active profile.
 pub fn dns_auto(ctx: &Ctx<'_>, force: bool) -> ActionResult {
+    let _lock = ctx.lock_dns()?;
     let pihole = ctx.cfg.pihole.as_ref().map(|p| p.address);
     let a = active_link(ctx)?;
     let servers = link_servers(ctx, &a);
@@ -443,6 +577,9 @@ pub fn dns_auto(ctx: &Ctx<'_>, force: bool) -> ActionResult {
         None => true,
     };
     if mode == Mode::Auto {
+        // Tapping Automatic while on Automatic still says "I want this",
+        // which is what clears the "you did not choose this" warning.
+        set_auto_choice(&ctx.state_dir, &a.uuid, true)?;
         let v = verify(ctx, &a, &|_| true);
         return Ok(with_verification(
             obj(&[("ok", json!(true)), ("noop", json!(true)), ("mode", json!("auto"))]),
@@ -460,25 +597,29 @@ pub fn dns_auto(ctx: &Ctx<'_>, force: bool) -> ActionResult {
     if has_foreign && !force {
         return Err(confirm_err(&a.profile, pihole, "switching to automatic DNS"));
     }
+    ctx.check_not_interrupted()?;
     let prev = load_prev(&ctx.state_dir, &a.uuid);
     // Restoring the saved settings only makes sense when they were
     // automatic; Automatic must mean automatic whatever came before.
     let restored = prev.as_ref().is_some_and(|p| !p.gateway_only && p.is_automatic());
+    // Written first, so the watcher, which reacts to the profile change, can
+    // already see that this Automatic is on purpose.
+    set_auto_choice(&ctx.state_dir, &a.uuid, true)?;
     ctx.be.set_profile_dns(&a.uuid, &a.profile.dns.automatic())?;
     ctx.be.reapply_saved(&a.iface)?;
     if restored {
         remove_prev(&ctx.state_dir, &a.uuid);
     }
+    let base = obj(&[
+        ("ok", json!(true)),
+        ("mode", json!("auto")),
+        ("restoredPrevious", json!(restored)),
+    ]);
+    if ctx.interrupted() {
+        return Ok(interrupted_result(base));
+    }
     let v = verify(ctx, &a, &expect);
-    Ok(with_verification(
-        obj(&[
-            ("ok", json!(true)),
-            ("mode", json!("auto")),
-            ("restoredPrevious", json!(restored)),
-        ]),
-        v,
-        false,
-    ))
+    Ok(with_verification(base, v, false))
 }
 
 fn is_active_uuid(ctx: &Ctx<'_>, uuid: &str) -> Result<bool, ActionErr> {
@@ -491,7 +632,7 @@ fn is_active_uuid(ctx: &Ctx<'_>, uuid: &str) -> Result<bool, ActionErr> {
 }
 
 /// Pin one saved profile that is not in use: write it, do not apply it.
-/// Returns the result fields; `Ok(None)` for "already pinned".
+/// Returns the profile's name and whether anything changed.
 fn pin_inactive(ctx: &Ctx<'_>, uuid: &str, force: bool) -> Result<(String, bool), ActionErr> {
     let pihole = ctx.pihole()?;
     let profile = ctx
@@ -504,13 +645,16 @@ fn pin_inactive(ctx: &Ctx<'_>, uuid: &str, force: bool) -> Result<(String, bool)
         return Err(ActionErr::new("invalid", "only Wi-Fi and Ethernet profiles can be pinned"));
     }
     if profile_pinned(&profile.dns, pihole) {
+        set_auto_choice(&ctx.state_dir, uuid, false)?;
         return Ok((profile.id, false));
     }
     dns_supported(&profile.dns)?;
     if manual_override(&profile.dns, pihole) && !force {
         return Err(confirm_err(&profile, Some(pihole), "pinning the Pi-hole"));
     }
+    ctx.check_not_interrupted()?;
     save_prev(&ctx.state_dir, uuid, &profile.dns, None)?;
+    set_auto_choice(&ctx.state_dir, uuid, false)?;
     ctx.be.set_profile_dns(uuid, &profile.dns.pinned_to(pihole))?;
     Ok((profile.id, true))
 }
@@ -535,8 +679,9 @@ pub fn dns_pin(ctx: &Ctx<'_>, uuid: &str, force: bool) -> ActionResult {
         return Err(ActionErr::new("invalid", "not a connection uuid"));
     }
     ctx.pihole()?;
+    let _lock = ctx.lock_dns()?;
     if is_active_uuid(ctx, uuid)? {
-        return dns_pihole(ctx, force);
+        return dns_pihole_locked(ctx, force);
     }
     let (name, changed) = pin_inactive(ctx, uuid, force)?;
     if !changed {
@@ -564,15 +709,18 @@ pub fn dns_pin_many(ctx: &Ctx<'_>, uuids: &[String], force: bool) -> ActionResul
         return dns_pin(ctx, &uuids[0], force);
     }
     ctx.pihole()?;
+    let _lock = ctx.lock_dns()?;
     let mut results: Vec<Value> = Vec::new();
     let mut failed = 0usize;
     let mut applied_active = false;
     for u in uuids {
-        let one: ActionResult = if !util::is_uuid(u) {
+        let one: ActionResult = if ctx.interrupted() {
+            Err(ActionErr::new("interrupted", "stopped before this profile"))
+        } else if !util::is_uuid(u) {
             Err(ActionErr::new("invalid", "not a connection uuid"))
         } else if is_active_uuid(ctx, u)? {
             applied_active = true;
-            dns_pihole(ctx, force)
+            dns_pihole_locked(ctx, force)
         } else {
             pin_inactive(ctx, u, force).map(|(name, changed)| {
                 json!({"ok": true, "connection": name, "noop": !changed, "applied": false})
@@ -595,7 +743,7 @@ pub fn dns_pin_many(ctx: &Ctx<'_>, uuids: &[String], force: bool) -> ActionResul
         }
     }
     let mut summary = obj(&[("ok", json!(failed == 0)), ("results", json!(results))]);
-    if !applied_active {
+    if !applied_active && !ctx.interrupted() {
         let v = verify_current_link(ctx);
         summary.insert("verifiedVia".into(), json!(v.via.unwrap_or_default()));
         if let Some(e) = v.error {
@@ -763,9 +911,46 @@ pub fn wifi_forget(ctx: &Ctx<'_>, uuid: &str) -> ActionResult {
     Ok(json!({"ok": true, "connection": profile.id}))
 }
 
-pub const SCAN_MIN_AGE_MS: u64 = 15_000;
+/// Two scans closer together than this are refused (the card is fragile).
+pub const SCAN_MIN_GAP_S: f64 = 15.0;
+/// Two radio switches closer together than this are refused.
+pub const RADIO_MIN_GAP_S: f64 = 10.0;
 
-pub fn wifi_scan(ctx: &Ctx<'_>) -> ActionResult {
+fn stamp_path(ctx: &Ctx<'_>, name: &str) -> PathBuf {
+    ctx.runtime_dir.join(name)
+}
+
+/// When a guarded operation last happened (unix seconds), from a small file
+/// shared by every qnet process.
+fn read_stamp(path: &Path) -> Option<f64> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    v.get("at")?.as_f64().filter(|t| t.is_finite())
+}
+
+fn write_stamp(path: &Path, at: f64) {
+    if let Some(dir) = path.parent() {
+        if util::ensure_private_dir(dir).is_err() {
+            return;
+        }
+    }
+    // Best effort: failing to note it only weakens the guard.
+    let _ = util::atomic_write(path, json!({ "at": at }).to_string().as_bytes(), 0o600);
+}
+
+fn too_soon(wait_s: f64) -> ActionErr {
+    let retry = wait_s.ceil().max(1.0) as u64;
+    let mut e = ActionErr::new("too-soon", format!("try again in {retry} s"));
+    e.extra = Some(json!({ "retryInS": retry }));
+    e
+}
+
+/// `qnet wifi scan [--if-stale <secs>]`.
+///
+/// A scan is refused as `too-soon` unless both NM's `LastScan` and qnet's own
+/// last request are at least 15 s old. With `if_stale`, nothing at all is done
+/// (`skipped`) while either is younger than that many seconds; the 15 s rule
+/// still applies on top.
+pub fn wifi_scan(ctx: &Ctx<'_>, if_stale: Option<u64>) -> ActionResult {
     let snap = ctx.be.snapshot(false)?;
     if !snap.wifi_enabled {
         return Err(ActionErr::new("radio", "Wi-Fi is turned off"));
@@ -773,15 +958,30 @@ pub fn wifi_scan(ctx: &Ctx<'_>) -> ActionResult {
     let dev = snap
         .wifi_device()
         .ok_or_else(|| ActionErr::new("nowifi", "no Wi-Fi device"))?;
-    let age = dev.wifi.as_ref().and_then(|w| w.last_scan_age_ms);
-    if let Some(a) = age {
-        if a < SCAN_MIN_AGE_MS {
-            return Ok(json!({
-                "ok": true, "scanned": false, "throttled": true, "lastScanAgeS": a / 1000
-            }));
+    let own_path = stamp_path(ctx, "scan");
+    let nm_age = dev
+        .wifi
+        .as_ref()
+        .and_then(|w| w.last_scan_age_ms)
+        .map(|ms| ms as f64 / 1000.0);
+    let own_age = read_stamp(&own_path).map(|t| (ctx.now() - t).max(0.0));
+    // The most recent scan from either source; None means never.
+    let youngest = match (nm_age, own_age) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    if let (Some(limit), Some(age)) = (if_stale, youngest) {
+        if age < limit as f64 {
+            return Ok(json!({"ok": true, "skipped": true, "lastScanAgeS": age as u64}));
+        }
+    }
+    if let Some(age) = youngest {
+        if age < SCAN_MIN_GAP_S {
+            return Err(too_soon(SCAN_MIN_GAP_S - age));
         }
     }
     ctx.be.request_scan(&dev.iface)?;
+    write_stamp(&own_path, ctx.now());
     Ok(json!({"ok": true, "scanned": true}))
 }
 
@@ -793,7 +993,16 @@ pub fn wifi_radio(ctx: &Ctx<'_>, on: bool) -> ActionResult {
     if snap.wifi_enabled == on {
         return Ok(json!({"ok": true, "noop": true, "wifiEnabled": on}));
     }
+    // Flipping the radio of a fragile card back and forth is how it dies.
+    let path = stamp_path(ctx, "radio");
+    if let Some(at) = read_stamp(&path) {
+        let since = (ctx.now() - at).max(0.0);
+        if since < RADIO_MIN_GAP_S {
+            return Err(too_soon(RADIO_MIN_GAP_S - since));
+        }
+    }
     ctx.be.set_wifi_enabled(on)?;
+    write_stamp(&path, ctx.now());
     Ok(json!({"ok": true, "wifiEnabled": on}))
 }
 
@@ -928,12 +1137,21 @@ mod tests {
 
     // -- DNS verbs against the fake -----------------------------------------
 
+    const MAC: Mac = [0x3c, 0x52, 0xa1, 0x00, 0x11, 0x22];
+
+    /// A context on temp dirs, with the Pi-hole's web API "alive" and the
+    /// router's MAC known, and no real network anywhere.
     fn ctx<'a>(be: &'a FakeNet, cfg: &'a Config, dir: &Path) -> Ctx<'a> {
         Ctx {
             be,
             cfg,
             state_dir: dir.to_path_buf(),
+            runtime_dir: dir.join("run"),
             settle: Duration::from_millis(200),
+            term: Arc::new(AtomicBool::new(false)),
+            now: Some(1_800_000_000.0),
+            api_check: Arc::new(|_, _| ApiLiveness::Alive),
+            mac_lookup: Arc::new(|_, _| Some(MAC)),
         }
     }
 
@@ -1173,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gateway_is_recorded_when_pinning_and_kept_across_undo_saves() {
+    fn the_router_ip_and_mac_are_recorded_after_a_verified_pin_and_kept_with_the_undo_state() {
         let dir = tempfile::tempdir().unwrap();
         let be = FakeNet::live_machine();
         let cfg = fake_cfg();
@@ -1181,34 +1399,81 @@ mod tests {
         dns_pihole(&ctx(&be, &cfg, dir.path()), false).unwrap();
         let prev = load_prev(dir.path(), U_WIFI).unwrap();
         assert_eq!(prev.gateway_addr(), Some("192.168.1.1".parse().unwrap()));
+        assert_eq!(prev.gateway_mac_addr(), Some(MAC));
         assert!(!prev.gateway_only);
         assert!(prev.is_automatic(), "undo state still there");
-        // The raw file carries both, in one place.
         let raw: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("prev-dns").join(format!("{U_WIFI}.json"))).unwrap(),
         )
         .unwrap();
         assert_eq!(raw["gateway"], "192.168.1.1");
+        assert_eq!(raw["gateway_mac"], "3c:52:a1:00:11:22");
         assert!(raw.get("gateway_only").is_none());
     }
 
     #[test]
-    fn already_pinned_profiles_get_their_gateway_recorded_once() {
+    fn nothing_is_recorded_unless_the_pinned_web_api_answered_on_this_link() {
+        for liveness in [ApiLiveness::Dead, ApiLiveness::Mismatch, ApiLiveness::Other] {
+            let dir = tempfile::tempdir().unwrap();
+            let be = FakeNet::live_machine();
+            let cfg = fake_cfg();
+            let mut c = ctx(&be, &cfg, dir.path());
+            c.api_check = Arc::new(move |_, _| liveness);
+            let r = dns_pihole(&c, false).unwrap();
+            assert_eq!(r["blocked"], true, "the pin itself still works");
+            assert!(load_prev(dir.path(), U_WIFI).is_none(), "{liveness:?}: no record");
+        }
+        // And no MAC, no record: a half-record would not satisfy the router rule anyway.
         let dir = tempfile::tempdir().unwrap();
         let be = FakeNet::live_machine();
         let cfg = fake_cfg();
-        // First no-op tap on a pinned profile with no record yet.
+        let mut c = ctx(&be, &cfg, dir.path());
+        c.mac_lookup = Arc::new(|_, _| None);
+        dns_pihole(&c, false).unwrap();
+        assert!(load_prev(dir.path(), U_WIFI).is_none());
+        // Nor when the canary was not blocked (the Pi-hole is not what answered).
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        be.set_canary_answer("142.250.74.14");
+        dns_pihole(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        assert!(load_prev(dir.path(), U_WIFI).is_none());
+    }
+
+    #[test]
+    fn already_pinned_profiles_get_their_router_recorded_on_a_no_op_tap() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
         dns_pihole(&ctx(&be, &cfg, dir.path()), false).unwrap();
         let prev = load_prev(dir.path(), U_WIFI).unwrap();
-        assert!(prev.gateway_only, "only the gateway is on file; there is no undo state");
-        assert_eq!(prev.gateway_addr(), Some("192.168.1.1".parse().unwrap()));
-        // A gateway-only file is not "previous settings".
+        assert!(prev.gateway_only, "only the router is on file; there is no undo state");
+        assert_eq!(prev.gateway_mac_addr(), Some(MAC));
+        // A router-only file is not "previous settings".
         let r = dns_auto(&ctx(&be, &cfg, dir.path()), false).unwrap();
         assert_eq!(r["restoredPrevious"], false);
-        // An existing record is never overwritten by ensure_gateway_recorded.
-        ensure_gateway_recorded(dir.path(), U_ETH1, "10.0.0.1".parse().unwrap()).unwrap();
-        ensure_gateway_recorded(dir.path(), U_ETH1, "10.9.9.9".parse().unwrap()).unwrap();
-        assert_eq!(load_prev(dir.path(), U_ETH1).unwrap().gateway_addr(), Some("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn recording_keeps_undo_state_and_replaces_the_router() {
+        let dir = tempfile::tempdir().unwrap();
+        let dns = DnsSettings {
+            v4_method: "auto".into(),
+            v4_dns: vec!["9.9.9.9".parse().unwrap()],
+            v4_ignore_auto: true,
+            v6_method: "auto".into(),
+            v6_dns: vec![],
+            v6_ignore_auto: false,
+        };
+        save_prev(dir.path(), U_ETH1, &dns, None).unwrap();
+        record_link_trust(dir.path(), U_ETH1, "10.0.0.1".parse().unwrap(), MAC).unwrap();
+        let p = load_prev(dir.path(), U_ETH1).unwrap();
+        assert_eq!(p.ipv4_dns, vec!["9.9.9.9"], "undo state untouched");
+        assert!(!p.gateway_only);
+        record_link_trust(dir.path(), U_ETH1, "10.9.9.9".parse().unwrap(), [1, 2, 3, 4, 5, 6]).unwrap();
+        let p = load_prev(dir.path(), U_ETH1).unwrap();
+        assert_eq!(p.gateway_addr(), Some("10.9.9.9".parse().unwrap()));
+        assert_eq!(p.gateway_mac_addr(), Some([1, 2, 3, 4, 5, 6]));
+        assert!(record_link_trust(dir.path(), "../x", "10.9.9.9".parse().unwrap(), MAC).is_err());
     }
 
     #[test]
@@ -1393,21 +1658,105 @@ mod tests {
         assert_eq!(e.code, "auth");
     }
 
+    fn scans(be: &FakeNet) -> usize {
+        be.calls().iter().filter(|c| c.starts_with("request_scan")).count()
+    }
+
     #[test]
-    fn scan_is_throttled_by_nm_last_scan() {
+    fn scan_within_fifteen_seconds_of_nms_last_scan_is_too_soon_not_ok() {
         let dir = tempfile::tempdir().unwrap();
         let be = FakeNet::live_machine();
         let cfg = fake_cfg();
         be.set_last_scan_age_ms(Some(5_000));
-        let r = wifi_scan(&ctx(&be, &cfg, dir.path())).unwrap();
-        assert_eq!(r["throttled"], true);
-        assert!(!be.calls().iter().any(|c| c.starts_with("request_scan")));
+        let e = wifi_scan(&ctx(&be, &cfg, dir.path()), None).unwrap_err();
+        assert_eq!(e.code, "too-soon");
+        let j = e.to_json();
+        assert_eq!(j["ok"], false);
+        assert_eq!(j["retryInS"], 10);
+        assert_eq!(scans(&be), 0, "nothing was requested");
         be.set_last_scan_age_ms(Some(40_000));
-        let r = wifi_scan(&ctx(&be, &cfg, dir.path())).unwrap();
+        let r = wifi_scan(&ctx(&be, &cfg, dir.path()), None).unwrap();
         assert_eq!(r["scanned"], true);
-        assert_eq!(be.calls().iter().filter(|c| c.starts_with("request_scan")).count(), 1);
+        assert_eq!(scans(&be), 1);
+        // NM has never scanned: fine, and the first request is not throttled.
+        let dir = tempfile::tempdir().unwrap();
         be.set_last_scan_age_ms(None);
-        assert_eq!(wifi_scan(&ctx(&be, &cfg, dir.path())).unwrap()["scanned"], true);
+        assert_eq!(wifi_scan(&ctx(&be, &cfg, dir.path()), None).unwrap()["scanned"], true);
+    }
+
+    #[test]
+    fn scan_also_throttles_on_qnets_own_last_request_even_if_nm_says_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        be.set_last_scan_age_ms(Some(120_000));
+        let mut c = ctx(&be, &cfg, dir.path());
+        assert_eq!(wifi_scan(&c, None).unwrap()["scanned"], true);
+        assert_eq!(scans(&be), 1);
+        // NM has not yet reported the scan (its LastScan is still old), but
+        // we asked 4 s ago: wait.
+        c.now = Some(c.now() + 4.0);
+        let e = wifi_scan(&c, None).unwrap_err();
+        assert_eq!(e.code, "too-soon");
+        assert_eq!(e.to_json()["retryInS"], 11);
+        assert_eq!(scans(&be), 1);
+        c.now = Some(c.now() + 11.0);
+        assert_eq!(wifi_scan(&c, None).unwrap()["scanned"], true);
+        assert_eq!(scans(&be), 2);
+    }
+
+    #[test]
+    fn a_failed_scan_request_is_not_noted() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        be.set_last_scan_age_ms(Some(120_000));
+        be.fail_scan(Some(NetError::Denied("polkit".into())));
+        let c = ctx(&be, &cfg, dir.path());
+        assert_eq!(wifi_scan(&c, None).unwrap_err().code, "denied");
+        be.fail_scan(None);
+        assert_eq!(wifi_scan(&c, None).unwrap()["scanned"], true, "the failure did not start the clock");
+    }
+
+    #[test]
+    fn scan_if_stale_skips_while_either_clock_is_young_and_still_obeys_the_throttle() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        let mut c = ctx(&be, &cfg, dir.path());
+        // NM scanned 30 s ago, limit 60: skipped, and says how old.
+        be.set_last_scan_age_ms(Some(30_000));
+        let r = wifi_scan(&c, Some(60)).unwrap();
+        assert_eq!(r, json!({"ok": true, "skipped": true, "lastScanAgeS": 30}));
+        assert_eq!(scans(&be), 0);
+        // NM scanned 70 s ago: due.
+        be.set_last_scan_age_ms(Some(70_000));
+        assert_eq!(wifi_scan(&c, Some(60)).unwrap()["scanned"], true);
+        assert_eq!(scans(&be), 1);
+        // Our own request counts: NM's clock still says 70 s, ours says 20 s.
+        c.now = Some(c.now() + 20.0);
+        let r = wifi_scan(&c, Some(60)).unwrap();
+        assert_eq!(r, json!({"ok": true, "skipped": true, "lastScanAgeS": 20}));
+        assert_eq!(scans(&be), 1);
+        // ...until both are older than the limit.
+        c.now = Some(c.now() + 45.0);
+        assert_eq!(wifi_scan(&c, Some(60)).unwrap()["scanned"], true);
+        assert_eq!(scans(&be), 2);
+    }
+
+    #[test]
+    fn scan_if_stale_with_a_short_limit_still_hits_the_fifteen_second_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        be.set_last_scan_age_ms(Some(10_000));
+        // 10 s is older than 5 s, so the scan is "due", but too young to repeat.
+        let e = wifi_scan(&ctx(&be, &cfg, dir.path()), Some(5)).unwrap_err();
+        assert_eq!(e.code, "too-soon");
+        assert_eq!(scans(&be), 0);
+        // Never scanned: due, and allowed.
+        be.set_last_scan_age_ms(None);
+        assert_eq!(wifi_scan(&ctx(&be, &cfg, dir.path()), Some(60)).unwrap()["scanned"], true);
     }
 
     #[test]
@@ -1416,7 +1765,8 @@ mod tests {
         let be = FakeNet::live_machine();
         be.set_wifi_enabled(false).unwrap();
         let cfg = fake_cfg();
-        assert_eq!(wifi_scan(&ctx(&be, &cfg, dir.path())).unwrap_err().code, "radio");
+        assert_eq!(wifi_scan(&ctx(&be, &cfg, dir.path()), None).unwrap_err().code, "radio");
+        assert_eq!(wifi_scan(&ctx(&be, &cfg, dir.path()), Some(60)).unwrap_err().code, "radio");
     }
 
     #[test]
@@ -1446,6 +1796,48 @@ mod tests {
     }
 
     #[test]
+    fn a_second_radio_change_within_ten_seconds_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        let mut c = ctx(&be, &cfg, dir.path());
+        assert_eq!(wifi_radio(&c, false).unwrap()["wifiEnabled"], false);
+        let switches = |be: &FakeNet| be.calls().iter().filter(|c| c.starts_with("set_wifi_enabled")).count();
+        assert_eq!(switches(&be), 1);
+        // Straight back on: too soon.
+        c.now = Some(c.now() + 3.0);
+        let e = wifi_radio(&c, true).unwrap_err();
+        assert_eq!(e.code, "too-soon");
+        let j = e.to_json();
+        assert_eq!((j["ok"].clone(), j["error"].clone(), j["retryInS"].clone()), (json!(false), json!("too-soon"), json!(7)));
+        assert_eq!(switches(&be), 1, "the radio was not touched");
+        // A no-op request is not a change and is never refused.
+        assert_eq!(wifi_radio(&c, false).unwrap()["noop"], true);
+        // After ten seconds it goes through, and starts the clock again.
+        c.now = Some(c.now() + 8.0);
+        assert_eq!(wifi_radio(&c, true).unwrap()["wifiEnabled"], true);
+        assert_eq!(switches(&be), 2);
+        c.now = Some(c.now() + 1.0);
+        assert_eq!(wifi_radio(&c, false).unwrap_err().code, "too-soon");
+    }
+
+    #[test]
+    fn the_radio_guard_is_shared_between_processes_through_the_runtime_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        wifi_radio(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        // A brand-new Ctx (another process) sees the same stamp.
+        let c2 = ctx(&be, &cfg, dir.path());
+        assert_eq!(wifi_radio(&c2, true).unwrap_err().code, "too-soon");
+        let stamp = std::fs::read_to_string(dir.path().join("run").join("radio")).unwrap();
+        assert!(stamp.contains("\"at\""));
+        // A corrupt stamp does not wedge the radio.
+        std::fs::write(dir.path().join("run").join("radio"), "garbage").unwrap();
+        assert_eq!(wifi_radio(&c2, true).unwrap()["wifiEnabled"], true);
+    }
+
+    #[test]
     fn down_needs_a_connected_wifi() {
         let dir = tempfile::tempdir().unwrap();
         let be = FakeNet::live_machine();
@@ -1454,5 +1846,188 @@ mod tests {
         assert_eq!(wifi_down(&c).unwrap()["ok"], true);
         be.set_link_down();
         assert_eq!(wifi_down(&c).unwrap_err().code, "nolink");
+    }
+
+    // -- one DNS change at a time -----------------------------------------------
+
+    fn hold_dns_lock(dir: &Path) -> util::FileLock {
+        util::try_lock(&dir.join("run").join("dns.lock")).unwrap().expect("free")
+    }
+
+    #[test]
+    fn every_dns_verb_is_busy_while_another_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        be.set_profile_dns_direct(U_ETH1, be.profile(U_ETH1).dns.automatic());
+        let cfg = fake_cfg();
+        let c = ctx(&be, &cfg, dir.path());
+        let _held = hold_dns_lock(dir.path());
+        let before = be.writes();
+        for r in [
+            dns_pihole(&c, false),
+            dns_auto(&c, false),
+            dns_auto(&c, true),
+            dns_pin(&c, U_ETH1, false),
+            dns_pin(&c, U_WIFI, false),
+            dns_pin_many(&c, &[U_ETH1.into(), U_ETH2.into()], false),
+        ] {
+            let e = r.unwrap_err();
+            assert_eq!(e.code, "busy", "{e:?}");
+            assert_eq!(e.to_json(), json!({"ok": false, "error": "busy", "detail": "another qnet operation is changing DNS right now"}));
+        }
+        assert_eq!(be.writes(), before, "a busy verb touches nothing");
+        assert!(!dir.path().join("auto-dns.json").exists());
+    }
+
+    #[test]
+    fn the_lock_is_released_after_each_verb() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        let c = ctx(&be, &cfg, dir.path());
+        dns_pihole(&c, false).unwrap();
+        assert!(util::try_lock(&dir.path().join("run").join("dns.lock")).unwrap().is_some());
+        dns_auto(&c, false).unwrap();
+        assert!(util::try_lock(&dir.path().join("run").join("dns.lock")).unwrap().is_some());
+        // Even a refused verb lets go.
+        let _ = dns_pihole(&ctx(&be, &Config::default(), dir.path()), false);
+        assert!(util::try_lock(&dir.path().join("run").join("dns.lock")).unwrap().is_some());
+        // Non-DNS verbs never wait for it.
+        let _held = hold_dns_lock(dir.path());
+        assert!(wifi_scan(&c, None).is_ok() || wifi_scan(&c, None).unwrap_err().code != "busy");
+    }
+
+    // -- SIGTERM ------------------------------------------------------------------
+
+    #[test]
+    fn an_interrupt_before_the_first_write_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        be.set_profile_dns_direct(U_WIFI, be.profile(U_WIFI).dns.automatic());
+        be.apply_saved_to_link();
+        let cfg = fake_cfg();
+        let c = ctx(&be, &cfg, dir.path());
+        c.term.store(true, Ordering::SeqCst);
+        let before = be.writes();
+        let e = dns_pihole(&c, false).unwrap_err();
+        assert_eq!(e.code, "interrupted");
+        assert_eq!(be.writes(), before);
+        assert!(!dir.path().join("prev-dns").exists(), "not even undo state");
+        // Pin-many stops between profiles.
+        let e = dns_pin_many(&c, &[U_ETH1.into(), U_ETH2.into()], false).unwrap_err();
+        assert_eq!(e.code, "partial");
+        assert!(e.extra.as_ref().unwrap()["results"].as_array().unwrap().iter().all(|r| r["error"] == "interrupted"));
+        assert_eq!(be.writes(), before);
+    }
+
+    #[test]
+    fn an_interrupt_in_the_middle_finishes_the_step_and_skips_the_check() {
+        // The signal arrives right after the profile is written.
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        be.set_profile_dns_direct(U_WIFI, be.profile(U_WIFI).dns.automatic());
+        be.apply_saved_to_link();
+        let cfg = fake_cfg();
+        let c = ctx(&be, &cfg, dir.path());
+        be.trip_after_profile_write(c.term.clone());
+        let r = dns_pihole(&c, false).unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["interrupted"], true);
+        assert_eq!(r["blocked"], false);
+        assert!(r.get("verifiedVia").is_none(), "no claim without a check");
+        // Saved profile and running DNS agree: written *and* applied.
+        assert!(crate::dnsmodel::profile_pinned(&be.profile(U_WIFI).dns, crate::dnsmodel::fixtures::pi()));
+        assert!(be.calls().iter().any(|c| c == "reapply_saved wlp7s0"));
+        assert_eq!(be.link_servers(), vec![crate::dnsmodel::fixtures::pi()]);
+        assert!(!be.calls().iter().any(|c| c.starts_with("resolve ")), "no verification query was sent");
+        assert!(util::try_lock(&dir.path().join("run").join("dns.lock")).unwrap().is_some());
+    }
+
+    #[test]
+    fn dns_auto_interrupted_after_the_write_also_applies_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        let c = ctx(&be, &cfg, dir.path());
+        be.trip_after_profile_write(c.term.clone());
+        let r = dns_auto(&c, false).unwrap();
+        assert_eq!(r["interrupted"], true);
+        assert!(be.profile(U_WIFI).dns.is_automatic());
+        assert!(be.calls().iter().any(|c| c == "reapply_saved wlp7s0"));
+        assert!(auto_choices(dir.path()).contains(U_WIFI));
+    }
+
+    #[test]
+    fn an_interrupted_activation_wait_is_reported_as_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        be.fail_next_activation(NetError::Interrupted("stopped while waiting".into()));
+        let cfg = fake_cfg();
+        let e = wifi_connect(&ctx(&be, &cfg, dir.path()), AP_NEW, Some("correct horse battery")).unwrap_err();
+        assert_eq!(e.code, "interrupted");
+    }
+
+    // -- "Automatic is my choice" -------------------------------------------------
+
+    #[test]
+    fn dns_auto_records_the_choice_and_pinning_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        let c = ctx(&be, &cfg, dir.path());
+        assert!(auto_choices(dir.path()).is_empty());
+        dns_auto(&c, false).unwrap();
+        assert!(auto_choices(dir.path()).contains(U_WIFI));
+        let raw = std::fs::read_to_string(dir.path().join("auto-dns.json")).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<String>>(&raw).unwrap(), vec![U_WIFI]);
+        dns_pihole(&c, false).unwrap();
+        assert!(auto_choices(dir.path()).is_empty(), "pinning is the opposite choice");
+        // Tapping Automatic while already on Automatic records it too.
+        dns_auto(&c, false).unwrap();
+        let r = dns_auto(&c, false).unwrap();
+        assert_eq!(r["noop"], true);
+        assert!(auto_choices(dir.path()).contains(U_WIFI));
+    }
+
+    #[test]
+    fn a_noop_tap_on_automatic_records_the_choice_for_a_cable_that_came_up_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        // The link is on automatic DNS, but nobody asked for that.
+        be.set_profile_dns_direct(U_WIFI, be.profile(U_WIFI).dns.automatic());
+        be.apply_saved_to_link();
+        let cfg = fake_cfg();
+        assert!(auto_choices(dir.path()).is_empty());
+        let r = dns_auto(&ctx(&be, &cfg, dir.path()), false).unwrap();
+        assert_eq!(r["noop"], true);
+        assert_eq!(be.writes(), 0, "no DNS change");
+        assert!(auto_choices(dir.path()).contains(U_WIFI));
+    }
+
+    #[test]
+    fn pinning_an_inactive_profile_forgets_its_automatic_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FakeNet::live_machine();
+        let cfg = fake_cfg();
+        set_auto_choice(dir.path(), U_ETH1, true).unwrap();
+        dns_pin(&ctx(&be, &cfg, dir.path()), U_ETH1, false).unwrap();
+        assert!(!auto_choices(dir.path()).contains(U_ETH1));
+    }
+
+    #[test]
+    fn auto_choice_file_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        set_auto_choice(dir.path(), U_WIFI, true).unwrap();
+        set_auto_choice(dir.path(), U_ETH1, true).unwrap();
+        set_auto_choice(dir.path(), U_WIFI, true).unwrap();
+        assert_eq!(auto_choices(dir.path()).len(), 2);
+        set_auto_choice(dir.path(), U_WIFI, false).unwrap();
+        assert_eq!(auto_choices(dir.path()), HashSet::from([U_ETH1.to_string()]));
+        assert!(set_auto_choice(dir.path(), "../x", true).is_err());
+        // Garbage and bad entries are ignored.
+        std::fs::write(dir.path().join("auto-dns.json"), r#"["../evil", "21307067-f47b-43ea-8c9c-2c746454b2bb"]"#).unwrap();
+        assert_eq!(auto_choices(dir.path()), HashSet::from([U_WIFI.to_string()]));
+        std::fs::write(dir.path().join("auto-dns.json"), "not json").unwrap();
+        assert!(auto_choices(dir.path()).is_empty());
     }
 }

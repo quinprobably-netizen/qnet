@@ -27,6 +27,8 @@ pub type Settings = HashMap<String, Dict>;
 
 pub struct DbusBackend {
     conn: Connection,
+    /// Set by SIGTERM in a one-shot verb: waiting loops give up.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl DbusBackend {
@@ -36,7 +38,19 @@ impl DbusBackend {
             .method_timeout(Duration::from_secs(15))
             .build()
             .map_err(map_err)?;
-        Ok(Self { conn })
+        Ok(Self { conn, cancel: None })
+    }
+
+    /// Let `flag` cut the waits short (activation polling).
+    pub fn with_cancel(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn call<B>(&self, dest: &str, path: &str, iface: &str, method: &str, body: &B) -> NetResult<zbus::Message>
@@ -192,6 +206,9 @@ impl DbusBackend {
                         .and_then(|v| reason_code(&v));
                     return Err(activation_error(reason));
                 }
+            }
+            if self.cancelled() {
+                return Err(NetError::Interrupted("stopped while waiting for the connection".into()));
             }
             if start.elapsed() >= timeout {
                 return Err(NetError::Timeout("the connection did not come up".into()));
@@ -365,6 +382,19 @@ fn parse_current_ex(v: &Value<'_>) -> Option<IpAddr> {
     let f = s.fields();
     let family = as_i32(f.first()?)?;
     let addr = as_bytes(f.get(1)?)?;
+    ip_from(family, &addr)
+}
+
+/// The Manager's `CurrentDNSServerEx`: `(iiayqs)` = ifindex, family, address,
+/// port, name. Only an entry without a link (ifindex 0) is a global server.
+fn parse_global_current(v: &Value<'_>) -> Option<IpAddr> {
+    let Value::Structure(s) = unwrap_variant(v) else { return None };
+    let f = s.fields();
+    if as_i32(f.first()?)? != 0 {
+        return None;
+    }
+    let family = as_i32(f.get(1)?)?;
+    let addr = as_bytes(f.get(2)?)?;
     ip_from(family, &addr)
 }
 
@@ -738,7 +768,13 @@ impl NetBackend for DbusBackend {
                 default_route,
             });
         }
-        Ok(ResolverSnapshot { links, global, fallback })
+        let global_current = mgr.get("CurrentDNSServerEx").and_then(|v| parse_global_current(v));
+        Ok(ResolverSnapshot {
+            links,
+            global,
+            fallback,
+            global_current,
+        })
     }
 
     fn applied_dns(&self, iface: &str) -> NetResult<DnsSettings> {
@@ -1141,6 +1177,26 @@ mod tests {
         assert_eq!(got[0], (4, "192.168.1.153".parse().unwrap()));
         assert_eq!(got[1].0, 0);
         assert!(got[1].1.is_ipv6());
+    }
+
+    #[test]
+    fn global_current_server_needs_ifindex_zero() {
+        use zbus::zvariant::StructureBuilder;
+        let mk = |ifx: i32| {
+            Value::Structure(
+                StructureBuilder::new()
+                    .add_field(ifx)
+                    .add_field(2i32)
+                    .add_field(vec![9u8, 9, 9, 9])
+                    .add_field(0u16)
+                    .add_field("dns.quad9.net".to_string())
+                    .build()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(parse_global_current(&mk(0)), Some("9.9.9.9".parse().unwrap()));
+        assert_eq!(parse_global_current(&mk(4)), None, "a link's server is not a global one");
+        assert_eq!(parse_global_current(&Value::from(3u32)), None);
     }
 
     #[test]

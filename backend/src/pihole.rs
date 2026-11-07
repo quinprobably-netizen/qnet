@@ -97,6 +97,94 @@ pub struct Bucket {
 }
 
 pub const MAX_BUCKETS: usize = 144;
+pub const MAX_UPSTREAMS: usize = 4;
+
+/// One real upstream resolver from `GET /api/stats/upstreams`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Upstream {
+    /// Reverse-resolved name, "" when Pi-hole has none.
+    pub name: String,
+    pub ip: IpAddr,
+    pub port: u16,
+    pub count: u64,
+    /// Average response time in ms, None when Pi-hole has no figure.
+    pub response_ms: Option<f64>,
+}
+
+/// Where Pi-hole's answers came from: the pseudo-upstreams and the rest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnsweredBy {
+    pub blocklist: u64,
+    pub cache: u64,
+    pub forwarded: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Upstreams {
+    pub list: Vec<Upstream>,
+    pub answered_by: AnsweredBy,
+}
+
+fn count_of(v: &Value) -> Option<u64> {
+    let n = v.as_f64()?;
+    (n.is_finite() && n >= 0.0).then_some(n as u64)
+}
+
+fn clean_hostname(s: &str) -> String {
+    let ok = !s.is_empty()
+        && s.len() <= 253
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    if ok {
+        s.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Validate and tidy `/api/stats/upstreams`. The pseudo-entries `blocklist`
+/// and `cache` become `answered_by`; real resolvers are checked (address
+/// parses, port in range, count a plain number), sorted by count and capped.
+pub fn parse_upstreams(v: &Value) -> Result<Upstreams, ApiError> {
+    let arr = v
+        .get("upstreams")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::Other("unexpected upstreams answer".into()))?;
+    let mut out = Upstreams::default();
+    let mut forwarded_sum = 0u64;
+    for e in arr {
+        let Some(ip) = e.get("ip").and_then(Value::as_str) else { continue };
+        let count = e.get("count").and_then(count_of);
+        match ip {
+            "blocklist" => out.answered_by.blocklist = count.unwrap_or(0),
+            "cache" => out.answered_by.cache = count.unwrap_or(0),
+            _ => {
+                let (Ok(addr), Some(count)) = (ip.parse::<IpAddr>(), count) else { continue };
+                let port = match e.get("port").and_then(Value::as_i64) {
+                    Some(p) if (1..=65535).contains(&p) => p as u16,
+                    _ => continue,
+                };
+                forwarded_sum += count;
+                let name = e.get("name").and_then(Value::as_str).map(clean_hostname).unwrap_or_default();
+                let response_ms = e
+                    .pointer("/statistics/response")
+                    .and_then(Value::as_f64)
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .map(|s| crate::util::round1(s * 1000.0));
+                out.list.push(Upstream {
+                    name: if name == ip { String::new() } else { name },
+                    ip: addr,
+                    port,
+                    count,
+                    response_ms,
+                });
+            }
+        }
+    }
+    out.answered_by.forwarded = v.get("forwarded_queries").and_then(count_of).unwrap_or(forwarded_sum);
+    out.list.sort_by(|a, b| b.count.cmp(&a.count).then(a.ip.cmp(&b.ip)));
+    out.list.truncate(MAX_UPSTREAMS);
+    Ok(out)
+}
 
 #[derive(Deserialize)]
 struct SummaryDoc {
@@ -178,6 +266,15 @@ struct LoginBody<'a> {
     password: &'a str,
 }
 
+/// The login request body, written straight into a buffer that is large
+/// enough for the worst case (every byte escaped as `\u00XX`), so it never
+/// reallocates and leaves a stray copy of the password behind. Wiped on drop.
+fn login_body(password: &str) -> Result<Zeroizing<Vec<u8>>, ApiError> {
+    let mut body = Zeroizing::new(Vec::with_capacity(password.len() * 6 + 32));
+    serde_json::to_writer(&mut *body, &LoginBody { password }).map_err(|e| ApiError::Other(e.to_string()))?;
+    Ok(body)
+}
+
 pub struct Pihole {
     http: HttpsClient,
     sid: Option<String>,
@@ -232,8 +329,17 @@ impl Pihole {
         }
     }
 
-    fn forget_saved_sid(&self) {
-        if let Some(path) = &self.sid_file {
+    /// Remove the saved session, but only if the file still holds `sid`:
+    /// another qnet may have logged in since and saved its own, which must
+    /// not be pulled out from under it.
+    fn forget_saved_sid(&self, sid: &str) {
+        let Some(path) = &self.sid_file else { return };
+        let still_ours = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.get("sid").and_then(Value::as_str).map(|s| s == sid))
+            .unwrap_or(false);
+        if still_ours {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -248,8 +354,9 @@ impl Pihole {
         match self.send("GET", "/api/auth", None) {
             Ok((200, v)) if v.pointer("/session/valid").and_then(Value::as_bool) == Some(true) => true,
             Ok(_) => {
-                self.sid = None;
-                self.forget_saved_sid();
+                if let Some(old) = self.sid.take() {
+                    self.forget_saved_sid(&old);
+                }
                 false
             }
             Err(_) => true,
@@ -268,9 +375,7 @@ impl Pihole {
 
     /// Log in with an explicit password (setup uses the web password).
     pub fn login_with(&mut self, password: &str) -> Result<(), ApiError> {
-        let body = Zeroizing::new(
-            serde_json::to_vec(&LoginBody { password }).map_err(|e| ApiError::Other(e.to_string()))?,
-        );
+        let body = login_body(password)?;
         // Never reuse a connection for the login POST.
         self.http.close();
         let r = self.http.request("POST", "/api/auth", &[], Some(&body[..]))?;
@@ -331,8 +436,9 @@ impl Pihole {
         }
         let (mut status, mut v) = self.send(method, path, body)?;
         if status == 401 {
-            self.sid = None;
-            self.forget_saved_sid();
+            if let Some(old) = self.sid.take() {
+                self.forget_saved_sid(&old);
+            }
             self.login()?;
             (status, v) = self.send(method, path, body)?;
         }
@@ -346,6 +452,10 @@ impl Pihole {
 
     pub fn summary(&mut self) -> Result<Summary, ApiError> {
         parse_summary(&self.json("GET", "/api/stats/summary", None)?)
+    }
+
+    pub fn upstreams(&mut self) -> Result<Upstreams, ApiError> {
+        parse_upstreams(&self.json("GET", "/api/stats/upstreams", None)?)
     }
 
     pub fn blocking(&mut self) -> Result<Blocking, ApiError> {
@@ -367,8 +477,9 @@ impl Pihole {
         if self.sid.is_some() {
             let _ = self.send("DELETE", "/api/auth", None);
         }
-        self.sid = None;
-        self.forget_saved_sid();
+        if let Some(old) = self.sid.take() {
+            self.forget_saved_sid(&old);
+        }
         self.http.close();
     }
 
@@ -745,5 +856,162 @@ mod tests {
         assert!(!sid_is_sane("a\tb"));
         assert!(!sid_is_sane(&"a".repeat(513)));
         assert!(!sid_is_sane("é"));
+    }
+
+    #[test]
+    fn login_body_never_reallocates_even_when_every_byte_is_escaped() {
+        for pw in [
+            "hunter2".to_string(),
+            "quote\"back\\slash".to_string(),
+            "\u{1}\u{2}\u{3}".repeat(100), // control bytes become \u00XX
+            "é☕😀".repeat(50),
+            String::new(),
+        ] {
+            let reserved = pw.len() * 6 + 32;
+            let body = login_body(&pw).unwrap();
+            assert_eq!(body.capacity(), reserved, "no growth for {pw:?}");
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["password"].as_str().unwrap(), pw);
+            assert_eq!(v.as_object().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn logout_leaves_a_session_file_that_another_process_wrote() {
+        let srv = serve(5, |_, req| {
+            if req.starts_with("POST /api/auth") {
+                Some(ok_json(LOGIN_OK))
+            } else {
+                Some(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec())
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qnet").join("sid");
+        let mut a = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap().with_sid_file(path.clone());
+        a.login_with("x").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["sid"], "SID-1");
+        // A newer qnet logs in and saves its own session in the same place.
+        std::fs::write(&path, json!({"address": "127.0.0.1", "sid": "SID-OTHER"}).to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        a.logout();
+        assert!(path.exists(), "A must not delete B's session file");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["sid"], "SID-OTHER");
+        // Its owner does remove it.
+        std::fs::write(&path, json!({"address": "127.0.0.1", "sid": "SID-1"}).to_string()).unwrap();
+        let mut b = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap().with_sid_file(path.clone());
+        b.login_with("x").unwrap();
+        b.logout();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_401_relogin_does_not_remove_a_newer_neighbours_file() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let srv = serve(6, move |_, req| {
+            if req.starts_with("POST /api/auth") {
+                let k = n2.fetch_add(1, Ordering::SeqCst) + 1;
+                Some(ok_json(&LOGIN_OK.replace("SID-1", &format!("SID-{k}"))))
+            } else if req.contains("X-FTL-SID: SID-1") {
+                Some(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}".to_vec())
+            } else {
+                Some(ok_json(r#"{"blocking":"enabled","timer":null}"#))
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qnet").join("sid");
+        let mut a = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap().with_sid_file(path.clone());
+        a.login_with("x").unwrap(); // SID-1, saved
+        std::fs::write(&path, json!({"address": "127.0.0.1", "sid": "SID-NEIGHBOUR"}).to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        a.blocking().unwrap(); // 401 -> relogin as SID-2 -> saved over it
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["sid"], "SID-2", "the relogin saves the new session");
+    }
+
+    #[test]
+    fn upstreams_real_pihole_shape() {
+        // Verbatim from the live Pi-hole (v6.5).
+        let v = json!({
+            "upstreams": [
+                {"ip":"blocklist","name":"blocklist","port":-1,"count":1734,"statistics":{"response":0,"variance":0}},
+                {"ip":"cache","name":"cache","port":-1,"count":1075,"statistics":{"response":0,"variance":0}},
+                {"ip":"9.9.9.9","name":"dns9.quad9.net","port":53,"count":287,"statistics":{"response":0.15915417671203613,"variance":0}},
+                {"ip":"149.112.112.112","name":"dns.quad9.net","port":53,"count":143,"statistics":{"response":0.045138109714613045,"variance":0.0096}}
+            ],
+            "total_queries": 3248, "forwarded_queries": 430, "took": 0.0001
+        });
+        let u = parse_upstreams(&v).unwrap();
+        assert_eq!(u.answered_by, AnsweredBy { blocklist: 1734, cache: 1075, forwarded: 430 });
+        assert_eq!(u.list.len(), 2, "the pseudo-entries are not upstreams");
+        assert_eq!(u.list[0].ip, "9.9.9.9".parse::<IpAddr>().unwrap());
+        assert_eq!((u.list[0].name.as_str(), u.list[0].port, u.list[0].count), ("dns9.quad9.net", 53, 287));
+        assert_eq!(u.list[0].response_ms, Some(159.2), "seconds become milliseconds");
+        assert_eq!(u.list[1].response_ms, Some(45.1));
+    }
+
+    #[test]
+    fn upstreams_are_validated_sorted_and_capped() {
+        let mut items = vec![
+            json!({"ip":"blocklist","name":"blocklist","port":-1,"count":10}),
+            // Junk that must not get through.
+            json!({"ip":"not-an-ip","port":53,"count":999}),
+            json!({"ip":"1.2.3.4","port":0,"count":999}),
+            json!({"ip":"1.2.3.5","port":70000,"count":999}),
+            json!({"ip":"1.2.3.6","port":53,"count":-5}),
+            json!({"ip":"1.2.3.7","port":53,"count":"many"}),
+            json!({"port":53,"count":999}),
+            json!("a string"),
+            json!({"ip":"2606:4700:4700::1111","name":"one.one.one.one","port":53,"count":50,"statistics":{"response":0.02}}),
+        ];
+        for i in 0..6u64 {
+            items.push(json!({"ip": format!("10.0.0.{}", i + 1), "name": "", "port": 53, "count": 100 + i, "statistics": {"response": 0}}));
+        }
+        let u = parse_upstreams(&json!({"upstreams": items})).unwrap();
+        assert_eq!(u.list.len(), MAX_UPSTREAMS, "capped");
+        let counts: Vec<u64> = u.list.iter().map(|x| x.count).collect();
+        assert_eq!(counts, vec![105, 104, 103, 102], "busiest first");
+        assert!(u.list.iter().all(|x| x.name.is_empty()));
+        assert!(u.list.iter().all(|x| x.response_ms.is_none()), "a zero response is no figure");
+        // No forwarded_queries field: the sum of the valid ones (the capped-off included).
+        assert_eq!(u.answered_by.forwarded, 100 + 101 + 102 + 103 + 104 + 105 + 50);
+        assert_eq!(u.answered_by.blocklist, 10);
+        assert_eq!(u.answered_by.cache, 0);
+    }
+
+    #[test]
+    fn upstream_names_are_cleaned_and_an_ip_as_name_means_no_name() {
+        let v = json!({"upstreams":[
+            {"ip":"9.9.9.9","name":"9.9.9.9","port":53,"count":3},
+            {"ip":"9.9.9.10","name":"evil\u{1b}[2J name","port":53,"count":2},
+            {"ip":"9.9.9.11","name":"ok-host_1.example.net","port":53,"count":1}
+        ]});
+        let u = parse_upstreams(&v).unwrap();
+        assert_eq!(u.list[0].name, "");
+        assert_eq!(u.list[1].name, "");
+        assert_eq!(u.list[2].name, "ok-host_1.example.net");
+    }
+
+    #[test]
+    fn upstreams_answer_without_the_list_is_an_error() {
+        assert!(parse_upstreams(&json!({})).is_err());
+        assert!(parse_upstreams(&json!({"upstreams": "x"})).is_err());
+        assert_eq!(parse_upstreams(&json!({"upstreams": []})).unwrap(), Upstreams::default());
+    }
+
+    #[test]
+    fn upstreams_request_goes_to_the_stats_endpoint() {
+        let srv = serve(2, |_, req| {
+            if req.starts_with("POST /api/auth") {
+                return Some(ok_json(LOGIN_OK));
+            }
+            assert!(req.starts_with("GET /api/stats/upstreams HTTP/1.1"), "{req}");
+            Some(ok_json(r#"{"upstreams":[{"ip":"cache","name":"cache","port":-1,"count":7}],"forwarded_queries":0}"#))
+        });
+        let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap();
+        let u = p.upstreams().unwrap();
+        assert_eq!(u.answered_by.cache, 7);
     }
 }

@@ -37,6 +37,19 @@ impl Fallback {
     }
 }
 
+impl Fallback {
+    /// Which fallback `servers` are, if any (for a failover found already
+    /// in place).
+    pub fn identify(servers: &[Ipv4Addr], gateway: Option<Ipv4Addr>) -> Option<Fallback> {
+        [Fallback::Router, Fallback::Quad9, Fallback::Cloudflare]
+            .into_iter()
+            .find(|f| {
+                let want = f.servers(gateway);
+                !want.is_empty() && servers == want.as_slice()
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiholeCfg {
     pub address: IpAddr,

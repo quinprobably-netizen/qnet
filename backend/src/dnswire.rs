@@ -57,17 +57,32 @@ pub fn encode_name(name: &str) -> Result<Vec<u8>, DnsError> {
     Ok(out)
 }
 
-/// Build a recursion-desired A/IN query.
-pub fn build_query(id: u16, name: &str) -> Result<Vec<u8>, DnsError> {
+pub const TYPE_OPT: u16 = 41;
+/// UDP payload size advertised in the EDNS0 OPT record.
+pub const EDNS_UDP_SIZE: u16 = 1232;
+
+/// Build a recursion-desired A/IN query. With `edns`, an EDNS0 OPT record
+/// is added, as systemd-resolved sends: a Pi-hole (or a path to it) that
+/// mishandles EDNS0 then shows up in the probes instead of only in
+/// resolved's logs.
+pub fn build_query(id: u16, name: &str, edns: bool) -> Result<Vec<u8>, DnsError> {
     let qname = encode_name(name)?;
-    let mut m = Vec::with_capacity(12 + qname.len() + 4);
+    let mut m = Vec::with_capacity(12 + qname.len() + 4 + 11);
     m.extend_from_slice(&id.to_be_bytes());
     m.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
     m.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
-    m.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN/NS/AR
+    m.extend_from_slice(&[0, 0, 0, 0]); // AN/NS
+    m.extend_from_slice(&u16::from(edns).to_be_bytes()); // ARCOUNT
     m.extend_from_slice(&qname);
     m.extend_from_slice(&TYPE_A.to_be_bytes());
     m.extend_from_slice(&CLASS_IN.to_be_bytes());
+    if edns {
+        m.push(0); // root name
+        m.extend_from_slice(&TYPE_OPT.to_be_bytes());
+        m.extend_from_slice(&EDNS_UDP_SIZE.to_be_bytes()); // "class" = payload size
+        m.extend_from_slice(&[0, 0, 0, 0]); // extended rcode, version 0, flags 0
+        m.extend_from_slice(&0u16.to_be_bytes()); // RDLEN
+    }
     Ok(m)
 }
 
@@ -236,7 +251,7 @@ fn exchange(
     sent: &mut u32,
 ) -> Result<Probe, DnsError> {
     let id = crate::util::random_u16();
-    let query = build_query(id, name)?;
+    let query = build_query(id, name, true)?;
     let bind: SocketAddr = match server {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("static addr"),
         SocketAddr::V6(_) => "[::]:0".parse().expect("static addr"),
@@ -293,16 +308,6 @@ fn exchange(
             Err(e) => return Err(DnsError::Io(e.to_string())),
         }
     }
-}
-
-/// Probe `addr:53`.
-pub fn probe_server(addr: IpAddr, name: &str, timeout: Duration) -> Result<Probe, DnsError> {
-    probe_server_counted(addr, name, timeout).1
-}
-
-/// Probe `addr:53`, also returning the number of queries sent.
-pub fn probe_server_counted(addr: IpAddr, name: &str, timeout: Duration) -> (u32, Result<Probe, DnsError>) {
-    query_a_counted(SocketAddr::new(addr, 53), name, timeout, Some(timeout / 2))
 }
 
 /// A name nobody has asked for: `<16 hex digits>.<domain>`. It forces the
@@ -380,7 +385,7 @@ mod tests {
 
     #[test]
     fn query_layout() {
-        let q = build_query(0xBEEF, "doubleclick.net").unwrap();
+        let q = build_query(0xBEEF, "doubleclick.net", false).unwrap();
         assert_eq!(&q[..2], &[0xBE, 0xEF]);
         assert_eq!(&q[2..4], &[0x01, 0x00]);
         assert_eq!(&q[4..6], &[0, 1]);
@@ -391,6 +396,28 @@ mod tests {
         assert_eq!(q[28], 0);
         assert_eq!(&q[29..], &[0, 1, 0, 1]);
         assert_eq!(q.len(), 33);
+    }
+
+    #[test]
+    fn edns_query_carries_an_opt_record() {
+        let plain = build_query(7, "doubleclick.net", false).unwrap();
+        let q = build_query(7, "doubleclick.net", true).unwrap();
+        assert_eq!(&q[10..12], &[0, 1], "ARCOUNT = 1");
+        assert_eq!(&plain[10..12], &[0, 0]);
+        assert_eq!(q.len(), plain.len() + 11);
+        // Same question, then the OPT RR: root, type 41, size 1232, no rdata.
+        assert_eq!(&q[12..plain.len()], &plain[12..]);
+        assert_eq!(
+            &q[plain.len()..],
+            &[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0],
+            "root name, TYPE OPT, UDP size 1232, ext-rcode/version/flags 0, RDLEN 0"
+        );
+        // A response that echoes the OPT record still parses.
+        let mut r = q.clone();
+        r[2] = 0x81;
+        r[3] = 0x80;
+        let p = parse_response(&r, 7, "doubleclick.net").unwrap();
+        assert_eq!(p.rcode, 0);
     }
 
     #[test]
@@ -446,7 +473,7 @@ mod tests {
         let r = response(1, "a.com", 0, &[Ipv4Addr::LOCALHOST]);
         assert_eq!(parse_response(&r, 2, "a.com"), Err(DnsError::IdMismatch));
         assert_eq!(parse_response(&r, 1, "b.com"), Err(DnsError::QuestionMismatch));
-        let q = build_query(1, "a.com").unwrap();
+        let q = build_query(1, "a.com", false).unwrap();
         assert_eq!(parse_response(&q, 1, "a.com"), Err(DnsError::NotResponse));
         assert_eq!(parse_response(&[0; 5], 1, "a.com"), Err(DnsError::Short));
     }

@@ -145,15 +145,33 @@ pub fn run(
     drop(web_pw);
 
     // 3. Is there already an app password? Replacing it breaks its users.
-    let old_hash = ph
-        .json("GET", "/api/config/webserver/api", None)
-        .ok()
-        .and_then(|v| {
-            v.pointer("/config/webserver/api/app_pwhash")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
+    // If this cannot be read, stop: a later rollback would otherwise "restore"
+    // an empty hash over an app password that was really there.
+    let current = match ph.json("GET", "/api/config/webserver/api", None) {
+        Ok(v) if v.pointer("/config/webserver/api").is_some_and(Value::is_object) => v,
+        Ok(_) => {
+            ph.logout();
+            return Err(ActionErr::new(
+                "api",
+                "the Pi-hole's answer about its app password setting was not understood; nothing was changed",
+            ));
+        }
+        Err(e) => {
+            ph.logout();
+            return Err(ActionErr::new(
+                "api",
+                format!(
+                    "could not read the Pi-hole's current app password setting ({}); nothing was changed",
+                    e.message()
+                ),
+            ));
+        }
+    };
+    let old_hash = current
+        .pointer("/config/webserver/api/app_pwhash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let in_keyring = secrets.exists(addr);
     if !old_hash.is_empty() || in_keyring {
         prompt.say("This Pi-hole already has an app password (or one is stored for it here).");
@@ -334,6 +352,10 @@ mod tests {
                 }
             } else if !first.starts_with("DELETE") && dead.lock().unwrap().contains(&sid) {
                 unauthorized()
+            } else if first.starts_with("GET /api/config/webserver/api") && existing_hash == "@500" {
+                Some(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\n\r\n{}".to_vec())
+            } else if first.starts_with("GET /api/config/webserver/api") && existing_hash == "@shape" {
+                Some(ok_json(r#"{"took":0.1}"#))
             } else if first.starts_with("GET /api/config/webserver/api") {
                 Some(ok_json(&format!(
                     r#"{{"config":{{"webserver":{{"api":{{"app_pwhash":"{existing_hash}"}}}}}}}}"#
@@ -619,5 +641,27 @@ mod tests {
         let r = go(srv.addr, &mut p, &store, &cfgp).unwrap();
         assert_eq!(r["ok"], true);
         assert!(!p.said.iter().any(|l| l.contains("CHANGED")));
+    }
+
+    #[test]
+    fn an_unreadable_app_password_setting_aborts_before_anything_is_changed() {
+        for mode in ["@500", "@shape"] {
+            let log: Log = Arc::default();
+            let srv = fake_pihole(mode, log.clone());
+            let dir = tempfile::tempdir().unwrap();
+            let cfgp = dir.path().join("config.toml");
+            let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+            let mut p = script(vec![true]);
+            let e = go(srv.addr, &mut p, &store, &cfgp).unwrap_err();
+            assert_eq!(e.code, "api", "{mode}: {e:?}");
+            assert!(e.detail.contains("nothing was changed"), "{}", e.detail);
+            let log = log.lock().unwrap();
+            assert!(!log.iter().any(|l| l.starts_with("GET /api/auth/app")), "{mode}: no app password made");
+            assert!(!log.iter().any(|l| l.starts_with("PATCH")), "{mode}: nothing patched, nothing to roll back");
+            assert!(!log.iter().any(|l| l.starts_with("POST /api/domains")));
+            assert!(log.iter().any(|l| l.starts_with("DELETE /api/auth")), "the web session was closed");
+            assert!(!cfgp.exists());
+            assert!(store.stored.borrow().is_empty());
+        }
     }
 }

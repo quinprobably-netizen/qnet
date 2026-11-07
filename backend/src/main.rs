@@ -19,10 +19,12 @@ mod failover;
 mod https;
 mod icmp;
 mod ledger;
+mod neigh;
 mod net;
 mod nm;
 mod pihole;
 mod proc;
+mod rstate;
 mod setup;
 mod state;
 mod threads;
@@ -46,6 +48,10 @@ fn usage() -> ActionErr {
 
 fn backend() -> Result<nm::DbusBackend, ActionErr> {
     nm::DbusBackend::connect().map_err(|e| ActionErr::new("dbus", e.detail()))
+}
+
+fn backend_cancellable(term: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<nm::DbusBackend, ActionErr> {
+    Ok(backend()?.with_cancel(term.clone()))
 }
 
 fn load_config() -> Result<config::Config, ActionErr> {
@@ -138,7 +144,7 @@ enum Cmd {
     PiholeSetup { addr: Option<std::net::IpAddr> },
     WifiConnect { ap: String },
     WifiDown,
-    WifiScan,
+    WifiScan { if_stale: Option<u64> },
     WifiForget { uuid: String },
     WifiRadio { on: bool },
     Portal,
@@ -147,7 +153,32 @@ enum Cmd {
 
 /// Parse and validate the command line. Nothing here touches the system, so
 /// bad input never gets as far as a D-Bus call.
-fn parse(args: &[String]) -> Result<Cmd, ActionErr> {
+fn parse(all: &[String]) -> Result<Cmd, ActionErr> {
+    // `--if-stale <secs>` takes a value, so it is cut out before the rest is
+    // matched by position.
+    let mut args: Vec<String> = Vec::new();
+    let mut if_stale: Option<u64> = None;
+    let mut it = all.iter();
+    while let Some(a) = it.next() {
+        if a == "--if-stale" {
+            let secs = it
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| (1..=86_400).contains(v))
+                .ok_or_else(|| ActionErr::new("invalid", "--if-stale needs a number of seconds (1-86400)"))?;
+            if_stale = Some(secs);
+        } else {
+            args.push(a.clone());
+        }
+    }
+    let cmd = parse_positional(&args, if_stale)?;
+    if if_stale.is_some() && !matches!(cmd, Cmd::WifiScan { .. }) {
+        return Err(ActionErr::new("invalid", "--if-stale only applies to `wifi scan`"));
+    }
+    Ok(cmd)
+}
+
+fn parse_positional(args: &[String], if_stale: Option<u64>) -> Result<Cmd, ActionErr> {
     let force = args.iter().any(|a| a == "--force");
     let pos: Vec<&str> = args
         .iter()
@@ -192,7 +223,7 @@ fn parse(args: &[String]) -> Result<Cmd, ActionErr> {
             Ok(Cmd::WifiConnect { ap: ap.to_string() })
         }
         ["wifi", "down"] => Ok(Cmd::WifiDown),
-        ["wifi", "scan"] => Ok(Cmd::WifiScan),
+        ["wifi", "scan"] => Ok(Cmd::WifiScan { if_stale }),
         ["wifi", "forget", uuid] => {
             if !util::is_uuid(uuid) {
                 return Err(bad_uuid());
@@ -225,48 +256,67 @@ fn pihole_client(cfg: &config::Config) -> Result<pihole::Pihole, ActionErr> {
 
 fn run_oneshot(cmd: Cmd) -> ActionResult {
     match cmd {
-        Cmd::PiholePause { secs } => {
-            util::harden_process();
-            let cfg = load_config()?;
-            let mut api = pihole_client(&cfg)?;
-            let r = actions::pihole_pause(&mut api, secs);
-            api.logout();
-            r
-        }
-        Cmd::PiholeResume => {
-            util::harden_process();
-            let cfg = load_config()?;
-            let mut api = pihole_client(&cfg)?;
-            let r = actions::pihole_resume(&mut api);
-            api.logout();
-            r
-        }
         Cmd::PiholeSetup { addr } => {
+            // Interactive: Ctrl-C must keep working at the prompts, so no
+            // signal flag here.
             if !std::io::stdin().is_terminal() {
                 return Err(ActionErr::new("interactive", "pihole setup must be run from a terminal"));
             }
             util::harden_process();
             setup::run(addr, 443, &mut Terminal, &setup::Keyring, &util::config_path())
         }
+        // From here on SIGTERM/SIGINT/SIGHUP only set a flag: the step in
+        // progress finishes (or is undone) and sessions are logged out.
+        Cmd::PiholePause { secs } => {
+            let term = util::term_flag();
+            util::harden_process();
+            let cfg = load_config()?;
+            let mut api = pihole_client(&cfg)?;
+            let r = if term.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(ActionErr::new("interrupted", "stopped before anything was changed"))
+            } else {
+                actions::pihole_pause(&mut api, secs)
+            };
+            api.logout();
+            r
+        }
+        Cmd::PiholeResume => {
+            let term = util::term_flag();
+            util::harden_process();
+            let cfg = load_config()?;
+            let mut api = pihole_client(&cfg)?;
+            let r = if term.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(ActionErr::new("interrupted", "stopped before anything was changed"))
+            } else {
+                actions::pihole_resume(&mut api)
+            };
+            api.logout();
+            r
+        }
         Cmd::WifiConnect { ap } => {
+            let term = util::term_flag();
             // One line on stdin: the passphrase (empty for open/known).
             // Read a line, never to EOF: the caller keeps the pipe open.
             util::harden_process();
             let pass = read_secret_line("Passphrase (empty for none): ").map_err(|e| ActionErr::new("io", e))?;
-            let be = backend()?;
+            let be = backend_cancellable(&term)?;
             let cfg = load_config()?;
-            actions::wifi_connect(&Ctx::new(&be, &cfg), &ap, Some(&pass))
+            let mut ctx = Ctx::new(&be, &cfg);
+            ctx.term = term;
+            actions::wifi_connect(&ctx, &ap, Some(&pass))
         }
         other => {
-            let be = backend()?;
+            let term = util::term_flag();
+            let be = backend_cancellable(&term)?;
             let cfg = load_config()?;
-            let ctx = Ctx::new(&be, &cfg);
+            let mut ctx = Ctx::new(&be, &cfg);
+            ctx.term = term;
             match other {
                 Cmd::DnsPihole { force } => actions::dns_pihole(&ctx, force),
                 Cmd::DnsAuto { force } => actions::dns_auto(&ctx, force),
                 Cmd::DnsPin { uuids, force } => actions::dns_pin_many(&ctx, &uuids, force),
                 Cmd::WifiDown => actions::wifi_down(&ctx),
-                Cmd::WifiScan => actions::wifi_scan(&ctx),
+                Cmd::WifiScan { if_stale } => actions::wifi_scan(&ctx, if_stale),
                 Cmd::WifiForget { uuid } => actions::wifi_forget(&ctx, &uuid),
                 Cmd::WifiRadio { on } => actions::wifi_radio(&ctx, on),
                 _ => Err(usage()),
@@ -395,7 +445,9 @@ mod tests {
         assert_eq!(p(&["pihole", "setup"]), Ok(Cmd::PiholeSetup { addr: None }));
         assert_eq!(p(&["wifi", "connect", AP]), Ok(Cmd::WifiConnect { ap: AP.into() }));
         assert_eq!(p(&["wifi", "down"]), Ok(Cmd::WifiDown));
-        assert_eq!(p(&["wifi", "scan"]), Ok(Cmd::WifiScan));
+        assert_eq!(p(&["wifi", "scan"]), Ok(Cmd::WifiScan { if_stale: None }));
+        assert_eq!(p(&["wifi", "scan", "--if-stale", "60"]), Ok(Cmd::WifiScan { if_stale: Some(60) }));
+        assert_eq!(p(&["wifi", "--if-stale", "5", "scan"]), Ok(Cmd::WifiScan { if_stale: Some(5) }));
         assert_eq!(p(&["wifi", "forget", U]), Ok(Cmd::WifiForget { uuid: U.into() }));
         assert_eq!(p(&["wifi", "radio", "on"]), Ok(Cmd::WifiRadio { on: true }));
         assert_eq!(p(&["wifi", "radio", "off"]), Ok(Cmd::WifiRadio { on: false }));
@@ -419,6 +471,13 @@ mod tests {
             &["wifi", "connect", "Redwood"],
             &["wifi", "connect", "/org/freedesktop/NetworkManager/AccessPoint/1/../2"],
             &["wifi", "forget", "Redwood"],
+            &["wifi", "scan", "--if-stale"],
+            &["wifi", "scan", "--if-stale", "soon"],
+            &["wifi", "scan", "--if-stale", "0"],
+            &["wifi", "scan", "--if-stale", "-5"],
+            &["wifi", "scan", "--if-stale", "999999"],
+            &["wifi", "down", "--if-stale", "60"],
+            &["dns", "auto", "--if-stale", "60"],
             &["wifi", "radio"],
             &["wifi", "radio", "maybe"],
             &["watch", "now"],

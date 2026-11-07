@@ -315,9 +315,12 @@ pub struct ResolverSnapshot {
     pub links: Vec<LinkDns>,
     /// Servers from resolved.conf (`DNS=`), ifindex 0.
     pub global: Vec<IpAddr>,
-    /// resolved's compiled-in `FallbackDNS=`. Used only when nothing else
-    /// is configured, so never a leak by itself.
+    /// resolved's compiled-in `FallbackDNS=`.
     pub fallback: Vec<IpAddr>,
+    /// The Manager's `CurrentDNSServerEx` when it has no link (ifindex 0).
+    /// With nothing configured globally this can only be a fallback server:
+    /// resolved has, at some point, picked one to send queries to.
+    pub global_current: Option<IpAddr>,
 }
 
 impl ResolverSnapshot {
@@ -337,6 +340,8 @@ pub enum NetError {
     /// Activation failed; `auth` is true when it looks like a bad passphrase.
     Activation { auth: bool, detail: String },
     Timeout(String),
+    /// The process was told to stop while waiting.
+    Interrupted(String),
     /// D-Bus or NM misbehaved.
     Bus(String),
 }
@@ -350,6 +355,7 @@ impl NetError {
             NetError::Activation { auth: true, .. } => "auth",
             NetError::Activation { .. } => "activation",
             NetError::Timeout(_) => "timeout",
+            NetError::Interrupted(_) => "interrupted",
             NetError::Bus(_) => "dbus",
         }
     }
@@ -359,6 +365,7 @@ impl NetError {
             | NetError::Denied(s)
             | NetError::Invalid(s)
             | NetError::Timeout(s)
+            | NetError::Interrupted(s)
             | NetError::Bus(s) => s.clone(),
             NetError::Activation { detail, .. } => detail.clone(),
         }
@@ -538,6 +545,10 @@ pub mod fake {
         pub reapply_error: Option<NetError>,
         pub snapshot_error: bool,
         pub canary_answer: Option<IpAddr>,
+        pub global_current: Option<IpAddr>,
+        pub scan_error: Option<NetError>,
+        pub eth_servers: Option<Vec<IpAddr>>,
+        pub trip: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
 
     pub struct FakeNet {
@@ -598,6 +609,10 @@ pub mod fake {
                     reapply_error: None,
                     snapshot_error: false,
                     canary_answer: None,
+                    global_current: None,
+                    scan_error: None,
+                    eth_servers: None,
+                    trip: None,
                 }),
             }
         }
@@ -682,6 +697,31 @@ pub mod fake {
         pub fn set_canary_answer(&self, ip: &str) {
             self.inner.lock().unwrap().canary_answer = Some(ip.parse().unwrap());
         }
+        pub fn fail_scan(&self, e: Option<NetError>) {
+            self.inner.lock().unwrap().scan_error = e;
+        }
+        /// Raise `flag` (a stand-in for SIGTERM) right after a profile write.
+        pub fn trip_after_profile_write(&self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+            self.inner.lock().unwrap().trip = Some(flag);
+        }
+        pub fn set_bitrate_kbps(&self, kbps: u32) {
+            let mut g = self.inner.lock().unwrap();
+            g.snap.devices[0].wifi.as_mut().unwrap().bitrate_kbps = kbps;
+        }
+        /// DNS servers resolved holds for the wired link added by
+        /// `add_ethernet_primary`.
+        pub fn set_resolver_for_primary_eth(&self, servers: &[&str]) {
+            self.inner.lock().unwrap().eth_servers = Some(servers.iter().map(|s| s.parse().unwrap()).collect());
+        }
+        /// Pin a saved profile to the Pi-hole without going through qnet.
+        pub fn pin_profile_dns(&self, uuid: &str) {
+            let mut g = self.inner.lock().unwrap();
+            let p = g.profiles.iter_mut().find(|p| p.uuid == uuid).unwrap();
+            p.dns = p.dns.pinned_to(fx::pi());
+        }
+        pub fn set_global_current(&self, ip: Option<&str>) {
+            self.inner.lock().unwrap().global_current = ip.map(|s| s.parse().unwrap());
+        }
         pub fn set_dhcp(&self, servers: Vec<IpAddr>) {
             self.inner.lock().unwrap().dhcp = servers;
         }
@@ -705,7 +745,7 @@ pub mod fake {
         fn resolver(&self, _w: &[(u32, String)]) -> NetResult<ResolverSnapshot> {
             let g = self.inner.lock().unwrap();
             let up = g.snap.devices[0].is_up();
-            let links = if up && !g.link_servers.is_empty() {
+            let mut links = if up && !g.link_servers.is_empty() {
                 vec![LinkDns {
                     ifindex: g.snap.devices[0].ifindex,
                     name: g.snap.devices[0].iface.clone(),
@@ -716,10 +756,20 @@ pub mod fake {
             } else {
                 vec![]
             };
+            if let (Some(servers), Some(eth)) = (&g.eth_servers, g.snap.devices.get(1)) {
+                links.push(LinkDns {
+                    ifindex: eth.ifindex,
+                    name: eth.iface.clone(),
+                    servers: servers.clone(),
+                    current: servers.first().copied(),
+                    default_route: true,
+                });
+            }
             Ok(ResolverSnapshot {
                 links,
                 global: vec![],
                 fallback: vec!["9.9.9.9".parse().unwrap(), "1.1.1.1".parse().unwrap()],
+                global_current: g.global_current,
             })
         }
         fn applied_dns(&self, iface: &str) -> NetResult<DnsSettings> {
@@ -731,6 +781,9 @@ pub mod fake {
             let mut g = self.inner.lock().unwrap();
             g.calls.push(format!("set_profile_dns {uuid}"));
             g.writes += 1;
+            if let Some(f) = &g.trip {
+                f.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             match g.profiles.iter_mut().find(|p| p.uuid == uuid) {
                 Some(p) => {
                     p.dns = dns.clone();
@@ -774,7 +827,10 @@ pub mod fake {
             let mut g = self.inner.lock().unwrap();
             g.calls.push(format!("request_scan {iface}"));
             g.writes += 1;
-            Ok(())
+            match g.scan_error.clone() {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
         fn set_wifi_enabled(&self, on: bool) -> NetResult<()> {
             let mut g = self.inner.lock().unwrap();

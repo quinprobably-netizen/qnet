@@ -426,6 +426,12 @@ impl HttpsClient {
         })
     }
 
+    /// A shorter overall deadline than the default 3 s, for liveness checks.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     #[cfg(test)]
     pub fn with_limits(mut self, timeout: Duration, max_body: usize) -> Self {
         self.timeout = timeout;

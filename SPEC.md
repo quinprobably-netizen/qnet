@@ -50,7 +50,8 @@ wiped the Pi-hole pin from every profile.
   - Because SIGKILL cannot be handled, the Pi-hole session id is kept in
     `$XDG_RUNTIME_DIR/qnet/sid` (file 0600, directory 0700, bound to the
     Pi-hole address) and reused on the next start if the Pi-hole still calls
-    it valid, so a killed `watch` never leaks a session slot.
+    it valid, so a killed `watch` never leaks a session slot. A process removes
+    the file on logout only if it still holds *its own* session id.
 - One-shot actions are `qnet <verb> ...`.
   - Each prints one JSON line, `{"ok":true,...}` or
     `{"ok":false,"error":"..."}`, and the exit code matches.
@@ -60,25 +61,54 @@ wiped the Pi-hole pin from every profile.
     pin of the active profile) `verifiedVia` appears **only if the canary
     came back 0.0.0.0**, together with `"blocked":true`; otherwise there is
     `"blocked":false` and a `"verifyError"` and no `verifiedVia`.
+- Cross-process state lives in `$XDG_RUNTIME_DIR/qnet/` (dir 0700; falls back
+  to `~/.local/state/qnet/`): `sid` (see above), `dns.lock`, `scan`, `radio`.
+  - **DNS lock:** every DNS-changing verb (`dns pihole|auto|pin`) and the
+    watcher's failover engage/recover take a non-blocking `flock` on
+    `dns.lock` for the whole operation. If it is held the verb answers
+    `{"ok":false,"error":"busy"}` and changes nothing; the watcher skips that
+    attempt and retries after its cool-down.
+  - **Error codes the panel should know:** `too-soon` (with `retryInS`, from
+    `wifi scan` and `wifi radio`), `busy`, `confirm`, `interrupted`,
+    `partial`, `unconfigured`, `enterprise`, `badpass`, `auth`, `nolink`,
+    `radio`, `rfkill`.
+  - **One-shot verbs and signals:** except the interactive `pihole setup`,
+    they catch SIGTERM/SIGINT/SIGHUP. The step in progress finishes (a
+    profile that was written is applied, a half-made Wi-Fi profile is
+    deleted), the next step is not started, the Pi-hole session is logged
+    out, and the verb ends with `"interrupted"` (error, or `"interrupted":
+    true` on a result that was applied but not checked).
 - Secrets never go on argv: Wi-Fi passphrases and the Pi-hole web password
   arrive on stdin (one line; the reader never waits for EOF). Untrusted
   strings reach processes only as argv elements. There is no shell anywhere
   (`sh -c` / `bash -c` are forbidden). Secrets are held in zeroizing buffers
-  and the verbs that handle them set `PR_SET_DUMPABLE=0`.
+  and the verbs that handle them (and `watch`) set `PR_SET_DUMPABLE=0`.
+  - **Yama:** `PR_SET_DUMPABLE=0` is what stops a same-user process from
+    reading qnet's memory when `kernel.yama.ptrace_scope` is 0 (classic
+    ptrace permissions). With ptrace_scope ≥ 1 that is already blocked for
+    non-descendants. It is not a defence against root, and a process that
+    runs as you can still read the keyring if it is unlocked.
+  - **The app password is a full Pi-hole admin credential** (it can change
+    any setting, add or delete lists and clients, and log in to the web UI).
+    Anyone who can read the Secret Service entry `service qnet pihole <addr>`
+    has the Pi-hole. qnet only ever uses it for the read calls and for
+    pause/resume, but it is not scoped down; treat the keyring accordingly.
 
 ## Data sources (watch)
 
 | What | Source | Cadence |
 |---|---|---|
 | Devices, primary connection, connectivity, Wi-Fi AP (ssid bytes, strength, freq, bitrate), IP4 address and gateway | NetworkManager D-Bus PropertiesChanged signals | event-driven; re-read on `open` |
-| Access points | NM `Device.Wireless.AccessPoints`, `LastScan` | event-driven; read on `open`, ignored while closed. `RequestScan` only via `qnet wifi scan` (≥ 15 s after NM's `LastScan`). Never on `open` |
+| Access points | NM `Device.Wireless.AccessPoints`, `LastScan` | event-driven; read on `open`, ignored while closed. `RequestScan` only via `qnet wifi scan [--if-stale <secs>]` (never on `open`; at least 15 s after both NM's `LastScan` and qnet's own last request) |
 | Saved profiles and their DNS settings | NM Settings `ListConnections` / `GetSettings` | on start, and on NewConnection, ConnectionRemoved, Updated |
-| Resolver truth | resolved D-Bus `org.freedesktop.resolve1` Manager `DNSEx`, `CurrentDNSServerEx`, `FallbackDNSEx`; per-link `DefaultRoute` | on NM change, plus every 30 s |
+| Resolver truth | resolved D-Bus `org.freedesktop.resolve1` Manager `DNSEx`, `CurrentDNSServerEx` (a server with ifindex 0 is resolved's global pick, only possible from the compiled `FallbackDNS`), `FallbackDNSEx`; per-link `DefaultRoute` | on NM change, plus every 30 s |
+| resolved's rating of the Pi-hole | `resolvectl show-server-state` (argv-only child, 3 s limit): a link server dropped to "UDP" or "TCP" (from "UDP+EDNS0") is a downgrade, shown as `health: degraded`. Only a health note; it never feeds the failover. The journal shows this happens here every few minutes ("Using degraded feature set UDP instead of UDP+EDNS0 for DNS server …"), so the probes also carry an EDNS0 OPT record like resolved's | only while open: on open, then every 30 s |
 | Pi-hole health | Raw UDP DNS sent straight to the Pi-hole. An A query for the canary must return `0.0.0.0` (blocking) or a real address (paused). Timeout 1.5 s, a timed-out probe is retried once at once; the RTT is the latency. The canary is the dedicated `qnet-canary.invalid` when the Pi-hole blocks it (it is on the exact deny list, added at setup; looked for again every 10 min while absent), otherwise the configured `canary`. | every 15 s closed, 5 s open; after any failed cycle every 5 s until 6 good cycles in a row (keeps failover ≈ 35 s and recovery ≈ 15 s) |
 | Upstream check | A random label under `example.com` (`<16 hex>.example.com`) sent to the Pi-hole. NOERROR or NXDOMAIN is healthy; SERVFAIL, REFUSED or a timeout means "degraded". Only run when the canary answered. | every 60 s closed, 15 s open |
-| Gateway gate | The canary probe sent to the gateway on port 53 (the router answers DNS) | only while the Pi-hole probe is failing |
+| Gateway gate | The canary probe sent to the gateway on port 53 (the router answers DNS). Also records whether the router itself answered `0.0.0.0` (it forwards to the Pi-hole, so it is no fallback) | while the Pi-hole probe is failing **or its upstream check is** |
+| Web API liveness | One pinned HTTPS `GET /api/dns/blocking` (3 s cap, 1.5 s here); a completed pinned handshake counts as "alive" whatever the HTTP status | only when the canary went unanswered (to decide whether it is an outage) and once when a router is to be recorded |
 | Gateway latency | In-process unprivileged ICMP echo (`SOCK_DGRAM`, `IPPROTO_ICMP`; needs `net.ipv4.ping_group_range`) to the gateway; no child process | only while open, every 5 s |
-| Pi-hole stats | HTTPS API on 443 with the **pinned cert SHA-256**: `/api/stats/summary`, `/api/dns/blocking` | only while open, every 10 s; `/api/history` every 60 s |
+| Pi-hole stats | HTTPS API on 443 with the **pinned cert SHA-256**: `/api/stats/summary`, `/api/dns/blocking` | only while open, every 10 s; `/api/history` and `/api/stats/upstreams` every 60 s and on open |
 
 ### Pi-hole API sessions
 
@@ -115,6 +145,7 @@ subtracts it from `today` and from each `history` bucket.
     "signal": 72,
     "band": "5 GHz",
     "bitrateMbps": 866,
+    "signalDbm": null,
     "ip4": "192.168.1.242",
     "gateway": "192.168.1.1",
     "gatewayMs": 4.1,
@@ -145,7 +176,7 @@ subtracts it from `today` and from each `history` bucket.
     "leaks": [
       { "kind": "link|profile|ipv6-ra", "where": "Wired connection 1", "uuid": "…", "detail": "uses router DNS (automatic)" }
     ],
-    "failover": { "enabled": true, "fallback": "router", "active": false, "since": 0, "reason": "" },
+    "failover": { "enabled": true, "fallback": "router|quad9|cloudflare", "active": false, "since": 0, "reason": "" },
     "manualOverride": false,
     "bypassed": false,
     "resolvedFallback": ""
@@ -160,10 +191,13 @@ subtracts it from `today` and from each `history` bucket.
     "pauseRemainingS": 0,
     "api": "ok|auth|tls|unreachable|unconfigured",
     "health": "ok|degraded|unreachable|unknown",
+    "healthReason": "",
     "canaryBlocked": true,
     "today": { "total": 1204, "blocked": 164, "percent": 13.6, "selfQueries": 14 },
     "history": [{ "t": 1794034800, "total": 40, "blocked": 6 }],
     "historySpanS": 21600,
+    "upstreams": [{ "name": "dns9.quad9.net", "ip": "9.9.9.9", "port": 53, "count": 287, "responseMs": 159.2 }],
+    "answeredBy": { "blocklist": 1734, "cache": 1075, "forwarded": 430 },
     "detected": "",
     "probes": [{ "t": 1794035000.1, "ok": true, "ms": 3.1, "blocked": true }]
   },
@@ -180,6 +214,28 @@ Field rules:
     stripped. Hidden networks (empty SSID) have `hidden: true` and cannot be
     connected from the list.
   - Grouped by SSID with the strongest AP shown. At most 40.
+- **When a `state` line is sent.** Whenever the state differs from the last
+  line sent, at most 4 per second. While the panel is closed `pihole.probes`,
+  `pihole.latencyMs` and `link.bitrateMbps` do not count, so a healthy closed
+  probe produces only a heartbeat. `open` always sends the full state.
+- **`link.signalDbm`:** always `null`. NetworkManager's D-Bus API gives only
+  the percentage (`link.signal`); qnet does not poll `iw` or the supplicant.
+- **`pihole.upstreams`:** from `GET /api/stats/upstreams`, refreshed on open
+  and every 60 s while open: at most four real resolvers, busiest first,
+  `{name, ip, port, count, responseMs}` (`name` is `""` when Pi-hole has none,
+  `responseMs` is `null` without a figure; Pi-hole reports seconds). Entries
+  whose address, port or count do not validate are dropped. The counts are
+  Pi-hole's own.
+- **`pihole.answeredBy`:** `{blocklist, cache, forwarded}` from the same
+  answer: the pseudo-entries `blocklist` and `cache`, and the queries that went
+  to an upstream. qnet's own probes are taken out (the blocked ones from
+  `blocklist`, the rest from `forwarded`), like for `today`.
+- **`failover.fallback`:** the fallback actually in use while `failover.active`
+  (it may differ from the configured one: quad9 stands in for an untrusted
+  router), the configured one otherwise. `failover.reason` says why.
+- **`dns.mode` `fallback`:** only for the link that actually failed over. If
+  another link has become primary, that link's own mode is shown while
+  `failover.active` stays true.
 - **`scan`:** `running` is always `false` (the watcher never scans);
   `lastScanAgeS` is NM's last-scan age, kept counting between reads, `null` if
   there has never been a scan.
@@ -196,13 +252,23 @@ Field rules:
     its compiled fallback list);
   - `unknown`: no Pi-hole is configured and a LAN candidate is still being
     checked. `custom` is never reported while that is pending.
-- **`dns.bypassed`:** true only with a configured Pi-hole and mode `pihole` or
-  `custom`: other servers are in use next to (or instead of) the Pi-hole, or
-  the primary profile is not pinned (DHCP or router advertisements may add
-  servers). A deliberate `auto`, a `fallback`, `none` and `unknown` are never
-  a bypass.
+- **`dns.bypassed`:** true only with a configured Pi-hole and mode `pihole`,
+  `custom` or `auto`: other servers are in use next to (or instead of) the
+  Pi-hole, the primary profile is not pinned (DHCP or router advertisements
+  may add servers), or the link is on Automatic DNS that nobody chose.
+  Automatic counts as chosen only if `qnet dns auto` recorded it for this very
+  profile (`~/.local/state/qnet/auto-dns.json`; `dns pihole` and `dns pin`
+  clear it). So plugging in a cable whose new profile is automatic warns,
+  with a Pin action. A `fallback`, `none` and `unknown` are never a bypass.
 - **`dns.resolvedFallback`:** the first of resolved's compiled `FallbackDNS`
   servers, only while the mode is `none` with a link up; otherwise `""`.
+- **`dns.leaks[].kind`:** `link`, `profile`, `ipv6-ra`, or `resolved-fallback`
+  (`where: "systemd-resolved"`): resolved's compiled-in `FallbackDNS` has been
+  picked as its global server while links have servers of their own, so
+  queries may leave for 9.9.9.9 & co. The detail names the servers; the cure
+  is an empty `FallbackDNS=` in `resolved.conf`. Never raised when no link has
+  servers (that is mode `none`) or when the global server comes from
+  `resolved.conf`'s `DNS=` (reported as a `link` leak).
 - **`dns.leaks`:** unchanged shape; the panel groups them. Inactive saved
   profiles with automatic or foreign DNS are always listed; the active link
   is listed when its servers include anything but the Pi-hole (except in a
@@ -213,8 +279,10 @@ Field rules:
   `qnet pihole setup` does not take it from there).
 - **`pihole.health`:** `unreachable` after two unanswered canary probes in a
   row; `degraded` when the canary is answered but the latest upstream check
-  failed (SERVFAIL, REFUSED, timeout); `ok`; `unknown` before any probe or
-  without a Pi-hole.
+  failed (SERVFAIL, REFUSED, timeout) or systemd-resolved has dropped the
+  Pi-hole to plain UDP/TCP; `ok`; `unknown` before any probe or without a
+  Pi-hole. `healthReason` is a short sentence for it ("" when `ok` or
+  `unknown`); for `unreachable` it says whether the web API still answers.
 - **`pihole.canaryBlocked`:** whether the last answered canary was `0.0.0.0`
   (`true`), a real address (`false`, e.g. paused), or `null` if none yet.
 - **`pihole.today`:** the Pi-hole's 24-hour totals with qnet's own probe
@@ -233,12 +301,14 @@ Field rules:
 | Verb | Effect |
 |---|---|
 | `qnet dns pihole` | **Active connection's saved profile only.**<br>• Sets `ipv4.dns=<pihole>`, `ipv4.ignore-auto-dns=yes`, `ipv6.ignore-auto-dns=yes`, `ipv6.dns=` (blocks the IPv6 RA leak), then `Device.Reapply`.<br>• First saves the previous ipv4/ipv6 DNS settings to `~/.local/state/qnet/prev-dns/<uuid>.json` for undo.<br>• Refuses with `{"ok":false,"error":"confirm","detail":…}` when `manualOverride` is set and `--force` is absent.<br>• No-op only when already pinned **and** resolved shows nothing but the Pi-hole; an unpinned profile that merely happens to resolve through it is pinned.<br>• Records the network's gateway in the undo file `prev-dns/<uuid>.json` (`gateway`), which the failover uses to decide whether the router is trustworthy.<br>• Succeeds with `verifiedVia` only if the canary comes back blocked (see above). |
-| `qnet dns auto` | Restores the saved previous settings, or clears to automatic. Active profile only. Same confirm and no-op rules. |
+| `qnet dns auto` | Clears the active profile to automatic (the saved previous settings are restored only when they were automatic). Active profile only. Same confirm and no-op rules. Records Automatic as the user's choice for this profile (also on a no-op tap), before touching the profile. |
 | `qnet dns pin <uuid> [<uuid>...]` | Applies the Pi-hole settings to inactive saved profiles, e.g. Wired connection 1. Saves undo state. No Reapply. With one uuid the result is as for `dns pihole` (the active profile is pinned the same way as `dns pihole`); with several each is pinned independently and the result is `{"ok":true,"results":[{uuid,…}],"verifiedVia":…}`, or `{"ok":false,"error":"partial","results":[…]}` if any refused. |
 | `qnet pihole pause [secs=300]` / `resume` | `POST /api/dns/blocking {"blocking":false,"timer":secs}` / `{"blocking":true,"timer":null}` |
-| `qnet pihole setup [addr]` | Interactive only (run from a terminal). With no address it asks "Pi-hole address:"; an address is never taken from network detection. Takes the web password at a no-echo prompt.<br>• Fetches the TLS cert and prints its SHA-256 for the user to accept (TOFU). On a re-setup it loads the pinned certificate for that address; if the new one differs it prints a loud `CERTIFICATE CHANGED (was …, now …)` and requires the word `yes` to be typed before the password is sent.<br>• Warns if an app password already exists, because `app_pwhash` replaces it.<br>• Creates the app password (`GET /api/auth/app`, then `PATCH /api/config` with `{"config":{"webserver":{"api":{"app_pwhash":…}}}}`) and stores it with `secret-tool store` (secret on stdin; attributes `service qnet`, `pihole <addr>`). Creating it ends the setup session, so setup logs in again.<br>• Adds `qnet-canary.invalid` to the exact deny list (`POST /api/domains/deny/exact`, comment "qnet canary"), best effort.<br>• Writes the config. |
+| `qnet pihole setup [addr]` | Interactive only (run from a terminal). With no address it asks "Pi-hole address:"; an address is never taken from network detection. Takes the web password at a no-echo prompt.<br>• Fetches the TLS cert and prints its SHA-256 for the user to accept (TOFU). On a re-setup it loads the pinned certificate for that address; if the new one differs it prints a loud `CERTIFICATE CHANGED (was …, now …)` and requires the word `yes` to be typed before the password is sent.<br>• Reads the existing `app_pwhash` first; if that cannot be read (or is not understood) setup stops before changing anything, so a later rollback can never write an empty hash over a real one.<br>• Warns if an app password already exists, because `app_pwhash` replaces it.<br>• Creates the app password (`GET /api/auth/app`, then `PATCH /api/config` with `{"config":{"webserver":{"api":{"app_pwhash":…}}}}`) and stores it with `secret-tool store` (secret on stdin; attributes `service qnet`, `pihole <addr>`). Creating it ends the setup session, so setup logs in again.<br>• Adds `qnet-canary.invalid` to the exact deny list (`POST /api/domains/deny/exact`, comment "qnet canary"), best effort.<br>• Writes the config. |
 | `qnet wifi connect <ap-path>` | Passphrase on stdin; empty means an open or known network. Known: `ActivateConnection` of the matching profile. Unknown: `AddAndActivateConnection` with the secret in the settings dict. **Enterprise (802.1X) is refused** with `"error":"enterprise"`; the panel then opens `nmtui` in a terminal. qnet never creates an EAP profile. |
-| `qnet wifi down`, `qnet wifi forget <uuid>`, `qnet wifi scan`, `qnet wifi radio on\|off` | NM D-Bus |
+| `qnet wifi down`, `qnet wifi forget <uuid>` | NM D-Bus |
+| `qnet wifi scan [--if-stale <secs>]` | `RequestScan`, but never closer than 15 s to **either** NM's `LastScan` or qnet's own last request (`$XDG_RUNTIME_DIR/qnet/scan`). Too soon: `{"ok":false,"error":"too-soon","retryInS":N}`. With `--if-stale`, a scan is requested only if both clocks are older than `<secs>`; otherwise `{"ok":true,"skipped":true,"lastScanAgeS":N}` (N = the younger of the two) and nothing is done. The 15 s rule still applies after that check. The panel calls `qnet wifi scan --if-stale 60` when the Wi-Fi view opens. |
+| `qnet wifi radio on\|off` | NM `WirelessEnabled`. A request for the state it is already in is a no-op. A second *change* within 10 s of the last one (`$XDG_RUNTIME_DIR/qnet/radio`) is refused: `{"ok":false,"error":"too-soon","retryInS":N}`. |
 | `qnet portal` | Opens `link.portalUrl`, or `http://neverssl.com`, in a normal **incognito window with a throwaway profile**: `chromium --user-data-dir=<new 0700 temp dir> --incognito <url>` (not `--app`: a portal page is untrusted web content). The temp dir is removed when the browser exits. |
 
 ## Failover (in `qnet watch`)
@@ -253,6 +323,12 @@ Field rules:
   - the link is up (NM device state ACTIVATED) and has been the same
     connection for 10 s;
   - the gateway answers the same DNS probe;
+  - the Pi-hole's pinned web API does **not** answer (when the canary is
+    unanswered). A completed pinned handshake means the host is alive, so the
+    DNS silence is packet loss or spoofing, not an outage, and qnet does not
+    fail over; a different certificate does not count as the Pi-hole being
+    dead either. (This check is not made when the canary is answered but
+    upstream resolution fails: then the web API being up is expected.)
   - the hold-down after the last recovery has passed (see below).
 
   A dead Wi-Fi card is not a Pi-hole outage, so in that case qnet does
@@ -263,9 +339,16 @@ Field rules:
     crash can never leave you stranded on the fallback.
   - Keep `ipv6.ignore-auto-dns=yes`.
   - The fallback server is `router` (the gateway), `quad9` or `cloudflare`.
-    `router` is used only if the gateway is the one recorded when the profile
-    was pinned (`prev-dns/<uuid>.json`, learned once from a healthy pinned
-    profile if absent); otherwise quad9 is used and `failover.reason` says so.
+    `router` is used only if the router is verifiably the one the profile was
+    pinned on: the gateway's **IP and MAC** (from `/proc/net/arp`) both match
+    what `prev-dns/<uuid>.json` holds, **and** the router does not itself
+    answer the canary with `0.0.0.0` (that means it forwards to the Pi-hole).
+    Otherwise quad9 is used and `failover.reason` says why. The record is made
+    by `dns pihole`, or learned once from a healthy pinned profile, but only
+    after the Pi-hole's pinned web API has answered on that link; a record for
+    a different router is never overwritten by the learning.
+  - A DNS change is made under the DNS lock (see above); if it is held the
+    attempt is retried after the cool-down.
   - The engaged interface and connection are remembered; recovery and exit
     restore **that** link even if the primary link has since changed. If the
     engaged link itself goes away the failover state is simply dropped (a new

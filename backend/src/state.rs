@@ -6,12 +6,13 @@ use std::net::IpAddr;
 
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{Config, Fallback};
 use crate::dnsmodel::{self, classify, detect_leaks, detect_mode, is_bypassed, LeakInput, Mode};
 use crate::failover::Failover;
 use crate::ledger::Ledger;
 use crate::net::*;
-use crate::pihole::{Blocking, BlockingState, Bucket, Summary};
+use crate::pihole::{Blocking, BlockingState, Bucket, Summary, Upstreams};
+use crate::threads::ApiLiveness;
 use crate::util::round1;
 
 pub const MAX_NETWORKS: usize = 40;
@@ -39,6 +40,9 @@ pub struct ApiView {
     pub own_today: (u64, u64),
     /// The tally as of the moment `history` was read.
     pub own_history: Ledger,
+    /// Per-upstream statistics, and the tally when they were read.
+    pub upstreams: Upstreams,
+    pub own_upstreams: (u64, u64),
 }
 
 impl ApiView {
@@ -50,6 +54,8 @@ impl ApiView {
             blocking: None,
             own_today: (0, 0),
             own_history: Ledger::default(),
+            upstreams: Upstreams::default(),
+            own_upstreams: (0, 0),
         }
     }
     pub fn configured() -> Self {
@@ -83,6 +89,15 @@ pub struct Inputs<'a> {
     pub upstream_ok: Option<bool>,
     /// Gateway ICMP round trip, only while the panel is open.
     pub gateway_ms: Option<f64>,
+    /// What the pinned web API said the last time the canary went unanswered.
+    pub api_state: Option<ApiLiveness>,
+    /// systemd-resolved has dropped the Pi-hole to a lower feature level.
+    pub resolved_downgrade: Option<&'a str>,
+    /// `qnet dns auto` recorded Automatic as the choice for the primary profile.
+    pub auto_deliberate: bool,
+    /// The link a runtime failover is on, and the fallback it uses.
+    pub engaged_iface: Option<&'a str>,
+    pub fallback_in_use: Option<Fallback>,
     pub api: &'a ApiView,
     pub failover: &'a Failover,
     pub scan: ScanView,
@@ -105,6 +120,9 @@ pub struct LinkOut {
     pub signal: u32,
     pub band: String,
     pub bitrate_mbps: u32,
+    /// Signal strength in dBm. NetworkManager does not expose it over D-Bus
+    /// (only a percentage), and polling `iw` is off the table: always null.
+    pub signal_dbm: Option<i32>,
     pub ip4: String,
     pub gateway: String,
     pub gateway_ms: Option<f64>,
@@ -191,6 +209,23 @@ pub struct TodayOut {
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamOut {
+    pub name: String,
+    pub ip: String,
+    pub port: u16,
+    pub count: u64,
+    pub response_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct AnsweredByOut {
+    pub blocklist: u64,
+    pub cache: u64,
+    pub forwarded: u64,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct BucketOut {
     pub t: i64,
     pub total: u64,
@@ -218,12 +253,18 @@ pub struct PiholeOut {
     pub api: String,
     /// ok | degraded | unreachable | unknown
     pub health: &'static str,
+    /// Why, in a short sentence; empty when `ok` or `unknown`.
+    pub health_reason: String,
     /// The last canary answered 0.0.0.0 (true) or did not (false).
     pub canary_blocked: Option<bool>,
     pub today: TodayOut,
     pub history: Vec<BucketOut>,
     /// Seconds of non-empty history (for fitting the graph's x axis).
     pub history_span_s: u64,
+    /// The busiest real resolvers behind the Pi-hole (at most four).
+    pub upstreams: Vec<UpstreamOut>,
+    /// Who answered: the blocklist, the cache, or an upstream.
+    pub answered_by: AnsweredByOut,
     /// A LAN Pi-hole seen blocking the canary while none is configured.
     /// Display only; never used as the address.
     pub detected: String,
@@ -270,6 +311,7 @@ pub fn build_link(net: Option<&NetSnapshot>, profiles: &[Profile], gateway_ms: O
         signal: 0,
         band: String::new(),
         bitrate_mbps: 0,
+        signal_dbm: None,
         ip4: String::new(),
         gateway: String::new(),
         gateway_ms: None,
@@ -394,9 +436,16 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
     let primary_link = primary.and_then(|d| i.resolver.and_then(|r| r.link(d.ifindex)));
     let link_servers: Vec<IpAddr> = primary_link.map(|l| l.servers.clone()).unwrap_or_default();
 
+    // Only the link that actually failed over is in "fallback".
+    let failed_over_here = i.failover.active()
+        && match (i.engaged_iface, primary) {
+            (Some(e), Some(d)) => e == d.iface,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
     let mut mode = detect_mode(
         primary.is_some(),
-        i.failover.active(),
+        failed_over_here,
         &link_servers,
         primary_profile,
         i.pihole,
@@ -453,6 +502,8 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
             gateways: &gws,
             mode,
             primary_iface: primary.map(|d| d.iface.as_str()),
+            auto_deliberate: i.auto_deliberate,
+            engaged_iface: if i.failover.active() { i.engaged_iface } else { None },
         })
         .into_iter()
         .map(|l| LeakOut {
@@ -473,7 +524,7 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
     let configured = i.cfg.pihole.is_some();
     let configured_addr = i.cfg.pihole.as_ref().map(|p| p.address);
     let bypassed = match configured_addr {
-        Some(p) if primary.is_some() => is_bypassed(mode, &link_servers, primary_profile, p),
+        Some(p) if primary.is_some() => is_bypassed(mode, &link_servers, primary_profile, p, i.auto_deliberate),
         _ => false,
     };
     let resolved_fallback = match (mode, i.resolver) {
@@ -482,12 +533,17 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
     };
     let dns = DnsOut {
         mode: mode.as_str(),
-        mode_source: if i.failover.active() { "runtime-failover" } else { "profile" },
+        mode_source: if mode == Mode::Fallback { "runtime-failover" } else { "profile" },
         servers,
         leaks,
         failover: FailoverOut {
             enabled: configured && i.cfg.failover.enabled,
-            fallback: i.cfg.failover.fallback.as_str(),
+            // What is in use while failed over, what would be otherwise.
+            fallback: if i.failover.active() {
+                i.fallback_in_use.unwrap_or(i.cfg.failover.fallback).as_str()
+            } else {
+                i.cfg.failover.fallback.as_str()
+            },
             active: i.failover.active(),
             since: i.failover.since(),
             reason: i.failover.reason().to_string(),
@@ -528,14 +584,21 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
         None => String::new(),
     };
     let is_reachable = i.pihole.is_some() && reachable(i.probes);
-    let health = if i.pihole.is_none() || i.probes.is_empty() {
-        "unknown"
+    let (health, health_reason): (&'static str, String) = if i.pihole.is_none() || i.probes.is_empty() {
+        ("unknown", String::new())
     } else if !is_reachable {
-        "unreachable"
+        let why = match i.api_state {
+            Some(ApiLiveness::Alive) => "DNS probes get no answer, but the web API still does: not failing over",
+            Some(ApiLiveness::Mismatch) => "DNS probes get no answer and the web API presents a different certificate",
+            _ => "no answer to DNS probes",
+        };
+        ("unreachable", why.to_string())
     } else if i.upstream_ok == Some(false) {
-        "degraded"
+        ("degraded", "upstream resolution is failing (SERVFAIL, REFUSED or timeout)".to_string())
+    } else if let Some(d) = i.resolved_downgrade {
+        ("degraded", d.to_string())
     } else {
-        "ok"
+        ("ok", String::new())
     };
     let canary_blocked = if i.pihole.is_some() { last_ok.map(|p| p.blocked) } else { None };
 
@@ -570,6 +633,7 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
         pause_remaining_s,
         api: if configured { i.api.status.clone() } else { "unconfigured".into() },
         health,
+        health_reason,
         canary_blocked,
         today: TodayOut {
             total,
@@ -579,6 +643,30 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
         },
         history,
         history_span_s,
+        upstreams: i
+            .api
+            .upstreams
+            .list
+            .iter()
+            .map(|u| UpstreamOut {
+                name: u.name.clone(),
+                ip: u.ip.to_string(),
+                port: u.port,
+                count: u.count,
+                response_ms: u.response_ms,
+            })
+            .collect(),
+        answered_by: {
+            // Our own probes are in these figures too: the blocked ones in
+            // the blocklist, the rest among what was forwarded.
+            let a = i.api.upstreams.answered_by;
+            let (own_total, own_blocked) = i.api.own_upstreams;
+            AnsweredByOut {
+                blocklist: a.blocklist.saturating_sub(own_blocked),
+                cache: a.cache,
+                forwarded: a.forwarded.saturating_sub(own_total.saturating_sub(own_blocked)),
+            }
+        },
         detected: i.detected.map(|a| a.to_string()).unwrap_or_default(),
         probes: i
             .probes
@@ -625,10 +713,11 @@ pub fn history_span(history: &[BucketOut]) -> u64 {
     (last.t + BUCKET_S - first.t).clamp(0, 24 * 3600) as u64
 }
 
-/// Fields that tick with the clock and must not, on their own, cause a new
-/// line to be emitted.
-pub fn change_signature(s: &State) -> String {
-    let mut v = serde_json::to_value(s).unwrap_or(serde_json::Value::Null);
+/// What decides whether a new line is worth sending: the state without the
+/// fields that merely tick with the clock and, while the panel is closed,
+/// without the ones that only a visible graph needs (`probes`, `latencyMs`,
+/// the Wi-Fi `bitrateMbps`). A healthy closed probe then changes nothing.
+pub fn signature_of(mut v: serde_json::Value, open: bool) -> String {
     if let Some(o) = v.as_object_mut() {
         o.remove("seq");
         o.remove("heartbeat");
@@ -637,9 +726,23 @@ pub fn change_signature(s: &State) -> String {
         }
         if let Some(p) = o.get_mut("pihole").and_then(|s| s.as_object_mut()) {
             p.remove("pauseRemainingS");
+            if !open {
+                p.remove("probes");
+                p.remove("latencyMs");
+            }
+        }
+        if !open {
+            if let Some(l) = o.get_mut("link").and_then(|s| s.as_object_mut()) {
+                l.remove("bitrateMbps");
+            }
         }
     }
     v.to_string()
+}
+
+#[cfg(test)]
+pub fn change_signature(s: &State, open: bool) -> String {
+    signature_of(serde_json::to_value(s).unwrap_or(serde_json::Value::Null), open)
 }
 
 #[cfg(test)]
@@ -648,6 +751,7 @@ mod tests {
     use crate::config::{Config, FailoverCfg, PiholeCfg};
     use crate::dnsmodel::fixtures as fx;
     use crate::net::fake::{fake_cfg, FakeNet, U_ETH1, U_WIFI};
+    use crate::pihole::{AnsweredBy, Upstream};
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
 
@@ -663,6 +767,11 @@ mod tests {
         gateway_ms: Option<f64>,
         detected: Option<IpAddr>,
         detect_pending: bool,
+        auto_deliberate: bool,
+        engaged_iface: Option<String>,
+        fallback_in_use: Option<Fallback>,
+        resolved_downgrade: Option<String>,
+        api_state: Option<ApiLiveness>,
     }
 
     fn fixture() -> Fixture {
@@ -689,12 +798,28 @@ mod tests {
                 )),
                 own_today: (0, 0),
                 own_history: Ledger::default(),
+                upstreams: Upstreams {
+                    list: vec![Upstream {
+                        name: "dns9.quad9.net".into(),
+                        ip: "9.9.9.9".parse().unwrap(),
+                        port: 53,
+                        count: 287,
+                        response_ms: Some(159.2),
+                    }],
+                    answered_by: AnsweredBy { blocklist: 1734, cache: 1075, forwarded: 430 },
+                },
+                own_upstreams: (0, 0),
             },
             fo: Failover::new(),
             upstream_ok: Some(true),
             gateway_ms: Some(3.84),
             detected: None,
             detect_pending: false,
+            auto_deliberate: false,
+            engaged_iface: None,
+            fallback_in_use: None,
+            resolved_downgrade: None,
+            api_state: None,
         }
     }
 
@@ -711,6 +836,11 @@ mod tests {
                 probes: &f.probes,
                 upstream_ok: f.upstream_ok,
                 gateway_ms: f.gateway_ms,
+                api_state: f.api_state,
+                resolved_downgrade: f.resolved_downgrade.as_deref(),
+                auto_deliberate: f.auto_deliberate,
+                engaged_iface: f.engaged_iface.as_deref(),
+                fallback_in_use: f.fallback_in_use,
                 api: &f.api,
                 failover: &f.fo,
                 scan: ScanView { running: false },
@@ -737,7 +867,7 @@ mod tests {
             "link": {
                 "kind": "wifi", "device": "wlp7s0", "connection": "Redwood",
                 "uuid": U_WIFI, "ssid": "Redwood", "signal": 72, "band": "5 GHz",
-                "bitrateMbps": 866, "ip4": "192.168.1.242", "gateway": "192.168.1.1",
+                "bitrateMbps": 866, "signalDbm": null, "ip4": "192.168.1.242", "gateway": "192.168.1.1",
                 "gatewayMs": 3.8, "connectivity": "full", "portalUrl": ""
             },
             "radio": {"wifiEnabled": true, "hwEnabled": true},
@@ -778,10 +908,12 @@ mod tests {
                 "configured": true, "address": "192.168.1.153",
                 "adminUrl": "https://192.168.1.153/admin/", "reachable": true,
                 "latencyMs": 3.0, "blocking": "enabled", "pauseRemainingS": 0, "api": "ok",
-                "health": "ok", "canaryBlocked": true,
+                "health": "ok", "healthReason": "", "canaryBlocked": true,
                 "today": {"total": 1204, "blocked": 164, "percent": 13.6, "selfQueries": 0},
                 "history": [{"t": 1794034800, "total": 40, "blocked": 6}],
                 "historySpanS": 600,
+                "upstreams": [{"name": "dns9.quad9.net", "ip": "9.9.9.9", "port": 53, "count": 287, "responseMs": 159.2}],
+                "answeredBy": {"blocklist": 1734, "cache": 1075, "forwarded": 430},
                 "detected": "",
                 "probes": [
                     {"t": 1794000000.0, "ok": true, "ms": 3.1, "blocked": true},
@@ -1026,6 +1158,7 @@ mod tests {
     #[test]
     fn automatic_mode_is_not_a_leak_and_lights_auto() {
         let mut f = fixture();
+        f.auto_deliberate = true;
         f.profiles[0].dns = fx::dns_auto();
         f.resolver.links[0].servers = vec![fx::gw()];
         f.resolver.links[0].current = Some(fx::gw());
@@ -1068,6 +1201,11 @@ mod tests {
                     probes: &VecDeque::new(),
                     upstream_ok: None,
                     gateway_ms: None,
+                api_state: None,
+                resolved_downgrade: None,
+                auto_deliberate: false,
+                engaged_iface: None,
+                fallback_in_use: None,
                     api: &ApiView::unconfigured(),
                     failover: &f.fo,
                     scan: ScanView::default(),
@@ -1137,13 +1275,13 @@ mod tests {
         b.heartbeat = true;
         b.scan.last_scan_age_s = Some(500);
         b.pihole.pause_remaining_s = 12;
-        assert_eq!(change_signature(&a), change_signature(&b));
+        assert_eq!(change_signature(&a, true), change_signature(&b, true));
         let mut c = a.clone();
         c.dns.mode = "auto";
-        assert_ne!(change_signature(&a), change_signature(&c));
+        assert_ne!(change_signature(&a, true), change_signature(&c, true));
         let mut d = a.clone();
         d.pihole.today.total += 1;
-        assert_ne!(change_signature(&a), change_signature(&d));
+        assert_ne!(change_signature(&a, true), change_signature(&d, true));
     }
 
     #[test]
@@ -1178,13 +1316,20 @@ mod tests {
         assert_eq!(st.dns.mode, "pihole");
         assert!(st.dns.bypassed, "Pin has something to fix");
 
-        // Deliberate automatic mode on the router is not a bypass.
+        // Automatic that `qnet dns auto` recorded is the user's choice; any other
+        // Automatic (a cable that came up on its own) is a bypass.
         let mut f = fixture();
         f.profiles[0].dns = fx::dns_auto();
         f.resolver.links[0].servers = vec![fx::gw()];
         let st = build(&f);
         assert_eq!(st.dns.mode, "auto");
+        assert!(st.dns.bypassed, "nobody chose this");
+        assert!(st.dns.leaks.iter().any(|l| l.where_ == "Redwood"), "and the active link says so");
+        f.auto_deliberate = true;
+        let st = build(&f);
+        assert_eq!(st.dns.mode, "auto");
         assert!(!st.dns.bypassed);
+        assert!(st.dns.leaks.iter().all(|l| l.where_ != "Redwood"));
 
         // Link up, no DNS servers at all: mode none, resolved's fallback shown.
         let mut f = fixture();
@@ -1221,6 +1366,11 @@ mod tests {
                 probes: &f.probes,
                 upstream_ok: None,
                 gateway_ms: None,
+                api_state: None,
+                resolved_downgrade: None,
+                auto_deliberate: false,
+                engaged_iface: None,
+                fallback_in_use: None,
                 api: &f.api,
                 failover: &f.fo,
                 scan: ScanView::default(),
@@ -1276,6 +1426,11 @@ mod tests {
                 probes: &f.probes,
                 upstream_ok: None,
                 gateway_ms: None,
+                api_state: None,
+                resolved_downgrade: None,
+                auto_deliberate: false,
+                engaged_iface: None,
+                fallback_in_use: None,
                 api: &ApiView::unconfigured(),
                 failover: &f.fo,
                 scan: ScanView::default(),
@@ -1353,5 +1508,151 @@ mod tests {
         assert_eq!(build(&f).link.gateway_ms, Some(12.3));
         f.gateway_ms = None;
         assert_eq!(to_json(&build(&f))["link"]["gatewayMs"], Value::Null);
+    }
+
+    #[test]
+    fn closed_signature_ignores_probes_latency_and_bitrate_but_open_does_not() {
+        let f = fixture();
+        let a = build(&f);
+        let mut b = a.clone();
+        b.pihole.probes.push(ProbeOut { t: 1_794_000_020.0, ok: true, ms: Some(9.0), blocked: true });
+        b.pihole.latency_ms = Some(9.0);
+        b.link.bitrate_mbps = 433;
+        assert_eq!(change_signature(&a, false), change_signature(&b, false), "closed: nothing worth a line");
+        assert_ne!(change_signature(&a, true), change_signature(&b, true), "open: the graph needs them");
+        // Everything else still counts while closed.
+        let mut c = a.clone();
+        c.pihole.reachable = false;
+        assert_ne!(change_signature(&a, false), change_signature(&c, false));
+        let mut d = a.clone();
+        d.pihole.health = "degraded";
+        assert_ne!(change_signature(&a, false), change_signature(&d, false));
+        let mut e = a.clone();
+        e.link.signal = 40;
+        assert_ne!(change_signature(&a, false), change_signature(&e, false));
+    }
+
+    #[test]
+    fn history_buckets_labelled_by_their_centre_are_matched() {
+        // Live /api/history timestamps are bucket centres: t % 600 == 300.
+        let mut f = fixture();
+        let start = 1_794_034_200i64; // a multiple of 600
+        assert_eq!(start % 600, 0);
+        f.api.history = vec![
+            Bucket { t: start + 300, total: 50, blocked: 10 },
+            Bucket { t: start + 900, total: 40, blocked: 6 },
+        ];
+        let mut ledger = Ledger::default();
+        ledger.add(start as f64 + 100.0, 12, 8); // inside the first bucket
+        ledger.add(start as f64 + 700.0, 4, 0); // inside the second
+        f.api.own_history = ledger.clone();
+        f.api.own_today = ledger.sums(start as f64 + 800.0);
+        let st = build(&f);
+        let h = &st.pihole.history;
+        assert_eq!((h[0].t, h[0].total, h[0].blocked), (start + 300, 38, 2), "own queries leave the right bucket");
+        assert_eq!((h[1].t, h[1].total, h[1].blocked), (start + 900, 36, 6));
+        // The same with start-labelled buckets (tests, older Pi-holes).
+        f.api.history = vec![Bucket { t: start, total: 50, blocked: 10 }];
+        let st = build(&f);
+        assert_eq!((st.pihole.history[0].total, st.pihole.history[0].blocked), (38, 2));
+    }
+
+    #[test]
+    fn failover_fallback_is_the_one_in_use_and_reason_is_shown() {
+        let mut f = fixture();
+        assert_eq!(build(&f).dns.failover.fallback, "router", "configured, nothing in use");
+        f.fo.adopt(1_794_000_000, "Pi-hole not answering; this router is not the one the profile was pinned on, using quad9");
+        f.fallback_in_use = Some(Fallback::Quad9);
+        f.engaged_iface = Some("wlp7s0".into());
+        f.resolver.links[0].servers = vec!["9.9.9.9".parse().unwrap()];
+        let st = build(&f);
+        assert!(st.dns.failover.active);
+        assert_eq!(st.dns.failover.fallback, "quad9", "what is really running, not what was configured");
+        assert!(st.dns.failover.reason.contains("quad9"));
+        assert_eq!(st.dns.mode, "fallback");
+        assert_eq!(st.dns.mode_source, "runtime-failover");
+        // Unknown in-use value (an adopted failover we could not identify).
+        f.fallback_in_use = None;
+        assert_eq!(build(&f).dns.failover.fallback, "router");
+    }
+
+    #[test]
+    fn mode_is_fallback_only_for_the_link_that_failed_over() {
+        // Wi-Fi failed over; Ethernet came up and is now the primary link
+        // with the Pi-hole pinned on it.
+        let mut f = fixture();
+        f.fo.adopt(1_794_000_000, "x");
+        f.engaged_iface = Some("wlp7s0".into());
+        f.fallback_in_use = Some(Fallback::Router);
+        let mut eth = f.net.devices[0].clone();
+        eth.kind = DeviceKind::Ethernet;
+        eth.iface = "enp8s0".into();
+        eth.ifindex = 2;
+        eth.wifi = None;
+        eth.active = Some(ActiveConn {
+            path: "/org/freedesktop/NetworkManager/ActiveConnection/9".into(),
+            uuid: U_ETH1.into(),
+            id: "Wired connection 1".into(),
+            state: 2,
+        });
+        f.net.primary_conn = eth.active.as_ref().map(|a| a.path.clone());
+        f.net.devices.push(eth);
+        f.profiles[1].dns = fx::dns_pinned();
+        f.resolver.links.push(fx::link(2, "enp8s0", &[fx::PI], true));
+        let st = build(&f);
+        assert_eq!(st.link.kind, "ethernet");
+        assert_eq!(st.dns.mode, "pihole", "the primary link is fine");
+        assert_eq!(st.dns.mode_source, "profile");
+        assert!(st.dns.failover.active, "the failover itself is still real");
+        assert!(!st.dns.bypassed);
+        // The failed-over link, still primary, is "fallback".
+        let mut g = fixture();
+        g.fo.adopt(1_794_000_000, "x");
+        g.engaged_iface = Some("wlp7s0".into());
+        assert_eq!(build(&g).dns.mode, "fallback");
+        // And a failover whose link we cannot name is assumed to be here.
+        g.engaged_iface = None;
+        assert_eq!(build(&g).dns.mode, "fallback");
+    }
+
+    #[test]
+    fn health_reason_explains_each_state() {
+        let mut f = fixture();
+        let st = build(&f);
+        assert_eq!((st.pihole.health, st.pihole.health_reason.as_str()), ("ok", ""));
+        f.upstream_ok = Some(false);
+        let st = build(&f);
+        assert_eq!(st.pihole.health, "degraded");
+        assert!(st.pihole.health_reason.contains("upstream"));
+        f.upstream_ok = Some(true);
+        f.resolved_downgrade = Some("systemd-resolved dropped 192.168.1.153 to plain UDP (EDNS0 is failing)".into());
+        let st = build(&f);
+        assert_eq!(st.pihole.health, "degraded");
+        assert!(st.pihole.health_reason.contains("EDNS0"));
+        // A real outage outranks a downgrade; the web API's word is added.
+        f.probes.push_back(ProbeRec { t: 1_794_000_010.0, ok: false, ms: None, blocked: false });
+        f.probes.push_back(ProbeRec { t: 1_794_000_015.0, ok: false, ms: None, blocked: false });
+        f.api_state = Some(ApiLiveness::Dead);
+        let st = build(&f);
+        assert_eq!(st.pihole.health, "unreachable");
+        assert_eq!(st.pihole.health_reason, "no answer to DNS probes");
+        f.api_state = Some(ApiLiveness::Alive);
+        assert!(build(&f).pihole.health_reason.contains("web API still does"));
+        f.probes.clear();
+        let st = build(&f);
+        assert_eq!((st.pihole.health, st.pihole.health_reason.as_str()), ("unknown", ""));
+    }
+
+    #[test]
+    fn resolved_fallback_leak_shows_in_the_state() {
+        let mut f = fixture();
+        f.resolver.global_current = Some("9.9.9.9".parse().unwrap());
+        let st = build(&f);
+        let l = st.dns.leaks.iter().find(|l| l.kind == "resolved-fallback").expect("flagged");
+        assert_eq!(l.where_, "systemd-resolved");
+        assert!(l.detail.contains("9.9.9.9") && l.detail.contains("1.1.1.1"));
+        assert!(!st.dns.bypassed, "it is a leak line, not the hero's bypass");
+        f.resolver.global_current = None;
+        assert!(build(&f).dns.leaks.iter().all(|l| l.kind != "resolved-fallback"));
     }
 }

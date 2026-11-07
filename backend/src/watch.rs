@@ -12,18 +12,20 @@
 //! settings. `Watch` takes the current time as an argument everywhere, so
 //! its decisions can be tested without sleeping.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::actions;
+use crate::actions::{self, ApiCheck, MacLookup};
 use crate::config::{self, Config, Fallback};
 use crate::dnsmodel::{self, pihole_candidate};
 use crate::failover::{Decision, Failover, LinkKey, Obs};
 use crate::ledger::Ledger;
+use crate::neigh;
 use crate::net::*;
 use crate::state::*;
 use crate::util;
@@ -41,6 +43,13 @@ pub const NET_MIN_GAP_MS: u64 = 250;
 pub const LEDGER_SAVE_MS: u64 = 300_000;
 /// How long a gateway round trip stays valid with no new measurement.
 pub const GATEWAY_MS_FRESH_S: f64 = 20.0;
+/// How often resolved's view of the Pi-hole is read while the panel is open.
+pub const RESOLVED_CHECK_MS: u64 = 30_000;
+/// How long to wait before trying to record the router again.
+pub const LEARN_RETRY_MS: u64 = 300_000;
+
+/// Reads resolved's view of the Pi-hole; Some(reason) if it downgraded it.
+pub type ResolvedCheck = Arc<dyn Fn(IpAddr) -> Option<String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
@@ -102,21 +111,40 @@ pub struct Watch {
     confirmed: Option<IpAddr>,
     /// Latest result of the upstream-resolution check.
     upstream_ok: Option<bool>,
+    /// What the pinned web API said when the canary last went unanswered.
+    api_state: Option<ApiLiveness>,
+    /// The gateway answered the canary with 0.0.0.0 in the last failing cycle.
+    gateway_forwards: bool,
+    /// The fallback a failover is actually using.
+    fallback_in_use: Option<Fallback>,
+    resolved_downgrade: Option<String>,
+    resolved_check_due_ms: u64,
+    resolved_check: Option<ResolvedCheck>,
+    event_tx: Option<Sender<Event>>,
+    /// Profiles whose Automatic DNS was chosen with `qnet dns auto`.
+    auto_set: HashSet<String>,
+    api_check: ApiCheck,
+    mac_lookup: MacLookup,
+    /// `$XDG_RUNTIME_DIR/qnet`: the DNS lock.
+    runtime_dir: PathBuf,
     /// ICMP round trip to the gateway and when it was taken (unix s).
     gateway_ms: Option<(f64, f64)>,
     ledger: Ledger,
     ledger_saved_ms: u64,
     state_dir: PathBuf,
-    learned_for: Option<String>,
+    learned_for: Option<(String, Ipv4Addr)>,
+    learn_retry_ms: u64,
     dirty: Dirty,
     aps_stale: bool,
     last_net_ms: u64,
     net_read_unix: f64,
     resolver_due_ms: u64,
     seq: u64,
-    last_sig: String,
+    last_json: Option<serde_json::Value>,
     last_emit_ms: u64,
     emitted_once: bool,
+    /// Send the full state next time, whatever the signature says (on `open`).
+    force_emit: bool,
     /// Bumped whenever anything the state is built from may have changed.
     gen: u64,
     emitted_gen: u64,
@@ -153,20 +181,40 @@ impl Watch {
             candidate_probed: false,
             confirmed: None,
             upstream_ok: None,
+            api_state: None,
+            gateway_forwards: false,
+            fallback_in_use: None,
+            resolved_downgrade: None,
+            resolved_check_due_ms: 0,
+            resolved_check: None,
+            event_tx: None,
+            auto_set: HashSet::new(),
+            // Unit tests must never reach the real network or neighbour table.
+            #[cfg(not(test))]
+            api_check: Arc::new(|addr, probe| check_api(addr, probe, Duration::from_millis(1500))),
+            #[cfg(test)]
+            api_check: Arc::new(|_, _| ApiLiveness::Dead),
+            #[cfg(not(test))]
+            mac_lookup: Arc::new(neigh::mac_of),
+            #[cfg(test)]
+            mac_lookup: Arc::new(|_, _| None),
+            runtime_dir: util::runtime_qnet_dir(),
             gateway_ms: None,
             ledger: Ledger::default(),
             ledger_saved_ms: 0,
             state_dir: util::state_dir(),
             learned_for: None,
+            learn_retry_ms: 0,
             dirty: Dirty::default(),
             aps_stale: true,
             last_net_ms: 0,
             net_read_unix: 0.0,
             resolver_due_ms: 0,
             seq: 0,
-            last_sig: String::new(),
+            last_json: None,
             last_emit_ms: 0,
             emitted_once: false,
+            force_emit: false,
             gen: 1,
             emitted_gen: 0,
             pending_change: false,
@@ -187,6 +235,29 @@ impl Watch {
     #[cfg(test)]
     pub fn set_state_dir(&mut self, dir: PathBuf) {
         self.state_dir = dir;
+    }
+
+    /// Where the DNS lock lives (tests use a temp dir).
+    #[cfg(test)]
+    pub fn set_runtime_dir(&mut self, dir: PathBuf) {
+        self.runtime_dir = dir;
+    }
+
+    #[cfg(test)]
+    pub fn set_api_check(&mut self, f: ApiCheck) {
+        self.api_check = f;
+    }
+
+    #[cfg(test)]
+    pub fn set_mac_lookup(&mut self, f: MacLookup) {
+        self.mac_lookup = f;
+    }
+
+    /// Read resolved's server state through `f` while the panel is open;
+    /// results come back as `Event::Downgrade` on `tx`.
+    pub fn set_resolved_check(&mut self, f: ResolvedCheck, tx: Sender<Event>) {
+        self.resolved_check = Some(f);
+        self.event_tx = Some(tx);
     }
 
     #[cfg(test)]
@@ -268,6 +339,9 @@ impl Watch {
             }
             Err(e) => self.profile_error = format!("NetworkManager: {}", e.detail()),
         }
+        // `qnet dns auto` writes its note before it touches the profile, so
+        // by the time the change is seen the note is there.
+        self.auto_set = actions::auto_choices(&self.state_dir);
     }
 
     fn read_resolver(&mut self, now_ms: u64) {
@@ -339,7 +413,8 @@ impl Watch {
             None => (self.candidate?, config::DEFAULT_CANARY.to_string()),
         };
         let gateway = self.primary().and_then(|d| d.gateway).map(IpAddr::V4);
-        Some(ProbeTarget { addr, port: 53, canary, gateway })
+        let api = self.cfg.pihole.as_ref().map(|p| ApiProbe { port: 443, pin: p.tls_sha256 });
+        Some(ProbeTarget { addr, port: 53, gateway_port: 53, api, canary, gateway })
     }
 
     fn sync_threads(&mut self) {
@@ -403,10 +478,12 @@ impl Watch {
         };
         let (iface, saved) = (dev.iface.clone(), profile.dns.v4_dns.clone());
         let key = self.link_key();
+        let gateway = self.primary().and_then(|d| d.gateway);
         if let Ok(applied) = self.be.applied_dns(&iface) {
             if applied.v4_dns != saved {
                 self.fo.adopt(util::unix_secs(), "device was running different DNS than its saved profile");
                 self.engaged = key;
+                self.fallback_in_use = Fallback::identify(&applied.v4_dns, gateway);
             }
         }
     }
@@ -425,6 +502,7 @@ impl Watch {
                 if self.be.reapply_saved(&iface).is_ok() {
                     self.fo.dropped();
                     self.engaged = None;
+                    self.fallback_in_use = None;
                 }
             }
         }
@@ -465,6 +543,10 @@ impl Watch {
                 self.on_api(r);
                 self.touch();
             }
+            Event::Downgrade(d) => {
+                self.resolved_downgrade = d;
+                self.touch();
+            }
         }
         Flow::Continue
     }
@@ -477,6 +559,10 @@ impl Watch {
         match cmd {
             "open" => {
                 self.open = true;
+                // Whatever was quietly swallowed while closed (probes,
+                // latency) goes out in full now.
+                self.force_emit = true;
+                self.resolved_check_due_ms = 0;
                 self.op_error.clear();
                 self.mark_all_dirty();
                 self.load_config();
@@ -549,6 +635,10 @@ impl Watch {
             self.api.history = h;
             self.api.own_history = self.ledger.clone();
         }
+        if let Some(u) = r.upstreams {
+            self.api.upstreams = u;
+            self.api.own_upstreams = self.ledger.sums(r.at);
+        }
         if let Some(b) = r.blocking {
             self.api.blocking = Some((b, r.at));
         }
@@ -614,6 +704,13 @@ impl Watch {
             (false, None) => self.upstream_ok = None,
             (true, None) => {}
         }
+        // Evidence from the cycles in which something was wrong.
+        self.api_state = if r.pihole.ok { None } else { r.api };
+        if let Some(b) = r.gateway_blocked {
+            self.gateway_forwards = b;
+        } else if r.gateway.is_none() {
+            self.gateway_forwards = false;
+        }
         if self.open {
             if let Some(ms) = r.gateway_ms {
                 self.gateway_ms = Some((ms, util::unix_now()));
@@ -635,53 +732,103 @@ impl Watch {
             eligible: self.eligible(),
             pihole_ok: healthy,
             gateway_ok: r.gateway,
+            api_alive: self.api_state.is_some_and(|a| a.answered()),
         };
         match self.fo.observe(&obs) {
             Decision::Idle => {}
-            Decision::Cleared(_) => self.engaged = None,
+            Decision::Cleared(_) => {
+                self.engaged = None;
+                self.fallback_in_use = None;
+            }
             Decision::Engage => self.engage(now_ms),
             Decision::Recover => self.recover(now_ms),
         }
         if healthy && r.pihole.blocked {
-            self.learn_gateway();
+            self.learn_link(now_ms);
         }
     }
 
-    /// First healthy sighting of a pinned profile with no gateway on file:
-    /// the Pi-hole answering and blocking means this is the network it was
-    /// pinned for. Written once per link.
-    fn learn_gateway(&mut self) {
-        if self.fo.active() || !self.eligible() {
+    /// First healthy sighting of a pinned profile on a link whose router is
+    /// not on file (or lacks its MAC): record IP and MAC, but only after the
+    /// Pi-hole's pinned web API has answered on this link. A router that is
+    /// already recorded as a *different* one is never overwritten here.
+    fn learn_link(&mut self, now_ms: u64) {
+        if self.fo.active() || !self.eligible() || now_ms < self.learn_retry_ms {
             return;
         }
+        let Some(cfg) = self.cfg.pihole.clone() else { return };
         let Some((key, dev)) = self.watched_link() else { return };
-        let Some(gw) = dev.gateway else { return };
-        if self.learned_for.as_deref() == Some(key.uuid.as_str()) {
+        let (Some(gw), iface) = (dev.gateway, dev.iface.clone()) else { return };
+        if self.learned_for.as_ref() == Some(&(key.uuid.clone(), gw)) {
             return;
         }
-        self.learned_for = Some(key.uuid.clone());
-        let _ = actions::ensure_gateway_recorded(&self.state_dir, &key.uuid, gw);
+        let prev = actions::load_prev(&self.state_dir, &key.uuid);
+        if let Some(rec) = prev.as_ref().and_then(|p| p.gateway_addr()) {
+            if rec != gw {
+                self.learned_for = Some((key.uuid, gw));
+                return;
+            }
+            if prev.as_ref().is_some_and(|p| p.gateway_mac_addr().is_some()) {
+                self.learned_for = Some((key.uuid, gw));
+                return;
+            }
+        }
+        self.learn_retry_ms = now_ms + LEARN_RETRY_MS;
+        let probe = ApiProbe { port: 443, pin: cfg.tls_sha256 };
+        if (self.api_check)(cfg.address, &probe) != ApiLiveness::Alive {
+            return;
+        }
+        let Some(mac) = (self.mac_lookup)(gw, &iface) else { return };
+        if actions::record_link_trust(&self.state_dir, &key.uuid, gw, mac).is_ok() {
+            self.learned_for = Some((key.uuid, gw));
+            self.learn_retry_ms = 0;
+        }
     }
 
-    /// Servers for the fallback, and the reason to show. `router` is only
-    /// used on the network the profile was pinned on (same gateway address).
-    fn fallback_plan(&self, uuid: &str, gateway: Option<std::net::Ipv4Addr>) -> (Fallback, Vec<std::net::Ipv4Addr>, String) {
+    /// Servers for the fallback, and the reason to show. `router` is used
+    /// only if this is verifiably the router the profile was pinned on (IP
+    /// and MAC both match what was recorded) and that router does not simply
+    /// forward to the Pi-hole.
+    fn fallback_plan(
+        &self,
+        uuid: &str,
+        iface: &str,
+        gateway: Option<Ipv4Addr>,
+    ) -> (Fallback, Vec<Ipv4Addr>, String) {
         let want = self.cfg.failover.fallback;
-        if want == Fallback::Router {
-            let recorded = actions::load_prev(&self.state_dir, uuid).and_then(|p| p.gateway_addr());
-            if gateway.is_some() && recorded == gateway {
-                return (Fallback::Router, Fallback::Router.servers(gateway), "Pi-hole not answering".into());
-            }
+        if want != Fallback::Router {
+            return (want, want.servers(gateway), "Pi-hole not answering".into());
+        }
+        let rec = actions::load_prev(&self.state_dir, uuid);
+        let mac_now = gateway.and_then(|g| (self.mac_lookup)(g, iface));
+        let same_router = gateway.is_some()
+            && rec.as_ref().and_then(|r| r.gateway_addr()) == gateway
+            && mac_now.is_some()
+            && rec.as_ref().and_then(|r| r.gateway_mac_addr()) == mac_now;
+        if !same_router {
             return (
                 Fallback::Quad9,
                 Fallback::Quad9.servers(None),
-                "Pi-hole not answering; this router is not the one the profile was pinned on, using quad9".into(),
+                "Pi-hole not answering; this router is not the one the profile was pinned on (address or MAC differ or are unknown), using quad9".into(),
             );
         }
-        (want, want.servers(gateway), "Pi-hole not answering".into())
+        if self.gateway_forwards {
+            return (
+                Fallback::Quad9,
+                Fallback::Quad9.servers(None),
+                "Pi-hole not answering; the router forwards DNS to the Pi-hole, using quad9".into(),
+            );
+        }
+        (Fallback::Router, Fallback::Router.servers(gateway), "Pi-hole not answering".into())
     }
 
     fn engage(&mut self, now_ms: u64) {
+        // One DNS change at a time, across processes.
+        let Ok(Some(_lock)) = util::try_lock(&self.runtime_dir.join("dns.lock")) else {
+            self.op_error = "failover: another qnet operation is changing DNS".into();
+            self.fo.engage_failed(now_ms);
+            return;
+        };
         // Re-read the link right before touching DNS.
         let Ok(snap) = self.be.snapshot(false) else {
             self.fo.engage_failed(now_ms);
@@ -700,7 +847,7 @@ impl Watch {
             self.fo.engage_failed(now_ms);
             return;
         }
-        let (used, servers, reason) = self.fallback_plan(&uuid, dev.gateway);
+        let (used, servers, reason) = self.fallback_plan(&uuid, &dev.iface, dev.gateway);
         if servers.is_empty() {
             self.op_error = "failover: no gateway address for the router fallback".into();
             self.fo.engage_failed(now_ms);
@@ -711,6 +858,7 @@ impl Watch {
                 self.op_error.clear();
                 self.fo.engaged(util::unix_secs(), &reason);
                 self.engaged = Some(LinkKey { iface: dev.iface.clone(), uuid });
+                self.fallback_in_use = Some(used);
                 (self.notify)("Pi-hole unreachable", &format!("Using {} DNS", used.as_str()));
                 self.resolver_due_ms = now_ms + RESOLVER_FOLLOWUP_MS;
             }
@@ -722,6 +870,11 @@ impl Watch {
     }
 
     fn recover(&mut self, now_ms: u64) {
+        let Ok(Some(_lock)) = util::try_lock(&self.runtime_dir.join("dns.lock")) else {
+            self.op_error = "failover recovery: another qnet operation is changing DNS".into();
+            self.fo.recover_failed(now_ms);
+            return;
+        };
         let iface = self
             .engaged
             .as_ref()
@@ -736,6 +889,7 @@ impl Watch {
                 self.op_error.clear();
                 self.fo.recovered(now_ms);
                 self.engaged = None;
+                self.fallback_in_use = None;
                 (self.notify)("Pi-hole is back", "Using Pi-hole DNS again");
                 self.resolver_due_ms = now_ms + RESOLVER_FOLLOWUP_MS;
             }
@@ -774,11 +928,28 @@ impl Watch {
             self.sync_threads();
             self.touch();
         }
+        self.maybe_check_resolved(now_ms);
         if self.ledger.is_dirty() && now_ms.saturating_sub(self.ledger_saved_ms) >= LEDGER_SAVE_MS {
             let path = self.ledger_path();
             let _ = self.ledger.save(&path);
             self.ledger_saved_ms = now_ms;
         }
+    }
+
+    /// While the panel is open (never while closed: that would be a process
+    /// spawn on a timer), ask resolved how it rates the Pi-hole. The answer
+    /// arrives as an event; the slow part runs on its own thread.
+    fn maybe_check_resolved(&mut self, now_ms: u64) {
+        if !self.open || now_ms < self.resolved_check_due_ms {
+            return;
+        }
+        let (Some(check), Some(tx), Some(addr)) = (self.resolved_check.clone(), self.event_tx.clone(), self.effective_pihole()) else {
+            return;
+        };
+        self.resolved_check_due_ms = now_ms + RESOLVED_CHECK_MS;
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::Downgrade(check(addr)));
+        });
     }
 
     pub fn state(&self, heartbeat: bool) -> State {
@@ -811,6 +982,14 @@ impl Watch {
                 probes: &self.probes,
                 upstream_ok: self.upstream_ok,
                 gateway_ms,
+                api_state: self.api_state,
+                resolved_downgrade: self.resolved_downgrade.as_deref(),
+                auto_deliberate: self
+                    .primary()
+                    .and_then(|d| d.active.as_ref())
+                    .is_some_and(|a| self.auto_set.contains(&a.uuid)),
+                engaged_iface: self.engaged.as_ref().map(|k| k.iface.as_str()),
+                fallback_in_use: self.fallback_in_use,
                 api: &self.api,
                 failover: &self.fo,
                 scan: ScanView { running: false },
@@ -827,10 +1006,14 @@ impl Watch {
     /// state changed (at most 4 per second); otherwise a bare `hb` line once
     /// nothing has been said for the heartbeat interval. Quiet wakes cost
     /// nothing: the state is not even built unless an input changed.
+    ///
+    /// "Changed" is judged on the signature for the panel's current state:
+    /// while it is closed, the probe list, latency and bitrate do not count,
+    /// so a healthy probe is an `hb`. `open` always sends the full state.
     pub fn next_emission(&mut self, now_ms: u64) -> Option<Line> {
         let since = now_ms.saturating_sub(self.last_emit_ms);
         let hb_due = self.emitted_once && since >= self.hb_every_ms;
-        let inputs_changed = !self.emitted_once || self.gen != self.emitted_gen;
+        let inputs_changed = !self.emitted_once || self.force_emit || self.gen != self.emitted_gen;
         if !inputs_changed && !hb_due {
             self.pending_change = false;
             return None;
@@ -840,14 +1023,17 @@ impl Watch {
             return None;
         }
         let st = self.state(false);
-        let sig = change_signature(&st);
+        let json = serde_json::to_value(&st).unwrap_or(serde_json::Value::Null);
+        let sig = signature_of(json.clone(), self.open);
+        let last_sig = self.last_json.clone().map(|v| signature_of(v, self.open));
         self.emitted_gen = self.gen;
         self.pending_change = false;
-        if !self.emitted_once || sig != self.last_sig {
+        if !self.emitted_once || self.force_emit || last_sig.as_deref() != Some(sig.as_str()) {
+            self.force_emit = false;
             self.seq += 1;
             let mut st = st;
             st.seq = self.seq;
-            self.last_sig = sig;
+            self.last_json = serde_json::to_value(&st).ok();
             self.last_emit_ms = now_ms;
             self.emitted_once = true;
             return Some(Line::State(Box::new(st)));
@@ -873,6 +1059,9 @@ impl Watch {
         }
         if self.ledger.is_dirty() {
             wake = wake.min((self.ledger_saved_ms + LEDGER_SAVE_MS).saturating_sub(now_ms));
+        }
+        if self.open && self.resolved_check.is_some() {
+            wake = wake.min(self.resolved_check_due_ms.saturating_sub(now_ms));
         }
         wake.max(5)
     }
@@ -980,6 +1169,7 @@ pub fn run_watch(be: Box<dyn NetBackend>) -> i32 {
     let (tx, rx) = mpsc::channel::<Event>();
     let mut w = Watch::new(be, util::config_path());
     w.set_notifier(Box::new(desktop_notify));
+    w.set_resolved_check(Arc::new(crate::rstate::real_check), tx.clone());
     spawn_signals(tx.clone());
     spawn_stdin(tx.clone());
     spawn_nm_watcher(tx.clone());
@@ -1023,6 +1213,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const PI: &str = "192.168.1.153";
+    const MAC: neigh::Mac = [0x3c, 0x52, 0xa1, 0x00, 0x11, 0x22];
 
     struct Rig {
         w: Watch,
@@ -1048,6 +1239,10 @@ mod tests {
         let be = Arc::new(be);
         let mut w = Watch::new(Box::new(be.clone()), path);
         w.set_state_dir(dir.path().join("state"));
+        w.set_runtime_dir(dir.path().join("run"));
+        // No real network, no real neighbour table.
+        w.set_api_check(Arc::new(|_, _| ApiLiveness::Alive));
+        w.set_mac_lookup(Arc::new(|_, _| Some(MAC)));
         let notes: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
         let n2 = notes.clone();
         w.set_notifier(Box::new(move |t, b| n2.lock().unwrap().push((t.into(), b.into()))));
@@ -1069,6 +1264,8 @@ mod tests {
                 blocked: ok,
             },
             gateway: gw,
+            gateway_blocked: None,
+            api: None,
             upstream: None,
             own: OwnQueries { total: 1, blocked: u32::from(ok) },
             gateway_ms: None,
@@ -1198,26 +1395,96 @@ mod tests {
         assert!(r.runtime_calls().is_empty());
     }
 
+    /// A cycle in which the canary is answered but upstream is not, with the
+    /// gateway probe the prober now takes in exactly that situation.
+    fn degraded_report(gateway: Option<bool>) -> ProbeReport {
+        let mut rep = report(true, gateway);
+        rep.upstream = Some(false);
+        rep
+    }
+
     #[test]
-    fn upstream_failures_count_as_an_outage_when_the_canary_still_answers() {
+    fn a_degraded_pihole_fails_over_after_thirty_seconds_when_the_gateway_answers() {
         let mut r = rig();
         r.settle();
-        // The canary is answered (blocked locally) but upstream SERVFAILs.
+        for _ in 0..2 {
+            r.t += 15_000;
+            r.w.on_probe(degraded_report(Some(true)), r.t);
+        }
+        assert!(r.runtime_calls().is_empty(), "30 s have not passed");
+        assert_eq!(r.w.state(false).pihole.health, "degraded");
+        r.t += 15_000;
+        r.w.on_probe(degraded_report(Some(true)), r.t);
+        assert_eq!(r.runtime_calls().len(), 1, "degraded for 30 s with the gateway up");
+        assert!(r.w.failover_active());
+    }
+
+    #[test]
+    fn a_degraded_pihole_without_gateway_evidence_does_not_fail_over() {
+        let mut r = rig();
+        r.settle();
+        for _ in 0..6 {
+            r.t += 15_000;
+            r.w.on_probe(degraded_report(None), r.t);
+        }
+        assert!(r.runtime_calls().is_empty(), "no gateway evidence, no failover");
+        // The gateway itself is down too: the network is the problem.
         for _ in 0..3 {
             r.t += 15_000;
-            let mut rep = report(true, None);
-            rep.upstream = Some(false);
+            r.w.on_probe(degraded_report(Some(false)), r.t);
+        }
+        assert!(r.runtime_calls().is_empty());
+        r.t += 15_000;
+        r.w.on_probe(degraded_report(Some(true)), r.t);
+        assert_eq!(r.runtime_calls().len(), 1);
+    }
+
+    #[test]
+    fn a_live_pinned_web_api_stops_an_unreachable_failover_until_it_goes_quiet_too() {
+        let mut r = rig();
+        r.settle();
+        // DNS silent for minutes, gateway fine, but the Pi-hole's API answers.
+        for _ in 0..8 {
+            r.t += 15_000;
+            let mut rep = report(false, Some(true));
+            rep.api = Some(ApiLiveness::Alive);
             r.w.on_probe(rep, r.t);
         }
-        assert_eq!(r.w.state(false).pihole.health, "degraded");
-        // The gateway probe only runs when the canary fails, so a degraded
-        // Pi-hole needs the gate answered too: it was not asked here.
-        assert!(r.runtime_calls().is_empty(), "no gateway evidence, no failover");
+        assert!(r.runtime_calls().is_empty(), "host alive: packet loss or spoofing, not an outage");
+        let st = r.w.state(false);
+        assert_eq!(st.pihole.health, "unreachable");
+        assert!(st.pihole.health_reason.contains("web API still does"), "{}", st.pihole.health_reason);
+        // A different certificate does not count as the Pi-hole being dead either.
         r.t += 15_000;
-        let mut rep = report(true, Some(true));
-        rep.upstream = Some(false);
+        let mut rep = report(false, Some(true));
+        rep.api = Some(ApiLiveness::Mismatch);
         r.w.on_probe(rep, r.t);
-        assert_eq!(r.runtime_calls().len(), 1, "degraded for over 30 s with the gateway up");
+        assert!(r.runtime_calls().is_empty());
+        assert!(r.w.state(false).pihole.health_reason.contains("different certificate"));
+        // Now the API is dead as well: fail over right away.
+        r.t += 15_000;
+        let mut rep = report(false, Some(true));
+        rep.api = Some(ApiLiveness::Dead);
+        r.w.on_probe(rep, r.t);
+        assert_eq!(r.runtime_calls().len(), 1);
+        assert!(r.w.failover_active());
+    }
+
+    #[test]
+    fn a_degraded_pihole_is_not_held_back_by_a_web_api_that_is_up() {
+        // The canary is answered, so the API is not even asked about; and an
+        // old "alive" from an earlier outage must not linger.
+        let mut r = rig();
+        r.settle();
+        let mut rep = report(false, Some(true));
+        rep.api = Some(ApiLiveness::Alive);
+        r.t += 15_000;
+        r.w.on_probe(rep, r.t);
+        for _ in 0..3 {
+            r.t += 15_000;
+            r.w.on_probe(degraded_report(Some(true)), r.t);
+        }
+        assert_eq!(r.runtime_calls().len(), 1);
     }
 
     #[test]
@@ -1342,7 +1609,7 @@ mod tests {
         let prev = actions::load_prev(&r.state_dir(), U_WIFI).expect("recorded on the first healthy probe");
         assert_eq!(prev.gateway_addr(), Some("192.168.1.1".parse().unwrap()));
         // Not rewritten on every probe, and never overwritten by a different router.
-        actions::record_gateway(&r.state_dir(), U_WIFI, "10.0.0.1".parse().unwrap()).unwrap();
+        actions::record_link_trust(&r.state_dir(), U_WIFI, "10.0.0.1".parse().unwrap(), MAC).unwrap();
         r.probe(true, None);
         r.probe(true, None);
         assert_eq!(
@@ -1589,6 +1856,7 @@ mod tests {
             summary: Some(Summary { total, blocked, percent: 0.0 }),
             blocking: Some(Blocking { state: BlockingState::Enabled, timer: None }),
             history: None,
+            upstreams: None,
             at: util::unix_now(),
         }
     }
@@ -1704,7 +1972,7 @@ mod tests {
         // Nothing changed: nothing to say.
         assert!(r.w.next_emission(200).is_none());
         // A change inside the 250 ms window waits.
-        r.w.handle(Event::Probe(report(true, None)), 300);
+        r.w.handle(Event::Api(api_report(10, 2)), 300);
         assert!(r.w.next_emission(320).is_none());
         assert!(r.w.next_wake_ms(320) <= 30);
         let b = state_of(r.w.next_emission(360).expect("coalesced change"));
@@ -1827,5 +2095,410 @@ mod tests {
         assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager/Devices/4"), NmKind::Core);
         assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager/IP4Config/2"), NmKind::Core);
         assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager"), NmKind::Core);
+    }
+
+    // -- closed-panel quiet ---------------------------------------------------------
+
+    fn healthy_report(ms: f64) -> ProbeReport {
+        let mut rep = report(true, None);
+        rep.pihole.ms = Some(ms);
+        rep.t = util::unix_now();
+        rep
+    }
+
+    #[test]
+    fn a_closed_healthy_probe_emits_hb_only() {
+        let mut r = rig();
+        // As at start-up: the first probe lands before the first line.
+        r.w.handle(Event::Probe(healthy_report(5.0)), 50);
+        let first = state_of(r.w.next_emission(100).expect("first state"));
+        assert_eq!(first.seq, 1);
+        // A healthy probe arrives while the panel is closed: new latency, one
+        // more point in probes[]; nothing a closed panel can show.
+        r.w.handle(Event::Probe(healthy_report(7.5)), 1_000);
+        assert!(r.w.next_emission(1_100).is_none(), "no state line for it");
+        r.w.handle(Event::Probe(healthy_report(9.1)), 2_000);
+        assert!(r.w.next_emission(2_100).is_none());
+        // What does go out is the heartbeat, and the state seq did not move.
+        let line = r.w.next_emission(10_200).expect("heartbeat");
+        assert_eq!(line, Line::Hb { seq: 1 });
+        // Yet the numbers are not lost: asking for the state shows them.
+        let st = r.w.state(false);
+        assert_eq!(st.pihole.probes.len(), 3);
+        assert_eq!(st.pihole.latency_ms, Some(9.1));
+    }
+
+    #[test]
+    fn a_closed_probe_that_matters_still_emits_a_state() {
+        let mut r = rig();
+        state_of(r.w.next_emission(100).unwrap());
+        // Two silent probes flip reachable: that is news even when closed.
+        r.w.handle(Event::Probe(report(false, Some(false))), 1_000);
+        r.w.handle(Event::Probe(report(false, Some(false))), 1_500);
+        let st = state_of(r.w.next_emission(1_800).expect("state"));
+        assert!(!st.pihole.reachable);
+        assert_eq!(st.pihole.health, "unreachable");
+    }
+
+    #[test]
+    fn open_resends_the_full_state_even_if_nothing_else_changed() {
+        let mut r = rig();
+        r.w.handle(Event::Probe(healthy_report(5.0)), 50);
+        state_of(r.w.next_emission(100).unwrap());
+        for ms in [1_000u64, 2_000, 3_000] {
+            r.w.handle(Event::Probe(healthy_report(ms as f64 / 100.0)), ms);
+        }
+        assert!(r.w.next_emission(3_100).is_none());
+        r.w.handle(Event::Cmd("open".into()), 4_000);
+        let st = state_of(r.w.next_emission(4_100).expect("open sends the state"));
+        assert_eq!(st.seq, 2);
+        assert!(st.pihole.probes.len() >= 4, "and now it carries the probes");
+        // Open for real: a probe is a state line again.
+        r.w.handle(Event::Probe(healthy_report(1.2)), 5_000);
+        assert!(matches!(r.w.next_emission(5_100), Some(Line::State(_))));
+        // Closing does not itself cause a line (the signature just shrinks)...
+        r.w.handle(Event::Cmd("closed".into()), 6_000);
+        let after_close = r.w.next_emission(6_100);
+        assert!(after_close.is_none() || matches!(after_close, Some(Line::State(_))));
+        // ...and from then on healthy probes are quiet again.
+        let before = r.w.seq;
+        r.w.handle(Event::Probe(healthy_report(1.4)), 7_000);
+        assert!(r.w.next_emission(7_100).is_none());
+        assert_eq!(r.w.seq, before + u64::from(after_close.is_some()));
+    }
+
+    #[test]
+    fn a_wifi_bitrate_change_while_closed_is_not_news() {
+        let mut r = rig();
+        r.w.handle(Event::Probe(healthy_report(5.0)), 50);
+        state_of(r.w.next_emission(100).unwrap());
+        r.be.set_bitrate_kbps(433_000);
+        r.w.handle(Event::Nm(NmKind::Core), 1_000);
+        r.w.process_dirty(1_300);
+        assert!(r.w.next_emission(1_400).is_none());
+        assert_eq!(r.w.state(false).link.bitrate_mbps, 433, "still read, just not announced");
+    }
+
+    // -- router trust: IP and MAC -----------------------------------------------------
+
+    fn record(r: &Rig, gw: &str, mac: neigh::Mac) {
+        actions::record_link_trust(&r.state_dir(), U_WIFI, gw.parse().unwrap(), mac).unwrap();
+    }
+
+    #[test]
+    fn router_fallback_needs_both_ip_and_mac_to_match() {
+        // Recorded and unchanged: the router is used.
+        let mut r = rig();
+        record(&r, "192.168.1.1", MAC);
+        r.settle();
+        r.fail3();
+        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 192.168.1.1"]);
+        assert_eq!(r.w.state(false).dns.failover.fallback, "router");
+        assert_eq!(r.w.state(false).dns.failover.reason, "Pi-hole not answering");
+
+        // Same IP, different MAC (another router took the address): quad9.
+        let mut r = rig();
+        record(&r, "192.168.1.1", [9, 9, 9, 9, 9, 9]);
+        r.settle();
+        r.fail3();
+        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+        let st = r.w.state(false);
+        assert_eq!(st.dns.failover.fallback, "quad9", "the one really in use");
+        assert!(st.dns.failover.reason.contains("MAC"), "{}", st.dns.failover.reason);
+
+        // The MAC cannot be determined now: not trusted either.
+        let mut r = rig();
+        record(&r, "192.168.1.1", MAC);
+        r.w.set_mac_lookup(Arc::new(|_, _| None));
+        r.settle();
+        r.fail3();
+        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+    }
+
+    #[test]
+    fn a_router_that_forwards_to_the_pihole_is_no_fallback() {
+        let mut r = rig();
+        record(&r, "192.168.1.1", MAC);
+        r.settle();
+        for _ in 0..3 {
+            r.t += 15_000;
+            let mut rep = report(false, Some(true));
+            rep.gateway_blocked = Some(true); // the router answered the canary 0.0.0.0
+            r.w.on_probe(rep, r.t);
+        }
+        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+        let st = r.w.state(false);
+        assert_eq!(st.dns.failover.fallback, "quad9");
+        assert!(st.dns.failover.reason.contains("forwards DNS to the Pi-hole"), "{}", st.dns.failover.reason);
+        assert_eq!(r.notes.lock().unwrap()[0].1, "Using quad9 DNS");
+    }
+
+    #[test]
+    fn the_router_is_only_learned_after_a_pinned_api_answer_and_with_its_mac() {
+        // API dead: the Pi-hole answering DNS is not enough to trust a router.
+        let mut r = rig();
+        r.w.set_api_check(Arc::new(|_, _| ApiLiveness::Dead));
+        r.settle();
+        assert!(actions::load_prev(&r.state_dir(), U_WIFI).is_none());
+        // Wrong certificate: no.
+        let mut r = rig();
+        r.w.set_api_check(Arc::new(|_, _| ApiLiveness::Mismatch));
+        r.settle();
+        assert!(actions::load_prev(&r.state_dir(), U_WIFI).is_none());
+        // No MAC in the neighbour table: no half-record.
+        let mut r = rig();
+        r.w.set_mac_lookup(Arc::new(|_, _| None));
+        r.settle();
+        assert!(actions::load_prev(&r.state_dir(), U_WIFI).is_none());
+        // Everything in order.
+        let mut r = rig();
+        r.settle();
+        let p = actions::load_prev(&r.state_dir(), U_WIFI).unwrap();
+        assert_eq!(p.gateway_addr(), Some("192.168.1.1".parse().unwrap()));
+        assert_eq!(p.gateway_mac_addr(), Some(MAC));
+    }
+
+    #[test]
+    fn a_failed_learning_attempt_is_not_repeated_every_probe() {
+        let mut r = rig();
+        let calls = Arc::new(Mutex::new(0u32));
+        let c2 = calls.clone();
+        r.w.set_api_check(Arc::new(move |_, _| {
+            *c2.lock().unwrap() += 1;
+            ApiLiveness::Dead
+        }));
+        r.settle();
+        r.probe(true, None);
+        r.probe(true, None);
+        r.probe(true, None);
+        assert_eq!(*calls.lock().unwrap(), 1, "one HTTPS attempt, then a quiet period");
+        // After the retry period it tries again.
+        r.t += LEARN_RETRY_MS;
+        r.probe(true, None);
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_record_with_ip_but_no_mac_gets_its_mac_added() {
+        let mut r = rig();
+        // The old format: gateway only.
+        let mut p = actions::PrevDns::default_for_tests(U_WIFI);
+        p.gateway = Some("192.168.1.1".into());
+        actions::write_prev_for_tests(&r.state_dir(), &p);
+        r.settle();
+        let p = actions::load_prev(&r.state_dir(), U_WIFI).unwrap();
+        assert_eq!(p.gateway_mac_addr(), Some(MAC));
+        // A record for a different router is left alone.
+        let mut r = rig();
+        record(&r, "10.0.0.1", [1, 2, 3, 4, 5, 6]);
+        r.settle();
+        let p = actions::load_prev(&r.state_dir(), U_WIFI).unwrap();
+        assert_eq!(p.gateway_addr(), Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(p.gateway_mac_addr(), Some([1, 2, 3, 4, 5, 6]));
+    }
+
+    // -- one DNS change at a time ---------------------------------------------------
+
+    #[test]
+    fn failover_engage_and_recover_wait_their_turn_for_the_dns_lock() {
+        let mut r = rig();
+        r.settle();
+        let held = util::try_lock(&r.dir.path().join("run").join("dns.lock")).unwrap().unwrap();
+        r.fail3();
+        assert!(r.runtime_calls().is_empty(), "another qnet is changing DNS: no engage");
+        assert!(!r.w.failover_active());
+        assert!(r.w.state(false).error.contains("another qnet operation"));
+        drop(held);
+        // The retry comes after the cooldown, and now it goes through.
+        r.probe(false, Some(true));
+        r.probe(false, Some(true));
+        assert_eq!(r.runtime_calls().len(), 1);
+        assert!(r.w.failover_active());
+
+        // Recovery respects the lock as well.
+        let held = util::try_lock(&r.dir.path().join("run").join("dns.lock")).unwrap().unwrap();
+        for _ in 0..4 {
+            r.probe(true, None);
+        }
+        assert!(r.saved_calls().is_empty());
+        assert!(r.w.failover_active());
+        drop(held);
+        for _ in 0..3 {
+            r.probe(true, None);
+        }
+        assert_eq!(r.saved_calls().len(), 1);
+        assert!(!r.w.failover_active());
+        // And the lock was released again by the watcher itself.
+        assert!(util::try_lock(&r.dir.path().join("run").join("dns.lock")).unwrap().is_some());
+    }
+
+    // -- auto is only deliberate if it was chosen ------------------------------------
+
+    #[test]
+    fn plugging_in_a_cable_with_automatic_dns_warns_until_the_user_chooses_it() {
+        let be = FakeNet::live_machine();
+        be.add_ethernet_primary();
+        // The new cable's profile is automatic, as NetworkManager creates it,
+        // and its link uses the router's DNS.
+        be.set_resolver_for_primary_eth(&["192.168.1.1"]);
+        let mut r = rig_with(Some(config_text("enabled = true")), be);
+        let st = r.w.state(false);
+        assert_eq!(st.link.kind, "ethernet");
+        assert_eq!(st.dns.mode, "auto");
+        assert!(st.dns.bypassed, "nobody chose Automatic for this cable");
+        assert!(st.dns.leaks.iter().any(|l| l.where_ == "Wired connection 1" && l.kind == "link"));
+        // The user taps Automatic: `dns auto` notes it, the profile change is seen.
+        actions::set_auto_choice(&r.state_dir(), U_ETH1, true).unwrap();
+        r.w.handle(Event::Nm(NmKind::Settings), 10_000);
+        r.w.process_dirty(10_000);
+        let st = r.w.state(false);
+        assert_eq!(st.dns.mode, "auto");
+        assert!(!st.dns.bypassed, "a choice, not an accident");
+        assert!(st.dns.leaks.iter().all(|l| l.where_ != "Wired connection 1" || l.kind == "profile"));
+        // Choosing the Pi-hole again forgets it.
+        actions::set_auto_choice(&r.state_dir(), U_ETH1, false).unwrap();
+        r.w.handle(Event::Nm(NmKind::Settings), 20_000);
+        r.w.process_dirty(20_000);
+        assert!(r.w.state(false).dns.bypassed);
+    }
+
+    // -- failover on one link while another is primary -------------------------------
+
+    #[test]
+    fn mode_is_fallback_only_on_the_link_that_failed_over() {
+        let mut r = rig();
+        r.settle();
+        r.fail3();
+        assert_eq!(r.w.state(false).dns.mode, "fallback");
+        r.be.add_ethernet_primary();
+        r.be.set_resolver_for_primary_eth(&[PI]);
+        r.be.pin_profile_dns(U_ETH1);
+        r.w.handle(Event::Nm(NmKind::Core), r.t);
+        r.w.handle(Event::Nm(NmKind::Settings), r.t);
+        r.t += 1_000;
+        r.w.process_dirty(r.t);
+        let st = r.w.state(false);
+        assert_eq!(st.link.kind, "ethernet");
+        assert_eq!(st.dns.mode, "pihole", "the cable's own link is healthy");
+        assert!(st.dns.failover.active, "Wi-Fi is still failed over");
+        assert_eq!(st.dns.failover.fallback, "router");
+        assert_eq!(st.dns.mode_source, "profile");
+        assert!(st.dns.leaks.iter().all(|l| l.where_ != "Redwood"), "the failed-over link is not a leak");
+    }
+
+    // -- resolved's downgrade ------------------------------------------------------------
+
+    #[test]
+    fn a_resolved_downgrade_makes_the_pihole_degraded_with_a_reason() {
+        let mut r = rig();
+        r.w.on_probe(report(true, None), 15_000);
+        assert_eq!(r.w.state(false).pihole.health, "ok");
+        r.w.handle(
+            Event::Downgrade(Some("systemd-resolved dropped 192.168.1.153 to plain UDP (EDNS0 is failing)".into())),
+            16_000,
+        );
+        let st = r.w.state(false);
+        assert_eq!(st.pihole.health, "degraded");
+        assert!(st.pihole.health_reason.contains("EDNS0"));
+        // It is only a health note: it never feeds the failover.
+        for _ in 0..6 {
+            r.probe(true, None);
+        }
+        assert!(r.runtime_calls().is_empty());
+        r.w.handle(Event::Downgrade(None), 200_000);
+        assert_eq!(r.w.state(false).pihole.health, "ok");
+    }
+
+    #[test]
+    fn resolved_is_asked_only_while_open_and_on_a_slow_timer() {
+        let mut r = rig();
+        let asked = Arc::new(Mutex::new(Vec::<IpAddr>::new()));
+        let a2 = asked.clone();
+        let (tx, rx) = mpsc::channel::<Event>();
+        r.w.set_resolved_check(
+            Arc::new(move |ip| {
+                a2.lock().unwrap().push(ip);
+                Some("systemd-resolved dropped it".to_string())
+            }),
+            tx,
+        );
+        // Closed: never.
+        r.w.process_dirty(40_000);
+        r.w.process_dirty(100_000);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(asked.lock().unwrap().is_empty(), "no process spawns while closed");
+        assert!(rx.try_recv().is_err());
+        // Open: once right away...
+        r.w.handle(Event::Cmd("open".into()), 100_000);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        match rx.try_recv() {
+            Ok(Event::Downgrade(Some(s))) => assert!(s.contains("dropped")),
+            _ => panic!("expected the downgrade event"),
+        }
+        // ...then every 30 s, not on every loop turn.
+        r.w.process_dirty(110_000);
+        r.w.process_dirty(120_000);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        r.w.process_dirty(131_000);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        assert_eq!(asked.lock().unwrap()[0], PI.parse::<IpAddr>().unwrap());
+        // Closing stops it.
+        r.w.handle(Event::Cmd("closed".into()), 140_000);
+        r.w.process_dirty(200_000);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(asked.lock().unwrap().len(), 2);
+    }
+
+    // -- resolver and upstream numbers -----------------------------------------------------
+
+    #[test]
+    fn resolved_fallback_dns_shows_up_as_a_leak_once_resolved_picked_it() {
+        let mut r = rig();
+        assert!(r.w.state(false).dns.leaks.iter().all(|l| l.kind != "resolved-fallback"));
+        r.be.set_global_current(Some("9.9.9.9"));
+        r.w.handle(Event::Nm(NmKind::Core), 5_000);
+        r.w.process_dirty(5_300);
+        let st = r.w.state(false);
+        assert!(st.dns.leaks.iter().any(|l| l.kind == "resolved-fallback"));
+        assert_eq!(st.dns.mode, "pihole", "it is a leak line, not a mode change");
+        assert!(!st.dns.bypassed);
+    }
+
+    #[test]
+    fn upstream_stats_arrive_with_the_api_and_our_probes_come_out_of_the_blocklist_figure() {
+        let mut r = rig();
+        for _ in 0..4 {
+            let mut rep = report(true, None);
+            rep.t = util::unix_now();
+            rep.own = OwnQueries { total: 2, blocked: 1 };
+            r.w.on_probe(rep, r.t);
+        }
+        let mut rep = api_report(100, 50);
+        rep.upstreams = Some(crate::pihole::Upstreams {
+            list: vec![crate::pihole::Upstream {
+                name: "dns9.quad9.net".into(),
+                ip: "9.9.9.9".parse().unwrap(),
+                port: 53,
+                count: 40,
+                response_ms: Some(15.5),
+            }],
+            answered_by: crate::pihole::AnsweredBy { blocklist: 50, cache: 10, forwarded: 40 },
+        });
+        r.w.handle(Event::Api(rep), r.t);
+        let st = r.w.state(false);
+        assert_eq!(st.pihole.upstreams.len(), 1);
+        let u = &st.pihole.upstreams[0];
+        assert_eq!((u.name.as_str(), u.ip.as_str(), u.port, u.count, u.response_ms), ("dns9.quad9.net", "9.9.9.9", 53, 40, Some(15.5)));
+        // 4 cycles x (1 blocked + 1 forwarded) of our own are in those numbers.
+        assert_eq!(st.pihole.answered_by.blocklist, 46);
+        assert_eq!(st.pihole.answered_by.cache, 10);
+        assert_eq!(st.pihole.answered_by.forwarded, 36);
+        assert_eq!(st.pihole.today.blocked, 46, "consistent with today");
+        // A poll without upstreams keeps the last ones.
+        r.w.handle(Event::Api(api_report(101, 50)), r.t);
+        assert_eq!(r.w.state(false).pihole.upstreams.len(), 1);
     }
 }

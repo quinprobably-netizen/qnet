@@ -131,17 +131,26 @@ pub fn detect_mode(
 ///
 /// * mode Pi-hole, but other servers are in use alongside it, or the
 ///   profile is not pinned (so DHCP or router advertisements may add some);
-/// * mode custom: the Pi-hole is not among the servers at all.
+/// * mode custom: the Pi-hole is not among the servers at all;
+/// * mode Auto, unless `qnet dns auto` recorded that choice for this very
+///   profile (`auto_deliberate`): an Ethernet cable that came up with
+///   automatic DNS is a bypass nobody asked for.
 ///
-/// A deliberate Automatic mode, a failover and "no DNS" are states of their
-/// own, not bypasses.
-pub fn is_bypassed(mode: Mode, servers: &[IpAddr], profile: Option<&Profile>, pihole: IpAddr) -> bool {
+/// A failover and "no DNS" are states of their own, not bypasses.
+pub fn is_bypassed(
+    mode: Mode,
+    servers: &[IpAddr],
+    profile: Option<&Profile>,
+    pihole: IpAddr,
+    auto_deliberate: bool,
+) -> bool {
     match mode {
         Mode::Pihole => {
             servers.iter().any(|s| *s != pihole) || profile.is_none_or(|p| !profile_pinned(&p.dns, pihole))
         }
         Mode::Custom => true,
-        Mode::Fallback | Mode::Auto | Mode::None | Mode::Unknown => false,
+        Mode::Auto => !auto_deliberate,
+        Mode::Fallback | Mode::None | Mode::Unknown => false,
     }
 }
 
@@ -156,6 +165,9 @@ pub enum LeakKind {
     Link,
     Profile,
     Ipv6Ra,
+    /// resolved's compiled-in FallbackDNS is being used next to the links'
+    /// own servers.
+    ResolvedFallback,
 }
 
 impl LeakKind {
@@ -164,6 +176,7 @@ impl LeakKind {
             LeakKind::Link => "link",
             LeakKind::Profile => "profile",
             LeakKind::Ipv6Ra => "ipv6-ra",
+            LeakKind::ResolvedFallback => "resolved-fallback",
         }
     }
 }
@@ -235,6 +248,11 @@ pub struct LeakInput<'a> {
     pub gateways: &'a [IpAddr],
     pub mode: Mode,
     pub primary_iface: Option<&'a str>,
+    /// The primary profile's Automatic DNS was chosen with `qnet dns auto`.
+    pub auto_deliberate: bool,
+    /// The link a runtime failover was applied to; its servers are the
+    /// fallback on purpose.
+    pub engaged_iface: Option<&'a str>,
 }
 
 fn describe(servers: &[IpAddr], pihole: IpAddr, gateways: &[IpAddr]) -> String {
@@ -268,9 +286,18 @@ pub fn detect_leaks(inp: &LeakInput<'_>) -> Vec<Leak> {
             continue;
         }
         let is_primary = inp.primary_iface == Some(dev.iface.as_str());
-        // The user's chosen Automatic/Fallback/None state on the primary link
-        // is not a leak; it is the current mode.
-        if is_primary && matches!(inp.mode, Mode::Auto | Mode::Fallback | Mode::None | Mode::Unknown) {
+        if inp.engaged_iface == Some(dev.iface.as_str()) {
+            continue;
+        }
+        // The user's chosen Automatic (and Fallback/None) state on the primary
+        // link is not a leak; it is the current mode. An Automatic nobody
+        // chose is.
+        let deliberate_mode = match inp.mode {
+            Mode::Auto => inp.auto_deliberate,
+            Mode::Fallback | Mode::None | Mode::Unknown => true,
+            Mode::Pihole | Mode::Custom => false,
+        };
+        if is_primary && deliberate_mode {
             continue;
         }
         let Some(link) = inp
@@ -328,6 +355,29 @@ pub fn detect_leaks(inp: &LeakInput<'_>) -> Vec<Leak> {
                     where_: link.name.clone(),
                     uuid: String::new(),
                     detail: format!("uses {}", describe(&others, inp.pihole, inp.gateways)),
+                });
+            }
+        }
+        // 1b. resolved's compiled-in FallbackDNS, once it has actually been
+        // picked while links have servers of their own.
+        if let Some(cur) = r.global_current {
+            let links_have_servers = r.links.iter().any(|l| !l.servers.is_empty());
+            if r.global.is_empty() && links_have_servers && r.fallback.contains(&cur) {
+                let mut names: Vec<String> = Vec::new();
+                for s in &r.fallback {
+                    let s = s.to_string();
+                    if !names.contains(&s) {
+                        names.push(s);
+                    }
+                }
+                out.push(Leak {
+                    kind: LeakKind::ResolvedFallback,
+                    where_: "systemd-resolved".into(),
+                    uuid: String::new(),
+                    detail: format!(
+                        "compiled-in fallback DNS is in use ({cur} now; {}); set FallbackDNS= empty in resolved.conf",
+                        names.join(", ")
+                    ),
                 });
             }
         }
@@ -505,6 +555,7 @@ pub mod fixtures {
                 "1.1.1.1".parse().unwrap(),
                 "8.8.8.8".parse().unwrap(),
             ],
+            global_current: None,
         }
     }
 }
@@ -630,6 +681,8 @@ mod tests {
             gateways: &[gw()],
             mode: Mode::Pihole,
             primary_iface: Some("wlp7s0"),
+            auto_deliberate: false,
+            engaged_iface: None,
         });
         assert_eq!(leaks.len(), 2, "{leaks:?}");
         assert_eq!(leaks[0].where_, "Wired connection 1");
@@ -653,6 +706,8 @@ mod tests {
             gateways: &[gw()],
             mode: Mode::Pihole,
             primary_iface: Some("wlp7s0"),
+            auto_deliberate: false,
+            engaged_iface: None,
         });
         assert!(leaks.is_empty(), "{leaks:?}");
     }
@@ -670,6 +725,8 @@ mod tests {
             gateways: &[gw()],
             mode: Mode::Custom,
             primary_iface: Some("wlp7s0"),
+            auto_deliberate: false,
+            engaged_iface: None,
         });
         assert_eq!(leaks.len(), 1);
         assert_eq!(leaks[0].kind, LeakKind::Link);
@@ -692,6 +749,8 @@ mod tests {
             gateways: &[gw()],
             mode: Mode::Custom,
             primary_iface: Some("wlp7s0"),
+            auto_deliberate: false,
+            engaged_iface: None,
         });
         assert_eq!(leaks.len(), 1);
         assert_eq!(leaks[0].kind, LeakKind::Ipv6Ra);
@@ -730,6 +789,8 @@ mod tests {
             gateways: &[gw()],
             mode: Mode::Auto,
             primary_iface: Some("wlp7s0"),
+            auto_deliberate: true,
+            engaged_iface: None,
         });
         assert_eq!(leaks.len(), 1, "{leaks:?}");
         assert_eq!(leaks[0].where_, "Wired connection 1");
@@ -753,6 +814,8 @@ mod tests {
             gateways: &[gw()],
             mode: Mode::Pihole,
             primary_iface: Some("wlp7s0"),
+            auto_deliberate: false,
+            engaged_iface: None,
         });
         assert!(none.is_empty(), "scoped links are not leaks: {none:?}");
 
@@ -766,6 +829,8 @@ mod tests {
             gateways: &[gw()],
             mode: Mode::Pihole,
             primary_iface: Some("wlp7s0"),
+            auto_deliberate: false,
+            engaged_iface: None,
         });
         assert_eq!(leaks.len(), 2, "{leaks:?}");
         assert_eq!(leaks[0].where_, "tailscale0");
@@ -787,6 +852,8 @@ mod tests {
             gateways: &[gw()],
             mode: Mode::Pihole,
             primary_iface: Some("wlp7s0"),
+            auto_deliberate: false,
+            engaged_iface: None,
         });
         assert!(leaks.is_empty());
     }
@@ -808,23 +875,25 @@ mod tests {
         let auto = profile(U_WIFI, "Redwood", ProfileKind::Wifi, dns_auto());
         let (one, mixed, router) = ([ip(PI)], [ip(PI), gw()], [gw()]);
         // Healthy: pinned, only the Pi-hole.
-        assert!(!is_bypassed(Mode::Pihole, &one, Some(&pinned), pi()));
+        assert!(!is_bypassed(Mode::Pihole, &one, Some(&pinned), pi(), false));
         // Pinned but something else is in the server list too.
-        assert!(is_bypassed(Mode::Pihole, &mixed, Some(&pinned), pi()));
+        assert!(is_bypassed(Mode::Pihole, &mixed, Some(&pinned), pi(), false));
         // DHCP happens to hand out only the Pi-hole, but nothing is pinned.
-        assert!(is_bypassed(Mode::Pihole, &one, Some(&auto), pi()));
+        assert!(is_bypassed(Mode::Pihole, &one, Some(&auto), pi(), false));
         // Pinned v4 but IPv6 router advertisements may still add servers.
         let ra = profile(U_WIFI, "Redwood", ProfileKind::Wifi, DnsSettings { v6_ignore_auto: false, ..dns_pinned() });
-        assert!(is_bypassed(Mode::Pihole, &one, Some(&ra), pi()));
+        assert!(is_bypassed(Mode::Pihole, &one, Some(&ra), pi(), false));
         // No profile known: cannot call it pinned.
-        assert!(is_bypassed(Mode::Pihole, &one, None, pi()));
+        assert!(is_bypassed(Mode::Pihole, &one, None, pi(), false));
         // The Pi-hole is not used at all.
-        assert!(is_bypassed(Mode::Custom, &[ip("9.9.9.9")], Some(&pinned), pi()));
+        assert!(is_bypassed(Mode::Custom, &[ip("9.9.9.9")], Some(&pinned), pi(), false));
         // Deliberate Automatic, failover, no DNS, undecided: not a bypass.
-        assert!(!is_bypassed(Mode::Auto, &router, Some(&auto), pi()));
-        assert!(!is_bypassed(Mode::Fallback, &router, Some(&pinned), pi()));
-        assert!(!is_bypassed(Mode::None, &[], Some(&pinned), pi()));
-        assert!(!is_bypassed(Mode::Unknown, &one, Some(&pinned), pi()));
+        // Automatic only counts as the user's choice if `qnet dns auto` said so.
+        assert!(!is_bypassed(Mode::Auto, &router, Some(&auto), pi(), true));
+        assert!(is_bypassed(Mode::Auto, &router, Some(&auto), pi(), false), "an Ethernet cable that came up on its own");
+        assert!(!is_bypassed(Mode::Fallback, &router, Some(&pinned), pi(), false));
+        assert!(!is_bypassed(Mode::None, &[], Some(&pinned), pi(), false));
+        assert!(!is_bypassed(Mode::Unknown, &one, Some(&pinned), pi(), false));
     }
 
     #[test]
@@ -840,8 +909,85 @@ mod tests {
             gateways: &[gw()],
             mode: Mode::Pihole,
             primary_iface: Some("wlp7s0"),
+            auto_deliberate: false,
+            engaged_iface: None,
         });
         assert_eq!(leaks.len(), 1);
         assert_eq!(leaks[0].detail, "also uses 192.168.1.1 (router)");
+    }
+
+    fn leaks_for(
+        net: &NetSnapshot,
+        profiles: &[Profile],
+        res: &ResolverSnapshot,
+        mode: Mode,
+        auto_deliberate: bool,
+        engaged: Option<&str>,
+    ) -> Vec<Leak> {
+        detect_leaks(&LeakInput {
+            net,
+            profiles,
+            resolver: Some(res),
+            pihole: pi(),
+            gateways: &[gw()],
+            mode,
+            primary_iface: Some("wlp7s0"),
+            auto_deliberate,
+            engaged_iface: engaged,
+        })
+    }
+
+    #[test]
+    fn an_automatic_nobody_chose_is_listed_on_the_primary_link() {
+        let net = snapshot(vec![wifi_device(true)]);
+        let auto = profile(U_WIFI, "Redwood", ProfileKind::Wifi, dns_auto());
+        let res = resolver(vec![link(4, "wlp7s0", &["192.168.1.1"], true)]);
+        let chosen = leaks_for(&net, std::slice::from_ref(&auto), &res, Mode::Auto, true, None);
+        assert!(chosen.is_empty(), "{chosen:?}");
+        let unchosen = leaks_for(&net, &[auto], &res, Mode::Auto, false, None);
+        assert_eq!(unchosen.len(), 1, "{unchosen:?}");
+        assert_eq!(unchosen[0].where_, "Redwood");
+        assert_eq!(unchosen[0].uuid, U_WIFI);
+        assert_eq!(unchosen[0].detail, "uses 192.168.1.1 (router)");
+    }
+
+    #[test]
+    fn the_failed_over_link_is_not_listed_as_a_leak() {
+        let net = snapshot(vec![wifi_device(true)]);
+        let profiles = vec![redwood()];
+        let res = resolver(vec![link(4, "wlp7s0", &["192.168.1.1"], true)]);
+        assert!(!leaks_for(&net, &profiles, &res, Mode::Custom, false, None).is_empty(), "custom would be one");
+        assert!(leaks_for(&net, &profiles, &res, Mode::Custom, false, Some("wlp7s0")).is_empty());
+    }
+
+    #[test]
+    fn compiled_fallback_dns_is_a_leak_only_once_resolved_has_picked_it() {
+        let net = snapshot(vec![wifi_device(true)]);
+        let profiles = vec![redwood()];
+        let mut res = resolver(vec![link(4, "wlp7s0", &[PI], true)]);
+        // Configured but never picked: quiet.
+        assert!(leaks_for(&net, &profiles, &res, Mode::Pihole, false, None).is_empty());
+        // The Manager's current server is a fallback address while the link has servers.
+        res.global_current = Some(ip("9.9.9.9"));
+        let leaks = leaks_for(&net, &profiles, &res, Mode::Pihole, false, None);
+        assert_eq!(leaks.len(), 1, "{leaks:?}");
+        assert_eq!(leaks[0].kind, LeakKind::ResolvedFallback);
+        assert_eq!(leaks[0].kind.as_str(), "resolved-fallback");
+        assert_eq!(leaks[0].where_, "systemd-resolved");
+        assert!(leaks[0].detail.contains("9.9.9.9 now"), "{}", leaks[0].detail);
+        assert!(leaks[0].detail.contains("1.1.1.1") && leaks[0].detail.contains("8.8.8.8"), "names the servers");
+        // Not a fallback address (a configured global server is reported the old way).
+        res.global_current = Some(ip("10.1.1.1"));
+        assert!(leaks_for(&net, &profiles, &res, Mode::Pihole, false, None).is_empty());
+        // No link has servers: resolved *has* to use its fallback, that is mode "none".
+        let mut res = resolver(vec![]);
+        res.global_current = Some(ip("9.9.9.9"));
+        assert!(leaks_for(&net, &profiles, &res, Mode::None, false, None).is_empty());
+        // Servers from resolved.conf are a leak of their own kind, not this one.
+        let mut res = resolver(vec![link(4, "wlp7s0", &[PI], true)]);
+        res.global = vec![ip("8.8.8.8")];
+        res.global_current = Some(ip("8.8.8.8"));
+        let leaks = leaks_for(&net, &profiles, &res, Mode::Pihole, false, None);
+        assert!(leaks.iter().all(|l| l.kind != LeakKind::ResolvedFallback));
     }
 }
