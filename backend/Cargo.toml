@@ -1,0 +1,27 @@
+[package]
+name = "qnet"
+version = "0.1.0"
+edition = "2021"
+description = "Backend for the qqq.qnet Omarchy shell plugin: Wi-Fi panel and Pi-hole DNS truth"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# zbus 6 dropped the blocking API; 5.x keeps it.
+zbus = "5"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+signal-hook = "0.3"
+libc = "0.2"
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

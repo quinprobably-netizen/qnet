@@ -1,0 +1,144 @@
+{
+  "type": "state",
+  "seq": 42,
+  "link": {
+    "kind": "wifi",
+    "device": "wlp7s0",
+    "connection": "Redwood",
+    "uuid": "4a0f7e58-2d3c-4b8e-9c61-0d5a1f7e9b21",
+    "ssid": "Redwood",
+    "signal": 72,
+    "band": "5 GHz",
+    "bitrateMbps": 866,
+    "ip4": "192.168.1.242",
+    "gateway": "192.168.1.1",
+    "connectivity": "full",
+    "portalUrl": ""
+  },
+  "radio": {
+    "wifiEnabled": true,
+    "hwEnabled": true
+  },
+  "networks": [
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/12",
+      "ssid": "Redwood",
+      "hidden": false,
+      "signal": 72,
+      "security": "psk",
+      "known": true,
+      "uuid": "4a0f7e58-2d3c-4b8e-9c61-0d5a1f7e9b21",
+      "active": true,
+      "band": "5 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/21",
+      "ssid": "Home-Guest",
+      "hidden": false,
+      "signal": 35,
+      "security": "psk",
+      "known": true,
+      "uuid": "0c3d9f12-88aa-4e77-b5d1-72f6e0a1c9d3",
+      "active": false,
+      "band": "2.4 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/30",
+      "ssid": "Neighbor-5G",
+      "hidden": false,
+      "signal": 55,
+      "security": "sae",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "5 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/31",
+      "ssid": "CoffeeShop",
+      "hidden": false,
+      "signal": 40,
+      "security": "open",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/32",
+      "ssid": "Uni-8021X",
+      "hidden": false,
+      "signal": 30,
+      "security": "enterprise",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/33",
+      "ssid": "Cafe-OWE",
+      "hidden": false,
+      "signal": 28,
+      "security": "owe",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz"
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/34",
+      "ssid": "",
+      "hidden": true,
+      "signal": 22,
+      "security": "psk",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz"
+    }
+  ],
+  "scan": {
+    "running": false,
+    "lastScanAgeS": 12
+  },
+  "dns": {
+    "mode": "auto",
+    "modeSource": "profile",
+    "servers": [
+      {
+        "addr": "192.168.1.1",
+        "link": "wlp7s0",
+        "current": true,
+        "role": "router"
+      }
+    ],
+    "leaks": [],
+    "failover": {
+      "enabled": true,
+      "fallback": "router",
+      "active": false,
+      "since": 0,
+      "reason": ""
+    },
+    "manualOverride": false
+  },
+  "pihole": {
+    "configured": false,
+    "address": "",
+    "adminUrl": "",
+    "reachable": false,
+    "latencyMs": null,
+    "blocking": "unknown",
+    "pauseRemainingS": 0,
+    "api": "unconfigured",
+    "today": {
+      "total": 0,
+      "blocked": 0,
+      "percent": 0
+    },
+    "history": [],
+    "probes": []
+  },
+  "error": ""
+}

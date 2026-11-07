@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "qqq.qnet",
+  "name": "qnet",
+  "version": "0.1.0",
+  "author": "qqq",
+  "license": "MIT",
+  "description": "Wi-Fi and network panel that tells the truth about DNS: the resolver in use, Pi-hole health and a day of queries, with safe failover and passive Wi-Fi",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "qnet",
+    "description": "Wi-Fi, connection state and DNS (Pi-hole)",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
