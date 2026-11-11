@@ -82,9 +82,6 @@ impl Default for Store {
 
 /// A label with control characters removed, trimmed and cut to
 /// [`LABEL_MAX`] characters; `None` when nothing is left.
-// The CLI verbs that edit the known list (a later task) use `clean_label`,
-// `is_known`, `know` and `forget`.
-#[allow(dead_code)]
 pub fn clean_label(s: &str) -> Option<String> {
     let kept: String = s.chars().filter(|c| !c.is_control()).collect();
     let label: String = kept.trim().chars().take(LABEL_MAX).collect();
@@ -156,7 +153,6 @@ impl Store {
     }
 
     /// Whether `mac` (any accepted spelling) is on the list.
-    #[allow(dead_code)]
     pub fn is_known(&self, mac: &str) -> bool {
         normalize_mac(mac).is_some_and(|m| self.known.iter().any(|k| k.mac == m))
     }
@@ -169,7 +165,6 @@ impl Store {
     /// for an entry that is there with the same label, and for a new entry
     /// when [`MAX_ENTRIES`] are on the list already (see [`is_known`](Self::is_known)
     /// to tell these apart).
-    #[allow(dead_code)]
     pub fn know(&mut self, mac: &str, label: Option<&str>, first_seen: u64) -> bool {
         let Some(mac) = normalize_mac(mac) else {
             return false;
@@ -195,7 +190,6 @@ impl Store {
     }
 
     /// Take `mac` off the list; true (and `known_gen` up) when it was there.
-    #[allow(dead_code)]
     pub fn forget(&mut self, mac: &str) -> bool {
         let Some(mac) = normalize_mac(mac) else {
             return false;

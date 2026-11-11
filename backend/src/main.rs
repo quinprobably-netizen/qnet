@@ -8,6 +8,9 @@
 //!   qnet wifi connect <ap-path>    passphrase on stdin
 //!   qnet wifi down|scan|radio on|off|forget <uuid>
 //!   qnet portal                    captive-portal browser, throwaway profile
+//!   qnet watchdog alerts|devices|know-all
+//!   qnet watchdog ack <id>         acknowledge a watchdog alert on the Pi
+//!   qnet watchdog know <mac> [label...]|forget <mac>   known-device list
 //!
 //! One-shot verbs print one JSON line and exit 0 (`ok`) or 1.
 
@@ -33,6 +36,7 @@ mod threads;
 mod util;
 mod watch;
 mod watchdog;
+mod wdcli;
 mod wdstore;
 
 use std::io::{BufRead, IsTerminal, Read, Write};
@@ -44,7 +48,8 @@ use zeroize::Zeroizing;
 use actions::{ActionErr, ActionResult, Ctx};
 
 const USAGE: &str = "usage: qnet watch | state | dns pihole|auto [--force] | dns pin <uuid> [--force] | \
-pihole pause [secs]|resume|setup <addr> | wifi connect <ap-path>|down|scan|forget <uuid>|radio on|off | portal";
+pihole pause [secs]|resume|setup <addr> | wifi connect <ap-path>|down|scan|forget <uuid>|radio on|off | portal | \
+watchdog alerts|devices|know-all | watchdog ack <id> | watchdog know <mac> [label...] | watchdog forget <mac>";
 
 fn usage() -> ActionErr {
     ActionErr::new("usage", USAGE)
@@ -178,12 +183,17 @@ enum Cmd {
         on: bool,
     },
     Portal,
+    Watchdog(wdcli::WdCmd),
     Version,
 }
 
 /// Parse and validate the command line. Nothing here touches the system, so
 /// bad input never gets as far as a D-Bus call.
 fn parse(all: &[String]) -> Result<Cmd, ActionErr> {
+    // A label may hold anything, so the watchdog verbs get the words as typed.
+    if all.first().map(String::as_str) == Some("watchdog") {
+        return wdcli::parse(&all[1..]).map(Cmd::Watchdog);
+    }
     // `--if-stale <secs>` takes a value, so it is cut out before the rest is
     // matched by position.
     let mut args: Vec<String> = Vec::new();
@@ -293,6 +303,26 @@ fn pihole_client(cfg: &config::Config) -> Result<pihole::Pihole, ActionErr> {
     )?)
 }
 
+/// Run a verb that talks to the Pi-hole: terminating signals only set a flag
+/// (checked before anything is changed), the process is hardened, and the
+/// session is always logged out.
+fn with_pihole(f: impl FnOnce(&mut pihole::Pihole) -> ActionResult) -> ActionResult {
+    let term = util::term_flag();
+    util::harden_process();
+    let cfg = load_config()?;
+    let mut api = pihole_client(&cfg)?;
+    let r = if term.load(std::sync::atomic::Ordering::SeqCst) {
+        Err(ActionErr::new(
+            "interrupted",
+            "stopped before anything was changed",
+        ))
+    } else {
+        f(&mut api)
+    };
+    api.logout();
+    r
+}
+
 fn run_oneshot(cmd: Cmd) -> ActionResult {
     match cmd {
         Cmd::PiholeSetup { addr } => {
@@ -315,38 +345,16 @@ fn run_oneshot(cmd: Cmd) -> ActionResult {
         }
         // From here on SIGTERM/SIGINT/SIGHUP only set a flag: the step in
         // progress finishes (or is undone) and sessions are logged out.
-        Cmd::PiholePause { secs } => {
-            let term = util::term_flag();
-            util::harden_process();
-            let cfg = load_config()?;
-            let mut api = pihole_client(&cfg)?;
-            let r = if term.load(std::sync::atomic::Ordering::SeqCst) {
-                Err(ActionErr::new(
-                    "interrupted",
-                    "stopped before anything was changed",
-                ))
-            } else {
-                actions::pihole_pause(&mut api, secs)
-            };
-            api.logout();
-            r
-        }
-        Cmd::PiholeResume => {
-            let term = util::term_flag();
-            util::harden_process();
-            let cfg = load_config()?;
-            let mut api = pihole_client(&cfg)?;
-            let r = if term.load(std::sync::atomic::Ordering::SeqCst) {
-                Err(ActionErr::new(
-                    "interrupted",
-                    "stopped before anything was changed",
-                ))
-            } else {
-                actions::pihole_resume(&mut api)
-            };
-            api.logout();
-            r
-        }
+        Cmd::PiholePause { secs } => with_pihole(|api| actions::pihole_pause(api, secs)),
+        Cmd::PiholeResume => with_pihole(|api| actions::pihole_resume(api)),
+        Cmd::Watchdog(w) => with_pihole(|api| {
+            wdcli::run(
+                api,
+                &util::state_dir().join("watchdog.json"),
+                util::unix_secs(),
+                &w,
+            )
+        }),
         Cmd::WifiConnect { ap } => {
             let term = util::term_flag();
             // One line on stdin: the passphrase (empty for open/known).
@@ -469,6 +477,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wdcli::WdCmd;
 
     fn p(args: &[&str]) -> Result<Cmd, ActionErr> {
         parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -584,6 +593,150 @@ mod tests {
         }
         assert_eq!(p(&["bogus"]).unwrap_err().code, "usage");
         assert_eq!(p(&["wifi", "forget", "x"]).unwrap_err().code, "invalid");
+    }
+
+    const M: &str = "02:00:00:00:00:01";
+
+    fn know(mac: &str, label: Option<&str>) -> Cmd {
+        Cmd::Watchdog(WdCmd::Know {
+            mac: mac.into(),
+            label: label.map(String::from),
+        })
+    }
+
+    #[test]
+    fn watchdog_verbs_parse() {
+        assert_eq!(p(&["watchdog", "alerts"]), Ok(Cmd::Watchdog(WdCmd::Alerts)));
+        assert_eq!(
+            p(&["watchdog", "devices"]),
+            Ok(Cmd::Watchdog(WdCmd::Devices))
+        );
+        assert_eq!(
+            p(&["watchdog", "know-all"]),
+            Ok(Cmd::Watchdog(WdCmd::KnowAll))
+        );
+        assert_eq!(
+            p(&["watchdog", "ack", "7"]),
+            Ok(Cmd::Watchdog(WdCmd::Ack { id: 7 }))
+        );
+        assert_eq!(
+            p(&["watchdog", "ack", "18446744073709551615"]),
+            Ok(Cmd::Watchdog(WdCmd::Ack { id: u64::MAX })),
+            "the largest id, 20 digits"
+        );
+        assert_eq!(
+            p(&["watchdog", "ack", "0007"]),
+            Ok(Cmd::Watchdog(WdCmd::Ack { id: 7 }))
+        );
+        assert_eq!(
+            p(&["watchdog", "forget", M]),
+            Ok(Cmd::Watchdog(WdCmd::Forget { mac: M.into() }))
+        );
+        assert_eq!(p(&["watchdog", "know", M]), Ok(know(M, None)));
+        assert_eq!(
+            p(&["watchdog", "know", M, "Printer"]),
+            Ok(know(M, Some("Printer")))
+        );
+    }
+
+    #[test]
+    fn watchdog_macs_are_normalised() {
+        let upper = "02-00-00-AA-BB-CC";
+        let lower = "02:00:00:aa:bb:cc";
+        assert_eq!(p(&["watchdog", "know", upper]), Ok(know(lower, None)));
+        assert_eq!(
+            p(&["watchdog", "forget", upper]),
+            Ok(Cmd::Watchdog(WdCmd::Forget { mac: lower.into() }))
+        );
+    }
+
+    #[test]
+    fn a_watchdog_label_is_the_rest_of_the_line_joined_and_cleaned() {
+        assert_eq!(
+            p(&["watchdog", "know", M, "Living", "room", "TV"]),
+            Ok(know(M, Some("Living room TV")))
+        );
+        // The words are kept as typed, even when they look like flags.
+        assert_eq!(
+            p(&["watchdog", "know", M, "--force", "--if-stale", "x"]),
+            Ok(know(M, Some("--force --if-stale x")))
+        );
+        // Control characters are removed, the ends trimmed.
+        assert_eq!(
+            p(&["watchdog", "know", M, "  Hall\u{7}way", "cam\t"]),
+            Ok(know(M, Some("Hallway cam")))
+        );
+        // Nothing left of the label: as if none was given.
+        assert_eq!(p(&["watchdog", "know", M, "", " "]), Ok(know(M, None)));
+        // Too long is cut at 64 characters, not refused.
+        let long = "x".repeat(100);
+        assert_eq!(
+            p(&["watchdog", "know", M, &long]),
+            Ok(know(M, Some(&"x".repeat(64))))
+        );
+        let words = ["word"; 30];
+        let mut args = vec!["watchdog", "know", M];
+        args.extend(words);
+        let Ok(Cmd::Watchdog(WdCmd::Know { label: Some(l), .. })) = p(&args) else {
+            panic!("a label");
+        };
+        assert_eq!(l.chars().count(), 64);
+        assert!(l.starts_with("word word") && !l.ends_with(' '));
+    }
+
+    #[test]
+    fn bad_watchdog_input_is_rejected_before_anything_runs() {
+        for id in [
+            "x",
+            "-1",
+            "+1",
+            "1.5",
+            "",
+            " 7",
+            "7 ",
+            "0x10",
+            "99999999999999999999999",
+        ] {
+            let e = p(&["watchdog", "ack", id]).unwrap_err();
+            assert_eq!(e.code, "invalid", "ack {id:?}");
+        }
+        // 20 digits that do not fit a u64.
+        assert_eq!(
+            p(&["watchdog", "ack", "18446744073709551616"])
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        for mac in [
+            "02:00:00:00:00",
+            "02:00-00:00:00:01",
+            "zz:00:00:00:00:01",
+            "02:00:00:00:00:01:",
+            "02:00:00:00:00:011",
+            "020000000001",
+            "",
+        ] {
+            for verb in ["know", "forget"] {
+                let e = p(&["watchdog", verb, mac]).unwrap_err();
+                assert_eq!(e.code, "invalid", "{verb} {mac:?}");
+            }
+        }
+        for bad in [
+            &["watchdog"][..],
+            &["watchdog", "bogus"],
+            &["watchdog", "alerts", "now"],
+            &["watchdog", "alerts", "--json"],
+            &["watchdog", "devices", "all"],
+            &["watchdog", "know-all", M],
+            &["watchdog", "ack"],
+            &["watchdog", "ack", "7", "8"],
+            &["watchdog", "forget"],
+            &["watchdog", "forget", M, "Printer"],
+            &["watchdog", "know"],
+        ] {
+            let e = p(bad).unwrap_err();
+            assert_eq!(e.code, "usage", "{bad:?} -> {e:?}");
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::net::*;
 use crate::pihole::{Blocking, BlockingState, Bucket, Summary, Upstreams};
 use crate::threads::ApiLiveness;
 use crate::util::round1;
-use crate::watchdog::{title_for, WatchdogReport};
+use crate::watchdog::{title_for, Alert, ReportDevice, WatchdogReport};
 
 pub const MAX_NETWORKS: usize = 40;
 pub const MAX_PROBES: usize = 60;
@@ -298,6 +298,24 @@ pub struct WatchdogAlertOut {
     pub acked: bool,
 }
 
+impl WatchdogAlertOut {
+    pub fn from_alert(a: &Alert) -> Self {
+        Self {
+            id: a.id,
+            key: a.key.clone(),
+            kind: a.kind.clone(),
+            severity: a.severity.clone(),
+            title: title_for(&a.kind),
+            client: a.client.clone(),
+            subject: a.subject.clone(),
+            first_unix: a.first_unix,
+            last_unix: a.last_unix,
+            count: a.count,
+            acked: a.acked,
+        }
+    }
+}
+
 /// One device of the Pi's inventory for the panel.
 #[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -312,6 +330,21 @@ pub struct WatchdogDeviceOut {
     /// It is on this PC's known list.
     pub known: bool,
     pub label: String,
+}
+
+impl WatchdogDeviceOut {
+    pub fn from_report_device(d: &ReportDevice) -> Self {
+        Self {
+            mac: d.device.mac.clone(),
+            ipv4: d.device.ipv4.clone(),
+            hostname: d.device.hostname.clone(),
+            first_unix: d.device.first_unix,
+            last_unix: d.device.last_unix,
+            known_on_pi: d.device.known,
+            known: d.known,
+            label: d.label.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -358,37 +391,12 @@ impl WatchdogOut {
             rev: r.rev,
             suppressed: r.suppressed,
             unacked: r.unacked,
-            alerts: r
-                .alerts
-                .iter()
-                .map(|a| WatchdogAlertOut {
-                    id: a.id,
-                    key: a.key.clone(),
-                    kind: a.kind.clone(),
-                    severity: a.severity.clone(),
-                    title: title_for(&a.kind),
-                    client: a.client.clone(),
-                    subject: a.subject.clone(),
-                    first_unix: a.first_unix,
-                    last_unix: a.last_unix,
-                    count: a.count,
-                    acked: a.acked,
-                })
-                .collect(),
+            alerts: r.alerts.iter().map(WatchdogAlertOut::from_alert).collect(),
             known_list: r.known_list.clone(),
             devices: r
                 .devices
                 .iter()
-                .map(|d| WatchdogDeviceOut {
-                    mac: d.device.mac.clone(),
-                    ipv4: d.device.ipv4.clone(),
-                    hostname: d.device.hostname.clone(),
-                    first_unix: d.device.first_unix,
-                    last_unix: d.device.last_unix,
-                    known_on_pi: d.device.known,
-                    known: d.known,
-                    label: d.label.clone(),
-                })
+                .map(WatchdogDeviceOut::from_report_device)
                 .collect(),
             known_count: r.known_count,
             pushed_at: r.pushed_at,

@@ -287,8 +287,6 @@ pub fn get_alerts(api: &mut Pihole, since: u64) -> Result<Qbp<AlertsPage>, ApiEr
 /// watchdog and when no alert has this id; the call cannot tell them apart,
 /// so the caller decides (it usually knows from an earlier answer whether the
 /// watchdog is there).
-// The CLI verb `qnet watchdog ack` (a later task) uses it.
-#[allow(dead_code)]
 pub fn ack(api: &mut Pihole, id: u64) -> Result<Qbp<()>, ApiError> {
     let path = format!("/api/qbp/alerts/{id}/ack");
     Ok(match api.json_opt("POST", &path, None)? {
@@ -579,6 +577,27 @@ pub struct ReportDevice {
     pub known: bool,
     /// The label from the known list, "" when there is none.
     pub label: String,
+}
+
+/// `devices` with what this PC's known list says about each, in the same
+/// order.
+pub fn annotate(devices: Vec<Device>, store: &Store) -> Vec<ReportDevice> {
+    let mine: HashMap<&str, Option<&str>> = store
+        .known
+        .iter()
+        .map(|k| (k.mac.as_str(), k.label.as_deref()))
+        .collect();
+    devices
+        .into_iter()
+        .map(|d| {
+            let entry = mine.get(d.mac.as_str());
+            ReportDevice {
+                known: entry.is_some(),
+                label: entry.and_then(|l| *l).unwrap_or_default().to_string(),
+                device: d,
+            }
+        })
+        .collect()
 }
 
 /// What the API thread tells the main thread after a watchdog cycle: the
@@ -918,11 +937,6 @@ impl Poller {
         alerts.truncate(REPORT_ALERTS);
         let unacked = self.alerts.values().filter(|a| !a.acked).count() as u64;
 
-        let mine: HashMap<&str, Option<&str>> = store
-            .known
-            .iter()
-            .map(|k| (k.mac.as_str(), k.label.as_deref()))
-            .collect();
         let (known_list, mut devices) = match &self.inventory {
             Some(inv) => (inv.known_list.clone(), inv.devices.clone()),
             None => (String::new(), Vec::new()),
@@ -930,17 +944,7 @@ impl Poller {
         // The Pi sends the one seen last first; do not rely on it.
         devices.sort_by_key(|d| std::cmp::Reverse(d.last_unix));
         devices.truncate(REPORT_DEVICES);
-        let devices = devices
-            .into_iter()
-            .map(|d| {
-                let entry = mine.get(d.mac.as_str());
-                ReportDevice {
-                    known: entry.is_some(),
-                    label: entry.and_then(|l| *l).unwrap_or_default().to_string(),
-                    device: d,
-                }
-            })
-            .collect();
+        let devices = annotate(devices, store);
 
         WatchdogReport {
             status: self.status,
