@@ -19,6 +19,13 @@ knows about the Pi-hole on the LAN. It is a thin QML panel over a Rust binary,
 - **Failover:** when the Pi-hole stops answering (≥30 s, and its pinned API is
   also dead), the *runtime* DNS switches to the trusted router or Quad9. It
   switches back on recovery. The saved profile is never written.
+- **Watchdog (qberrypi):** when the Pi-hole is a qberrypi, qnet reads its
+  watchdog.
+  - Alerts and devices are in the state JSON (`watchdog`), and new alerts raise
+    desktop notifications (3 a minute, then "N more alerts").
+  - The acknowledged alerts and the known devices are kept on this PC and
+    pushed back after a Pi reboot.
+  - Against a real Pi-hole nothing changes. There is no panel for it yet.
 
 Details: `SPEC.md`.
 
@@ -28,6 +35,12 @@ Details: `SPEC.md`.
 ./install.sh                 # builds to ~/.cache/qnet/target, installs ~/.local/bin/qnet
 omarchy restart shell        # QML hot-reload is unreliable; restart to load edits
 qnet pihole setup [address]  # once, in a terminal: pins the cert, stores an app password in the keyring
+qnet watchdog alerts         # qberrypi only: its alerts, one JSON line
+qnet watchdog ack <id>       # acknowledge an alert
+qnet watchdog devices        # its devices, and what this PC knows of them
+qnet watchdog know <mac> [label...]   # add to the known list; pushed to the Pi
+qnet watchdog forget <mac>   # take a device off the list
+qnet watchdog know-all       # add every device the Pi has seen
 ```
 
 - IPC: `omarchy-shell qqq.qnet toggle | open | close | view <main|wifi|dns>`.

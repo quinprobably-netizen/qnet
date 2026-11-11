@@ -21,6 +21,9 @@ wiped the Pi-hole pin from every profile.
    - Today's numbers, and a live query-flow hero.
    - Pause blocking for 5 minutes, and resume.
    - Safe automatic failover, and recovery.
+   - Watchdog: when the Pi-hole is a qberrypi, qnet also fronts its watchdog
+     (alerts, devices, desktop notifications, and the acknowledged and known
+     lists kept on this PC). Against a real Pi-hole nothing changes.
 3. **Passive Wi-Fi.** NetworkManager over D-Bus, event-driven, using NM's
    cached access-point list. Scan only on an explicit request (`qnet wifi
    scan`, at most once per 15 s); opening the panel never scans. The AX210 is
@@ -52,6 +55,13 @@ wiped the Pi-hole pin from every profile.
     Pi-hole address) and reused on the next start if the Pi-hole still calls
     it valid, so a killed `watch` never leaks a session slot. A process removes
     the file on logout only if it still holds *its own* session id.
+  - **Pi-hole API thread:** it polls the stats only while the panel is open.
+    It also runs while the panel is closed, for the watchdog only: one alerts
+    request a minute, no stats and no change to `pihole.api`, and only while
+    the Pi-hole turns out to be a qberrypi (see "Watchdog (qberrypi)"). A real
+    Pi-hole is asked once per start; when that happens while closed (30 s
+    after start) it is one login, one request and one logout, after which the
+    thread stays quiet.
 - One-shot actions are `qnet <verb> ...`.
   - Each prints one JSON line, `{"ok":true,...}` or
     `{"ok":false,"error":"..."}`, and the exit code matches.
@@ -71,13 +81,32 @@ wiped the Pi-hole pin from every profile.
   - **Error codes the panel should know:** `too-soon` (with `retryInS`, from
     `wifi scan` and `wifi radio`), `busy`, `confirm`, `interrupted`,
     `partial`, `unconfigured`, `enterprise`, `badpass`, `auth`, `nolink`,
-    `radio`, `rfkill`.
+    `radio`, `rfkill`. The `watchdog` verbs add `absent` (the Pi-hole has no
+    watchdog), `not-found` (no such alert, or the device is not on the known
+    list), `full` (the known list already holds 1024 devices) and `store` (the
+    PC-side watchdog store could not be written).
   - **One-shot verbs and signals:** except the interactive `pihole setup`,
     they catch SIGTERM/SIGINT/SIGHUP. The step in progress finishes (a
     profile that was written is applied, a half-made Wi-Fi profile is
     deleted), the next step is not started, the Pi-hole session is logged
     out, and the verb ends with `"interrupted"` (error, or `"interrupted":
     true` on a result that was applied but not checked).
+- The watchdog keeps its own state in `~/.local/state/qnet/watchdog.json`
+  (file 0600, directory 0700), with `watchdog.lock` beside it.
+  - **Holds:** `acked` (the keys of the alerts acknowledged, and when),
+    `known` (the known-device list: MAC, optional label, when it was first
+    seen), `knownGen` and `pushedKnownGen` (which edit of that list the Pi
+    has), `notified` (the alert instances that already got a desktop
+    notification, so a restart repeats none) and `version`. Each list keeps
+    at most 1024 entries.
+  - **Writers:** the watcher (keys the Pi reports as acknowledged,
+    `notified`, `pushedKnownGen` after a push) and the one-shot verbs
+    `watchdog ack|know|forget|know-all`. Two processes can write it, so every
+    change is a read-modify-write under an exclusive `flock` on
+    `watchdog.lock` and replaces the file atomically. Unlike the DNS lock this
+    one waits, up to 2 s. If it stays taken, a verb answers `store` and the
+    watcher tries again on its next cycle. A missing or unreadable file reads
+    as empty.
 - Secrets never go on argv: Wi-Fi passphrases and the Pi-hole web password
   arrive on stdin (one line; the reader never waits for EOF). Untrusted
   strings reach processes only as argv elements. There is no shell anywhere
@@ -109,6 +138,9 @@ wiped the Pi-hole pin from every profile.
 | Web API liveness | One pinned HTTPS `GET /api/dns/blocking` (3 s cap, 1.5 s here); a completed pinned handshake counts as "alive" whatever the HTTP status | only when the canary went unanswered (to decide whether it is an outage) and once when a router is to be recorded |
 | Gateway latency | In-process unprivileged ICMP echo (`SOCK_DGRAM`, `IPPROTO_ICMP`; needs `net.ipv4.ping_group_range`) to the gateway; no child process | only while open, every 5 s |
 | Pi-hole stats | HTTPS API on 443 with the **pinned cert SHA-256**: `/api/stats/summary`, `/api/dns/blocking` | only while open, every 10 s; `/api/history` and `/api/stats/upstreams` every 60 s and on open |
+| Watchdog alerts (qberrypi only) | `GET /api/qbp/alerts?since=<rev>` on the same pinned HTTPS session | open: after every good stats poll (10 s). Closed: 30 s after start, then every 60 s, while the watchdog is present. Never again once it is absent, until a new login session or a new config |
+| Watchdog devices (qberrypi only) | `GET /api/qbp/devices` | open only: on open, then every 60 s. Never while closed |
+| Watchdog pushes | `PUT /api/qbp/alerts/acked` and `PUT /api/qbp/devices/known` | only when due (see "Watchdog (qberrypi)"): the first cycle of a session, a new login, a Pi restart, a Pi that is `waiting` for its list, an edit of the known list. Each body is at most 4000 bytes (the Pi's cap is 4096), so the known list goes in chunks. An empty known list is pushed only when an edit emptied it |
 
 ### Pi-hole API sessions
 
@@ -122,6 +154,10 @@ wiped the Pi-hole pin from every profile.
   is locked or does not answer), 30 s for TLS problems.
 - Response bodies are capped at 256 KiB; requests time out after 3 s. The
   pinned-certificate verdict is reset for every request.
+- The watchdog uses the same session. A closed qnet whose Pi-hole has a
+  watchdog keeps its session between the minute polls (only the idle
+  connection is closed). If the closed poll finds there is none, it logs out
+  again at once, so a qnet that was never opened holds no session, as before.
 
 ### Our own queries
 
@@ -240,7 +276,9 @@ Field rules:
 - **When a `state` line is sent.** Whenever the state differs from the last
   line sent, at most 4 per second. While the panel is closed `pihole.probes`,
   `pihole.latencyMs` and `link.bitrateMbps` do not count, so a healthy closed
-  probe produces only a heartbeat. `open` always sends the full state.
+  probe produces only a heartbeat. `watchdog.polledAt` never counts, open or
+  closed, so a quiet watchdog poll is a heartbeat too. `open` always sends the
+  full state.
 - **`link.frequencyMhz`, `link.prefix`:** the active access point's channel
   frequency in MHz (`null` off Wi-Fi), and the IPv4 prefix length of `ip4`
   (`null` without an address); both straight from NetworkManager's D-Bus
@@ -323,6 +361,52 @@ Field rules:
   live edge of the hero.
 - **`manualOverride`:** true when the active profile has DNS servers set that
   qnet did not write. qnet must confirm before overwriting them.
+- **`watchdog.status`:**
+  - `unconfigured`: no Pi-hole is configured; everything else is empty or 0;
+  - `unknown`: configured, but no cycle has answered yet (also right after the
+    Pi-hole's address or pin changed);
+  - `ok`: the last cycle was answered;
+  - `absent`: the Pi-hole has no watchdog (a real Pi-hole); the lists are empty;
+  - `auth`, `tls`, `unreachable`: the last cycle failed. The data from earlier
+    cycles stays. A watchdog failure shows here and never in `pihole.api`.
+- **`watchdog.rev`, `suppressed`:** the Pi's alert revision and its own count
+  of suppressed alerts, as of the last answer.
+- **`watchdog.unacked`:** alerts not acknowledged among those qnet holds (at
+  most 256), so it can be more than the 50 listed.
+- **`watchdog.alerts`:**
+  - Newest change first, at most 50.
+  - `id` (and the top-level `rev`) start again at a Pi reboot; `key` (16
+    lower-case hex) does not, so it is what tells an alert apart over time.
+    `qnet watchdog ack` takes the `id`.
+  - `title` is the notification title for `kind` (unescaped; an unknown kind
+    reads "Watchdog alert"). `client` is an IP address or `null`. `severity`
+    is `info`, `warn` or `high` (anything else reads `info`).
+  - `subject` is text from the network, shown with control characters removed
+    and cut to 255 bytes. Show it as plain text.
+  - Entries without a usable id, key or kind are dropped.
+- **`watchdog.devices`:**
+  - Last seen first, at most 128.
+  - `[]` until the first read, which happens only while the panel is open;
+    after that the last read stays while it is closed. Read again on open and
+    every 60 s.
+  - `knownOnPi`: the Pi counts the device as known. `known`: it is on this
+    PC's known list, the one pushed to the Pi. The two can differ: the Pi may
+    have learned a device on its own, or a list edit may not have been pushed
+    yet.
+  - `label`: this PC's label for the device, `""` when there is none.
+  - `ipv4` holds at most 4 addresses; `hostname` is cut to 64 bytes.
+- **`watchdog.knownList`:** the Pi's list state: `waiting` (it has no list and
+  wants one; qnet pushes the PC's list if it has one), `learned` (it built its
+  own), `received` (a list was pushed to it), `""` (not read yet, or not a
+  value qnet knows).
+- **`watchdog.knownCount`:** the entries on this PC's known list at the last
+  report, so it is also set while the status is `absent` or a failure; it is 0
+  while `unconfigured` or `unknown`.
+- **`watchdog.pushedAt`, `pushError`:** the time of the last push that sent
+  something (0 = none yet in this run), and why the last push failed
+  (`""` once one has worked). A failed push stays due.
+- **`watchdog.polledAt`:** the time of the last cycle the Pi answered (0 =
+  none). It moves with every poll, so it is not a change (see above).
 
 ## Actions
 
@@ -338,6 +422,19 @@ Field rules:
 | `qnet wifi scan [--if-stale <secs>]` | `RequestScan`, but never closer than 15 s to **either** NM's `LastScan` or qnet's own last request (`$XDG_RUNTIME_DIR/qnet/scan`). Too soon: `{"ok":false,"error":"too-soon","retryInS":N}`. With `--if-stale`, a scan is requested only if both clocks are older than `<secs>`; otherwise `{"ok":true,"skipped":true,"lastScanAgeS":N}` (N = the younger of the two) and nothing is done. The 15 s rule still applies after that check. The panel calls `qnet wifi scan --if-stale 60` when the Wi-Fi view opens. |
 | `qnet wifi radio on\|off` | NM `WirelessEnabled`. A request for the state it is already in is a no-op. A second *change* within 10 s of the last one (`$XDG_RUNTIME_DIR/qnet/radio`) is refused: `{"ok":false,"error":"too-soon","retryInS":N}`. |
 | `qnet portal` | Opens `link.portalUrl`, or `http://neverssl.com`, in a normal **incognito window with a throwaway profile**: `chromium --user-data-dir=<new 0700 temp dir> --incognito <url>` (not `--app`: a portal page is untrusted web content). The temp dir is removed when the browser exits. |
+| `qnet watchdog alerts` | Every alert the Pi holds, newest change first, in the shape of `watchdog.alerts` (not cut at 50): `{"ok":true,"rev","suppressed","alerts":[…]}`. Error: `absent`. |
+| `qnet watchdog ack <id>` | Looks the alert up by `id` (`GET alerts`), `POST alerts/<id>/ack`, then records its key in the store so the Pi gets it again after a reboot. Result `{"ok":true,"id","key","saved":bool}`; `saved:false` means the Pi took it but this PC could not record it.<br>• Errors: `invalid` (not a whole number), `not-found` (no alert with that id, also when it vanished before the POST; nothing is written), `absent`. |
+| `qnet watchdog devices` | Result `{"ok":true,"knownList","devices":[…],"knownOffline":[{mac,label,firstSeen}]}`.<br>• `devices`: everything the Pi reports (not cut at 128), last seen first, each as in `watchdog.devices`.<br>• `knownOffline`: devices on this PC's known list that the Pi did not report (`label` is `""` without one).<br>• Error: `absent`. |
+| `qnet watchdog know <mac> [label...]` | Puts the device on this PC's known list, or changes its label, then pushes the whole list. Without a label an existing one stays. A new entry's `firstSeen` is when the Pi first saw the device, or now if the Pi does not list it or cannot be asked. It pushes on every call, also when nothing changed.<br>• Result `{"ok":true,"mac","label"?,"known":n,"pushed":bool,"pushError"?}`; `known` is the size of the list after the edit.<br>• A failed push, or a Pi-hole with no watchdog (`"pushError":"absent"`), still leaves the edit: `pushed:false`, and the watcher pushes it later.<br>• Errors: `invalid`, `full` (a new device, the list holds 1024; nothing is pushed), `store`. |
+| `qnet watchdog forget <mac>` | Takes the device off this PC's known list, then pushes the list; an emptied list is pushed too. Result as for `know`, without `label`. Errors: `invalid`, `not-found` (not on this PC's list; the Pi's own `known` flag does not count; no request is made), `store`. |
+| `qnet watchdog know-all` | Adds every device the Pi reports that is not on the list, in one edit (existing entries and labels are untouched; `firstSeen` comes from the Pi), then pushes. It pushes only if something was added or an earlier edit is still waiting to go.<br>• Result `{"ok":true,"added":n,"known":n,"pushed":bool,"skipped"?:n,"pushError"?}`; `skipped` counts devices that did not fit on a full list.<br>• Errors: `absent`, `store`. |
+
+The `watchdog` verbs share these rules:
+
+- A `<mac>` is six hex pairs with `:` or `-` between them, in either case; it is stored in lower-case colon form. Anything else is `invalid`, as is an `<id>` that is not a whole number.
+- A `label` is the rest of the line, words joined by single spaces and taken as typed (even words that look like flags). Control characters are removed, the ends trimmed and it is cut at 64 characters (cut, not refused); nothing left means no label.
+- A wrong shape of command is `usage`. Besides the errors above they can fail with `unconfigured`, `auth`, `tls`, `unreachable`, `api` (an answer qnet cannot use) and `interrupted`. The exit code matches `ok`, as for every verb.
+- `know` and `forget` need no watchdog to edit the list; `alerts`, `ack`, `devices` and `know-all` answer `absent` without one.
 
 ## Failover (in `qnet watch`)
 
@@ -390,6 +487,145 @@ Field rules:
   without trouble.
 - **Never** fail over or touch DNS while the link is down or flapping, and
   never touch the radio.
+
+## Watchdog (qberrypi)
+
+qberrypi, the owner's Pi-hole replacement, has a watchdog behind the same login
+as the Pi-hole API. It raises alerts (a new device, ARP spoofing, DGA lookups,
+DNS tunnels, beaconing, bursts, blocked threats, DNS rebinding) and keeps an
+inventory of the devices it has heard. qnet reads both over the pinned HTTPS
+API, puts them in the `watchdog` object of the state JSON and raises desktop
+notifications for new alerts. It keeps two lists on this PC and pushes them
+back to the Pi, so they survive its reboots: the acknowledged alerts and the
+known devices. A real Pi-hole answers 404 on all of it, and then qnet behaves
+exactly as it did before. There is no panel for it yet.
+
+Every call is under `/api/qbp/`, on the same session as the stats:
+
+| Call | Answer, and what qnet does with it |
+|---|---|
+| `GET alerts?since=R` | `{rev, suppressed, alerts:[…]}`: the alerts that changed after revision `R`, oldest change first. The query is always sent (0 at the start). |
+| `POST alerts/{id}/ack` | Acknowledges one alert; 404 for an unknown id. |
+| `PUT alerts/acked` | `{"acked":[<key>…]}`. Additive; the Pi keeps at most 1024. |
+| `GET devices` | `{known_list, devices:[{mac, ipv4[], hostname, first_unix, last_unix, known}]}`. |
+| `PUT devices/known` | `{"known":[<mac>…],"append":bool,"complete":bool}`. A list takes effect on the `complete` body; the Pi keeps at most 1024. |
+
+Answers are parsed leniently. An alert without a usable `id`, `key` or `kind`
+and a device without a valid MAC are dropped; other fields fall back to
+harmless defaults; strings lose their control characters and are capped; at
+most 256 alerts (the newest) and 512 devices are kept from one answer. A 2xx
+answer that does not parse is an error, never "absent".
+
+- **Presence:**
+  - `unknown` until the first qbp call is answered; `present` on any 2xx;
+    `absent` on HTTP 404 from the alerts, devices or push calls.
+  - Once absent, no qbp request is made again until a new config or a new
+    login session by this client: one extra request per session, never per
+    poll. The Pi's alerts, devices and `rev` are forgotten and stats polling
+    goes on exactly as before.
+  - While closed, a first presence check runs 30 s after start (it logs in);
+    if the watchdog is absent the thread logs out again at once. An auth
+    failure (no secret, a locked keyring) parks the closed poll until the next
+    `open` or new config, so a locked keyring is never asked every minute. A
+    TLS failure retries after 30 s, any other failure after 60 s.
+  - Failures of the watchdog go to `watchdog.status` and never to
+    `pihole.api`. While open, a failed stats poll skips the watchdog cycle for
+    that round: it only follows a good one. An auth failure of the watchdog
+    drops the client and waits 60 s, like one of the stats.
+- **The cycle** (the API thread; open after every good stats poll, closed on its
+  own, where it asks for alerts only):
+  1. Push what is due (below): the acknowledged keys first, then the known list.
+  2. `GET alerts?since=<cursor>`. A `rev` below the cursor means the Pi
+     restarted: the cursor, the alerts and the device list are reset, a push is
+     made and the alerts are fetched again from 0 (once per cycle at most).
+  3. Record the page in the store, in one locked update: an alert the Pi
+     reports as acknowledged adds its key to `acked` (so an ack made on the
+     Pi's own panel survives its reboot too), and an alert that needs a
+     notification is marked in `notified`. If the store cannot be written
+     the cursor does not move and nothing is notified: the next cycle gets the
+     same alerts again, so a notification is late and never lost.
+  4. Merge the page into the alerts held in memory, by `id`, at most 256 (the
+     lowest `rev` goes first).
+  5. Fold and show the notifications (below).
+  6. Open and devices due: `GET devices`. A `waiting` Pi with a non-empty PC
+     list is pushed at once. A failing devices read or push does not fail the
+     cycle.
+  7. Send the report to the main thread. The status is `ok` and `polledAt` is
+     now.
+
+  A failure that means no contact (auth, tls, unreachable) or an alerts
+  answer that cannot be used ends the cycle with that status, and nothing is
+  recorded.
+- **Pushes and reboots:**
+  - A push is due when this client has never pushed, when its login counter
+    changed (a new session, and the Pi may have rebooted), when `rev` went
+    backwards, when the Pi's `knownList` was seen as `waiting` while the PC
+    list is not empty, or when `knownGen` differs from `pushedKnownGen` (the
+    list was edited and the Pi does not have it yet).
+  - Acks: `PUT alerts/acked` with every stored key, in bodies of at most 4000
+    bytes; nothing is sent when there are none.
+  - Known list: `PUT devices/known` in chunks of at most 4000 bytes (197 MACs
+    each, so 250 MACs are 2 bodies and 1024 are 6), the first with
+    `append:false`, the last with `complete:true`, the MACs in list order and
+    never split. The Pi switches to the new list on the last chunk; if one
+    fails midway it keeps its old list and the next push starts over.
+  - **Empty list:** the list is pushed when it is not empty, or when an edit
+    emptied it (`knownGen` differs). An empty list that nobody edited is never
+    pushed: it would make the Pi raise every device, and without a list the Pi
+    learns silently.
+  - A failed push stays due and its message is `watchdog.pushError`. A
+    successful one records `pushedKnownGen` as the generation read before the
+    push, so an edit made while it was on the wire stays due.
+- **Notifications:**
+  - An alert is new when it is not acknowledged and its key is not in
+    `notified`, or its `first_unix` is later than the one recorded there (a
+    fresh instance after a Pi reboot). The first cycle fetches from 0, so
+    unacknowledged alerts the Pi still holds notify then (folded, if there
+    are many), unless `notified` already has them. `notified` is
+    persisted, so restarting qnet repeats none. Alerts the Pi reports as
+    acknowledged never notify.
+  - Title by kind, body `<subject> · <client>` (just the subject when the
+    client is `null`):
+
+    | Kind | Title |
+    |---|---|
+    | `new_device` | New device on the network |
+    | `arp_spoof` | Router impersonation (ARP spoofing) |
+    | `dga` | Suspicious lookups (DGA) |
+    | `tunnel` | Possible DNS tunnel |
+    | `beacon` | Regular beaconing |
+    | `burst` | Burst of lookups |
+    | `threat` | Threat blocked |
+    | `rebind` | DNS rebinding blocked |
+    | anything else | Watchdog alert |
+
+  - **Escaping:** the notification daemon may read its text as markup and the
+    subject comes from the network. In title and body `&` becomes `&amp;`, `<`
+    becomes `&lt;`, `>` becomes `&gt;` and every control character (newline and
+    tab too) becomes one space. Each is at most 200 characters; a longer text
+    ends in `…` and an entity is never cut in half.
+  - The process is `notify-send -a qnet -- <title> <body>`, argv only, with
+    `--` before the title so text that starts with `-` is never read as an
+    option. The failover notification gets the `--` as well.
+  - **Folding:** at most 3 individual notifications per rolling 60 s. The
+    rest are held and go out as one `Watchdog` / "N more alerts" ("1 more
+    alert" for one), itself at most once per 60 s; what is held carries to
+    the next cycle that may send it. Alerts that were only folded still count
+    as notified. A restart drops a fold that was still waiting.
+  - They are shown open or closed: that is what the closed poll is for.
+- **The PC store** (`~/.local/state/qnet/watchdog.json`, see the Process
+  model):
+  - `acked`: at most 1024 keys; when full the oldest goes first. They are
+    pushed to the Pi, and a key the Pi reports acknowledged is added.
+  - `known`: at most 1024 entries `{mac, label?, firstSeen}`. A MAC is stored
+    in lower-case colon form and a label has no control characters and at most
+    64 characters. A new device is refused when the list is full (`full`); it
+    is never dropped to make room.
+  - `knownGen` goes up on every edit of the list, `pushedKnownGen` is set to
+    the generation that was pushed by whoever pushes it successfully, the
+    watcher or a verb. `push due` means they differ.
+  - `notified`: at most 1024 `{key, firstUnix, at}`; when full the oldest `at`
+    goes first.
 
 ## Config: `~/.config/qnet/config.toml`
 
@@ -478,3 +714,6 @@ closes. Focus starts on the Networks list.
 - rx/tx throughput.
 - Band pinning, hotspot, VPN.
 - Creating 802.1X profiles.
+- The watchdog panel (alert and device lists, acknowledge and known-device
+  buttons). Only the backend, the `qnet watchdog` verbs and the `watchdog`
+  state object exist; the panel needs mockups first.
