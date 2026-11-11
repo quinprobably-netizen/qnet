@@ -340,7 +340,10 @@ pub enum NetError {
     /// A request that cannot be honoured (no such device, bad input).
     Invalid(String),
     /// Activation failed; `auth` is true when it looks like a bad passphrase.
-    Activation { auth: bool, detail: String },
+    Activation {
+        auth: bool,
+        detail: String,
+    },
     Timeout(String),
     /// The process was told to stop while waiting.
     Interrupted(String),
@@ -444,16 +447,28 @@ mod tests {
 
     #[test]
     fn ssid_strips_control_characters() {
-        assert_eq!(display_ssid(b"Ca\x00fe\n\r\t\x1b[31m"), ("Cafe[31m".into(), false));
+        assert_eq!(
+            display_ssid(b"Ca\x00fe\n\r\t\x1b[31m"),
+            ("Cafe[31m".into(), false)
+        );
         // C1 controls (U+0080..U+009F) as UTF-8.
-        assert_eq!(display_ssid("a\u{85}b\u{9b}c".as_bytes()), ("abc".into(), false));
+        assert_eq!(
+            display_ssid("a\u{85}b\u{9b}c".as_bytes()),
+            ("abc".into(), false)
+        );
     }
 
     #[test]
     fn ssid_strips_bidi_and_zero_width() {
         let evil = "free\u{202E}ofni\u{202C}wifi\u{200B}!\u{FEFF}";
-        assert_eq!(display_ssid(evil.as_bytes()), ("freeofniwifi!".into(), false));
-        assert_eq!(display_ssid("\u{2066}\u{2069}".as_bytes()), (String::new(), true));
+        assert_eq!(
+            display_ssid(evil.as_bytes()),
+            ("freeofniwifi!".into(), false)
+        );
+        assert_eq!(
+            display_ssid("\u{2066}\u{2069}".as_bytes()),
+            (String::new(), true)
+        );
     }
 
     #[test]
@@ -463,7 +478,10 @@ mod tests {
         assert!(s.starts_with('a') && s.contains('b'));
         assert!(s.contains('\u{FFFD}'));
         // Valid multi-byte names survive intact.
-        assert_eq!(display_ssid("Café ☕".as_bytes()), ("Café ☕".into(), false));
+        assert_eq!(
+            display_ssid("Café ☕".as_bytes()),
+            ("Café ☕".into(), false)
+        );
     }
 
     #[test]
@@ -504,12 +522,18 @@ mod tests {
         };
         let pi: IpAddr = "192.168.1.153".parse().unwrap();
         let pinned = base.pinned_to(pi);
-        assert_eq!(pinned.v4_dns, vec!["192.168.1.153".parse::<Ipv4Addr>().unwrap()]);
+        assert_eq!(
+            pinned.v4_dns,
+            vec!["192.168.1.153".parse::<Ipv4Addr>().unwrap()]
+        );
         assert!(pinned.v4_ignore_auto && pinned.v6_ignore_auto);
         assert!(pinned.v6_dns.is_empty());
         assert!(pinned.automatic().is_automatic());
         assert!(!base.is_automatic());
-        assert_eq!(base.manual_servers(), vec!["2001:db8::1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(
+            base.manual_servers(),
+            vec!["2001:db8::1".parse::<IpAddr>().unwrap()]
+        );
     }
 }
 
@@ -703,7 +727,10 @@ pub mod fake {
             self.inner.lock().unwrap().scan_error = e;
         }
         /// Raise `flag` (a stand-in for SIGTERM) right after a profile write.
-        pub fn trip_after_profile_write(&self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        pub fn trip_after_profile_write(
+            &self,
+            flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) {
             self.inner.lock().unwrap().trip = Some(flag);
         }
         pub fn set_bitrate_kbps(&self, kbps: u32) {
@@ -713,7 +740,8 @@ pub mod fake {
         /// DNS servers resolved holds for the wired link added by
         /// `add_ethernet_primary`.
         pub fn set_resolver_for_primary_eth(&self, servers: &[&str]) {
-            self.inner.lock().unwrap().eth_servers = Some(servers.iter().map(|s| s.parse().unwrap()).collect());
+            self.inner.lock().unwrap().eth_servers =
+                Some(servers.iter().map(|s| s.parse().unwrap()).collect());
         }
         /// Pin a saved profile to the Pi-hole without going through qnet.
         pub fn pin_profile_dns(&self, uuid: &str) {
@@ -808,11 +836,19 @@ pub mod fake {
             }
             Ok(())
         }
-        fn reapply_runtime_dns(&self, iface: &str, servers: &[std::net::Ipv4Addr]) -> NetResult<()> {
+        fn reapply_runtime_dns(
+            &self,
+            iface: &str,
+            servers: &[std::net::Ipv4Addr],
+        ) -> NetResult<()> {
             let mut g = self.inner.lock().unwrap();
             g.calls.push(format!(
                 "reapply_runtime_dns {iface} {}",
-                servers.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")
+                servers
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             ));
             g.writes += 1;
             if let Some(e) = g.reapply_error.clone() {
@@ -864,7 +900,11 @@ pub mod fake {
             let mut g = self.inner.lock().unwrap();
             g.calls.push(format!(
                 "activate_known {uuid} {iface} {ap_path} pass={}",
-                if new_passphrase.is_some() { "yes" } else { "no" }
+                if new_passphrase.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
             ));
             g.writes += 1;
             match g.activation_error.take() {
@@ -902,7 +942,8 @@ pub mod fake {
                 return Ok(vec![ip]);
             }
             // A blocking resolver answers 0.0.0.0; anyone else the real thing.
-            let pihole_only = !g.link_servers.is_empty() && g.link_servers.iter().all(|s| *s == fx::pi());
+            let pihole_only =
+                !g.link_servers.is_empty() && g.link_servers.iter().all(|s| *s == fx::pi());
             Ok(vec![if pihole_only {
                 "0.0.0.0".parse().unwrap()
             } else {

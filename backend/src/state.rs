@@ -307,7 +307,11 @@ fn gateways(net: Option<&NetSnapshot>) -> Vec<IpAddr> {
     .unwrap_or_default()
 }
 
-pub fn build_link(net: Option<&NetSnapshot>, profiles: &[Profile], gateway_ms: Option<f64>) -> LinkOut {
+pub fn build_link(
+    net: Option<&NetSnapshot>,
+    profiles: &[Profile],
+    gateway_ms: Option<f64>,
+) -> LinkOut {
     let mut out = LinkOut {
         kind: "none",
         device: String::new(),
@@ -374,13 +378,19 @@ pub fn build_networks(net: Option<&NetSnapshot>, profiles: &[Profile]) -> Vec<Ne
     if !net.wifi_enabled {
         return vec![];
     }
-    let Some(dev) = net.wifi_device() else { return vec![] };
+    let Some(dev) = net.wifi_device() else {
+        return vec![];
+    };
     let Some(w) = &dev.wifi else { return vec![] };
 
     // Group by SSID bytes; every hidden entry shares one group.
     let mut groups: Vec<(Vec<u8>, Vec<&Ap>)> = Vec::new();
     for ap in &w.aps {
-        let key = if display_ssid(&ap.ssid).1 { Vec::new() } else { ap.ssid.clone() };
+        let key = if display_ssid(&ap.ssid).1 {
+            Vec::new()
+        } else {
+            ap.ssid.clone()
+        };
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, v)) => v.push(ap),
             None => groups.push((key, vec![ap])),
@@ -389,8 +399,15 @@ pub fn build_networks(net: Option<&NetSnapshot>, profiles: &[Profile]) -> Vec<Ne
     let mut out: Vec<NetworkOut> = groups
         .into_iter()
         .map(|(key, aps)| {
-            let active_ap = aps.iter().find(|a| Some(&a.path) == w.active_ap.as_ref()).copied();
-            let strongest = aps.iter().max_by_key(|a| a.strength).copied().expect("non-empty group");
+            let active_ap = aps
+                .iter()
+                .find(|a| Some(&a.path) == w.active_ap.as_ref())
+                .copied();
+            let strongest = aps
+                .iter()
+                .max_by_key(|a| a.strength)
+                .copied()
+                .expect("non-empty group");
             let shown = active_ap.unwrap_or(strongest);
             let (name, hidden) = display_ssid(&shown.ssid);
             let profile = if hidden {
@@ -514,7 +531,11 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
             mode,
             primary_iface: primary.map(|d| d.iface.as_str()),
             auto_deliberate: i.auto_deliberate,
-            engaged_iface: if i.failover.active() { i.engaged_iface } else { None },
+            engaged_iface: if i.failover.active() {
+                i.engaged_iface
+            } else {
+                None
+            },
         })
         .into_iter()
         .map(|l| LeakOut {
@@ -535,23 +556,35 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
     let configured = i.cfg.pihole.is_some();
     let configured_addr = i.cfg.pihole.as_ref().map(|p| p.address);
     let bypassed = match configured_addr {
-        Some(p) if primary.is_some() => is_bypassed(mode, &link_servers, primary_profile, p, i.auto_deliberate),
+        Some(p) if primary.is_some() => {
+            is_bypassed(mode, &link_servers, primary_profile, p, i.auto_deliberate)
+        }
         _ => false,
     };
     let resolved_fallback = match (mode, i.resolver) {
-        (Mode::None, Some(r)) if primary.is_some() => r.fallback.first().map(|a| a.to_string()).unwrap_or_default(),
+        (Mode::None, Some(r)) if primary.is_some() => r
+            .fallback
+            .first()
+            .map(|a| a.to_string())
+            .unwrap_or_default(),
         _ => String::new(),
     };
     let dns = DnsOut {
         mode: mode.as_str(),
-        mode_source: if mode == Mode::Fallback { "runtime-failover" } else { "profile" },
+        mode_source: if mode == Mode::Fallback {
+            "runtime-failover"
+        } else {
+            "profile"
+        },
         servers,
         leaks,
         failover: FailoverOut {
             enabled: configured && i.cfg.failover.enabled,
             // What is in use while failed over, what would be otherwise.
             fallback: if i.failover.active() {
-                i.fallback_in_use.unwrap_or(i.cfg.failover.fallback).as_str()
+                i.fallback_in_use
+                    .unwrap_or(i.cfg.failover.fallback)
+                    .as_str()
             } else {
                 i.cfg.failover.fallback.as_str()
             },
@@ -595,31 +628,51 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
         None => String::new(),
     };
     let is_reachable = i.pihole.is_some() && reachable(i.probes);
-    let (health, health_reason): (&'static str, String) = if i.pihole.is_none() || i.probes.is_empty() {
-        ("unknown", String::new())
-    } else if !is_reachable {
-        let why = match i.api_state {
-            Some(ApiLiveness::Alive) => "DNS probes get no answer, but the web API still does: not failing over",
-            Some(ApiLiveness::Mismatch) => "DNS probes get no answer and the web API presents a different certificate",
-            _ => "no answer to DNS probes",
+    let (health, health_reason): (&'static str, String) =
+        if i.pihole.is_none() || i.probes.is_empty() {
+            ("unknown", String::new())
+        } else if !is_reachable {
+            let why = match i.api_state {
+                Some(ApiLiveness::Alive) => {
+                    "DNS probes get no answer, but the web API still does: not failing over"
+                }
+                Some(ApiLiveness::Mismatch) => {
+                    "DNS probes get no answer and the web API presents a different certificate"
+                }
+                _ => "no answer to DNS probes",
+            };
+            ("unreachable", why.to_string())
+        } else if i.upstream_ok == Some(false) {
+            (
+                "degraded",
+                "upstream resolution is failing (SERVFAIL, REFUSED or timeout)".to_string(),
+            )
+        } else if let Some(d) = i.resolved_downgrade {
+            ("degraded", d.to_string())
+        } else {
+            ("ok", String::new())
         };
-        ("unreachable", why.to_string())
-    } else if i.upstream_ok == Some(false) {
-        ("degraded", "upstream resolution is failing (SERVFAIL, REFUSED or timeout)".to_string())
-    } else if let Some(d) = i.resolved_downgrade {
-        ("degraded", d.to_string())
+    let canary_blocked = if i.pihole.is_some() {
+        last_ok.map(|p| p.blocked)
     } else {
-        ("ok", String::new())
+        None
     };
-    let canary_blocked = if i.pihole.is_some() { last_ok.map(|p| p.blocked) } else { None };
 
     // Our own probes are in Pi-hole's numbers; take them out.
-    let raw = i.api.today.unwrap_or(Summary { total: 0, blocked: 0, percent: 0.0 });
+    let raw = i.api.today.unwrap_or(Summary {
+        total: 0,
+        blocked: 0,
+        percent: 0.0,
+    });
     let (own_total, own_blocked) = i.api.own_today;
     let have_today = i.api.today.is_some();
     let total = raw.total.saturating_sub(own_total);
     let blocked = raw.blocked.saturating_sub(own_blocked);
-    let percent = if have_today && total > 0 { blocked as f64 / total as f64 * 100.0 } else { 0.0 };
+    let percent = if have_today && total > 0 {
+        blocked as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
     let history: Vec<BucketOut> = i
         .api
         .history
@@ -642,7 +695,11 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
         latency_ms,
         blocking: blocking.as_str(),
         pause_remaining_s,
-        api: if configured { i.api.status.clone() } else { "unconfigured".into() },
+        api: if configured {
+            i.api.status.clone()
+        } else {
+            "unconfigured".into()
+        },
         health,
         health_reason,
         canary_blocked,
@@ -650,7 +707,11 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
             total,
             blocked,
             percent: round1(percent),
-            self_queries: if have_today { own_total.min(raw.total) } else { 0 },
+            self_queries: if have_today {
+                own_total.min(raw.total)
+            } else {
+                0
+            },
         },
         history,
         history_span_s,
@@ -675,7 +736,9 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
             AnsweredByOut {
                 blocklist: a.blocklist.saturating_sub(own_blocked),
                 cache: a.cache,
-                forwarded: a.forwarded.saturating_sub(own_total.saturating_sub(own_blocked)),
+                forwarded: a
+                    .forwarded
+                    .saturating_sub(own_total.saturating_sub(own_blocked)),
             }
         },
         detected: i.detected.map(|a| a.to_string()).unwrap_or_default(),
@@ -691,7 +754,10 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
             .collect(),
     };
 
-    let (wifi_enabled, hw_enabled) = i.net.map(|n| (n.wifi_enabled, n.hw_enabled)).unwrap_or((false, true));
+    let (wifi_enabled, hw_enabled) = i
+        .net
+        .map(|n| (n.wifi_enabled, n.hw_enabled))
+        .unwrap_or((false, true));
     let last_scan_age_s = i
         .net
         .and_then(|n| n.wifi_device())
@@ -703,9 +769,15 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
         type_: "state",
         seq,
         link,
-        radio: RadioOut { wifi_enabled, hw_enabled },
+        radio: RadioOut {
+            wifi_enabled,
+            hw_enabled,
+        },
         networks,
-        scan: ScanOut { running: i.scan.running, last_scan_age_s },
+        scan: ScanOut {
+            running: i.scan.running,
+            last_scan_age_s,
+        },
         dns,
         pihole,
         error: i.error.to_string(),
@@ -753,7 +825,10 @@ pub fn signature_of(mut v: serde_json::Value, open: bool) -> String {
 
 #[cfg(test)]
 pub fn change_signature(s: &State, open: bool) -> String {
-    signature_of(serde_json::to_value(s).unwrap_or(serde_json::Value::Null), open)
+    signature_of(
+        serde_json::to_value(s).unwrap_or(serde_json::Value::Null),
+        open,
+    )
 }
 
 #[cfg(test)]
@@ -796,15 +871,36 @@ mod tests {
             resolver,
             cfg: fake_cfg(),
             probes: VecDeque::from([
-                ProbeRec { t: 1_794_000_000.0, ok: true, ms: Some(3.13), blocked: true },
-                ProbeRec { t: 1_794_000_005.0, ok: true, ms: Some(2.96), blocked: true },
+                ProbeRec {
+                    t: 1_794_000_000.0,
+                    ok: true,
+                    ms: Some(3.13),
+                    blocked: true,
+                },
+                ProbeRec {
+                    t: 1_794_000_005.0,
+                    ok: true,
+                    ms: Some(2.96),
+                    blocked: true,
+                },
             ]),
             api: ApiView {
                 status: "ok".into(),
-                today: Some(Summary { total: 1204, blocked: 164, percent: 13.62 }),
-                history: vec![Bucket { t: 1_794_034_800, total: 40, blocked: 6 }],
+                today: Some(Summary {
+                    total: 1204,
+                    blocked: 164,
+                    percent: 13.62,
+                }),
+                history: vec![Bucket {
+                    t: 1_794_034_800,
+                    total: 40,
+                    blocked: 6,
+                }],
                 blocking: Some((
-                    Blocking { state: BlockingState::Enabled, timer: None },
+                    Blocking {
+                        state: BlockingState::Enabled,
+                        timer: None,
+                    },
                     1_794_000_004.0,
                 )),
                 own_today: (0, 0),
@@ -817,7 +913,11 @@ mod tests {
                         count: 287,
                         response_ms: Some(159.2),
                     }],
-                    answered_by: AnsweredBy { blocklist: 1734, cache: 1075, forwarded: 430 },
+                    answered_by: AnsweredBy {
+                        blocklist: 1734,
+                        cache: 1075,
+                        forwarded: 430,
+                    },
                 },
                 own_upstreams: (0, 0),
             },
@@ -933,7 +1033,12 @@ mod tests {
             },
             "error": ""
         });
-        assert_eq!(got, want, "\n{}", serde_json::to_string_pretty(&got).unwrap());
+        assert_eq!(
+            got,
+            want,
+            "\n{}",
+            serde_json::to_string_pretty(&got).unwrap()
+        );
     }
 
     fn shape(v: &Value, path: &str, out: &mut BTreeMap<String, &'static str>) {
@@ -980,7 +1085,11 @@ mod tests {
         shape(&to_json(&build(&fixture())), "", &mut got);
         // The spec shows `lastScanAgeS` etc. as numbers; compare every path.
         for (path, ty) in &want {
-            assert_eq!(got.get(path), Some(ty), "contract path {path} missing or wrong type");
+            assert_eq!(
+                got.get(path),
+                Some(ty),
+                "contract path {path} missing or wrong type"
+            );
         }
         for path in got.keys() {
             assert!(want.contains_key(path), "undeclared field {path}");
@@ -1191,7 +1300,10 @@ mod tests {
         assert!(st.dns.failover.active);
         assert_eq!(st.dns.failover.since, 1_794_000_000);
         assert_eq!(st.dns.failover.reason, "Pi-hole not answering");
-        assert!(st.dns.leaks.iter().all(|l| l.where_ != "Redwood"), "failover is not a leak");
+        assert!(
+            st.dns.leaks.iter().all(|l| l.where_ != "Redwood"),
+            "failover is not a leak"
+        );
     }
 
     #[test]
@@ -1212,11 +1324,11 @@ mod tests {
                     probes: &VecDeque::new(),
                     upstream_ok: None,
                     gateway_ms: None,
-                api_state: None,
-                resolved_downgrade: None,
-                auto_deliberate: false,
-                engaged_iface: None,
-                fallback_in_use: None,
+                    api_state: None,
+                    resolved_downgrade: None,
+                    auto_deliberate: false,
+                    engaged_iface: None,
+                    fallback_in_use: None,
                     api: &ApiView::unconfigured(),
                     failover: &f.fo,
                     scan: ScanView::default(),
@@ -1243,11 +1355,21 @@ mod tests {
     #[test]
     fn reachability_needs_two_misses_and_latency_hides_when_failing() {
         let mut f = fixture();
-        f.probes.push_back(ProbeRec { t: 1_794_000_010.0, ok: false, ms: None, blocked: false });
+        f.probes.push_back(ProbeRec {
+            t: 1_794_000_010.0,
+            ok: false,
+            ms: None,
+            blocked: false,
+        });
         let st = build(&f);
         assert!(st.pihole.reachable, "one miss is a blip");
         assert_eq!(st.pihole.latency_ms, None);
-        f.probes.push_back(ProbeRec { t: 1_794_000_015.0, ok: false, ms: None, blocked: false });
+        f.probes.push_back(ProbeRec {
+            t: 1_794_000_015.0,
+            ok: false,
+            ms: None,
+            blocked: false,
+        });
         let st = build(&f);
         assert!(!st.pihole.reachable);
         assert_eq!(to_json(&st)["pihole"]["probes"][3]["ms"], Value::Null);
@@ -1258,28 +1380,57 @@ mod tests {
     #[test]
     fn pause_countdown_and_blocking_sources() {
         let mut f = fixture();
-        f.api.blocking = Some((Blocking { state: BlockingState::Disabled, timer: Some(300.0) }, 1_794_000_000.0));
+        f.api.blocking = Some((
+            Blocking {
+                state: BlockingState::Disabled,
+                timer: Some(300.0),
+            },
+            1_794_000_000.0,
+        ));
         let st = build(&f); // now = +6 s
         assert_eq!(st.pihole.blocking, "disabled");
         assert_eq!(st.pihole.pause_remaining_s, 294);
         // Stale API data (> 45 s) falls back to the canary.
-        f.api.blocking = Some((Blocking { state: BlockingState::Disabled, timer: Some(300.0) }, 1_793_999_900.0));
+        f.api.blocking = Some((
+            Blocking {
+                state: BlockingState::Disabled,
+                timer: Some(300.0),
+            },
+            1_793_999_900.0,
+        ));
         let st = build(&f);
         assert_eq!(st.pihole.blocking, "enabled");
         assert_eq!(st.pihole.pause_remaining_s, 0);
         // No API at all: paused is visible from the canary alone.
         f.api = ApiView::configured();
-        f.probes.push_back(ProbeRec { t: 1_794_000_010.0, ok: true, ms: Some(4.0), blocked: false });
+        f.probes.push_back(ProbeRec {
+            t: 1_794_000_010.0,
+            ok: true,
+            ms: Some(4.0),
+            blocked: false,
+        });
         assert_eq!(build(&f).pihole.blocking, "disabled");
         // Timer never goes negative.
-        f.api.blocking = Some((Blocking { state: BlockingState::Disabled, timer: Some(2.0) }, 1_794_000_000.0));
+        f.api.blocking = Some((
+            Blocking {
+                state: BlockingState::Disabled,
+                timer: Some(2.0),
+            },
+            1_794_000_000.0,
+        ));
         assert_eq!(build(&f).pihole.pause_remaining_s, 0);
     }
 
     #[test]
     fn change_signature_ignores_clock_driven_fields_only() {
         let mut f = fixture();
-        f.api.blocking = Some((Blocking { state: BlockingState::Disabled, timer: Some(300.0) }, 1_794_000_000.0));
+        f.api.blocking = Some((
+            Blocking {
+                state: BlockingState::Disabled,
+                timer: Some(300.0),
+            },
+            1_794_000_000.0,
+        ));
         let a = build(&f);
         let mut b = a.clone();
         b.seq = 99;
@@ -1298,9 +1449,14 @@ mod tests {
     #[test]
     fn disabled_failover_reports_enabled_false() {
         let mut f = fixture();
-        f.cfg.failover = FailoverCfg { enabled: false, ..FailoverCfg::default() };
+        f.cfg.failover = FailoverCfg {
+            enabled: false,
+            ..FailoverCfg::default()
+        };
         assert!(!build(&f).dns.failover.enabled);
-        f.cfg.pihole = Some(PiholeCfg { ..f.cfg.pihole.clone().unwrap() });
+        f.cfg.pihole = Some(PiholeCfg {
+            ..f.cfg.pihole.clone().unwrap()
+        });
         f.cfg.failover.enabled = true;
         assert!(build(&f).dns.failover.enabled);
     }
@@ -1335,7 +1491,10 @@ mod tests {
         let st = build(&f);
         assert_eq!(st.dns.mode, "auto");
         assert!(st.dns.bypassed, "nobody chose this");
-        assert!(st.dns.leaks.iter().any(|l| l.where_ == "Redwood"), "and the active link says so");
+        assert!(
+            st.dns.leaks.iter().any(|l| l.where_ == "Redwood"),
+            "and the active link says so"
+        );
         f.auto_deliberate = true;
         let st = build(&f);
         assert_eq!(st.dns.mode, "auto");
@@ -1402,8 +1561,18 @@ mod tests {
         let st = build(&f);
         assert_eq!(st.pihole.health, "degraded");
         assert!(st.pihole.reachable);
-        f.probes.push_back(ProbeRec { t: 1_794_000_010.0, ok: false, ms: None, blocked: false });
-        f.probes.push_back(ProbeRec { t: 1_794_000_015.0, ok: false, ms: None, blocked: false });
+        f.probes.push_back(ProbeRec {
+            t: 1_794_000_010.0,
+            ok: false,
+            ms: None,
+            blocked: false,
+        });
+        f.probes.push_back(ProbeRec {
+            t: 1_794_000_015.0,
+            ok: false,
+            ms: None,
+            blocked: false,
+        });
         assert_eq!(build(&f).pihole.health, "unreachable");
         f.probes.clear();
         assert_eq!(build(&f).pihole.health, "unknown");
@@ -1414,10 +1583,20 @@ mod tests {
     fn canary_blocked_reflects_the_last_answered_probe() {
         let mut f = fixture();
         assert_eq!(build(&f).pihole.canary_blocked, Some(true));
-        f.probes.push_back(ProbeRec { t: 1_794_000_010.0, ok: true, ms: Some(3.0), blocked: false });
+        f.probes.push_back(ProbeRec {
+            t: 1_794_000_010.0,
+            ok: true,
+            ms: Some(3.0),
+            blocked: false,
+        });
         assert_eq!(build(&f).pihole.canary_blocked, Some(false), "paused");
         // A probe that got no answer says nothing new.
-        f.probes.push_back(ProbeRec { t: 1_794_000_015.0, ok: false, ms: None, blocked: false });
+        f.probes.push_back(ProbeRec {
+            t: 1_794_000_015.0,
+            ok: false,
+            ms: None,
+            blocked: false,
+        });
         assert_eq!(build(&f).pihole.canary_blocked, Some(false));
     }
 
@@ -1454,7 +1633,10 @@ mod tests {
         assert_eq!(st.pihole.address, "");
         assert_eq!(st.pihole.admin_url, "");
         assert_eq!(st.pihole.detected, "192.168.1.153");
-        assert_eq!(st.dns.mode, "pihole", "the detection still drives the truth shown");
+        assert_eq!(
+            st.dns.mode, "pihole",
+            "the detection still drives the truth shown"
+        );
         assert!(!st.pihole.configured);
         // With a config the address is the configured one.
         let st = build(&fixture());
@@ -1467,9 +1649,21 @@ mod tests {
     fn own_queries_leave_today_and_the_history_buckets() {
         let mut f = fixture();
         f.api.history = vec![
-            Bucket { t: 1_794_034_200, total: 0, blocked: 0 },
-            Bucket { t: 1_794_034_800, total: 40, blocked: 6 },
-            Bucket { t: 1_794_035_400, total: 12, blocked: 3 },
+            Bucket {
+                t: 1_794_034_200,
+                total: 0,
+                blocked: 0,
+            },
+            Bucket {
+                t: 1_794_034_800,
+                total: 40,
+                blocked: 6,
+            },
+            Bucket {
+                t: 1_794_035_400,
+                total: 12,
+                blocked: 3,
+            },
         ];
         // 10 of our queries (all blocked) landed in the last bucket, plus 2
         // plain ones; 4 in the middle one.
@@ -1483,7 +1677,11 @@ mod tests {
         let h = &st.pihole.history;
         assert_eq!((h[0].total, h[0].blocked), (0, 0));
         assert_eq!((h[1].total, h[1].blocked), (36, 6));
-        assert_eq!((h[2].total, h[2].blocked), (0, 0), "saturates instead of going negative");
+        assert_eq!(
+            (h[2].total, h[2].blocked),
+            (0, 0),
+            "saturates instead of going negative"
+        );
         assert_eq!(st.pihole.today.self_queries, 16);
         assert_eq!(st.pihole.today.total, 1204 - 16);
         assert_eq!(st.pihole.today.blocked, 164 - 10);
@@ -1493,11 +1691,18 @@ mod tests {
 
     #[test]
     fn history_span_counts_from_the_first_non_empty_bucket() {
-        let b = |t: i64, n: u64| BucketOut { t, total: n, blocked: 0 };
+        let b = |t: i64, n: u64| BucketOut {
+            t,
+            total: n,
+            blocked: 0,
+        };
         assert_eq!(history_span(&[]), 0);
         assert_eq!(history_span(&[b(0, 0), b(600, 0)]), 0, "all empty");
         // Zero-filled before Pi-hole started recording.
-        assert_eq!(history_span(&[b(0, 0), b(600, 0), b(1200, 5), b(1800, 7)]), 1200);
+        assert_eq!(
+            history_span(&[b(0, 0), b(600, 0), b(1200, 5), b(1800, 7)]),
+            1200
+        );
         assert_eq!(history_span(&[b(1800, 7)]), 600);
         // Never more than a day.
         let long: Vec<BucketOut> = (0..200).map(|i| b(i * 600, 1)).collect();
@@ -1505,9 +1710,21 @@ mod tests {
         // The zero-filled stretch in front is not counted.
         let mut f = fixture();
         f.api.history = vec![
-            Bucket { t: 1_794_030_000, total: 0, blocked: 0 },
-            Bucket { t: 1_794_034_800, total: 40, blocked: 6 },
-            Bucket { t: 1_794_035_400, total: 12, blocked: 3 },
+            Bucket {
+                t: 1_794_030_000,
+                total: 0,
+                blocked: 0,
+            },
+            Bucket {
+                t: 1_794_034_800,
+                total: 40,
+                blocked: 6,
+            },
+            Bucket {
+                t: 1_794_035_400,
+                total: 12,
+                blocked: 3,
+            },
         ];
         assert_eq!(build(&f).pihole.history_span_s, 1_200);
     }
@@ -1526,11 +1743,24 @@ mod tests {
         let f = fixture();
         let a = build(&f);
         let mut b = a.clone();
-        b.pihole.probes.push(ProbeOut { t: 1_794_000_020.0, ok: true, ms: Some(9.0), blocked: true });
+        b.pihole.probes.push(ProbeOut {
+            t: 1_794_000_020.0,
+            ok: true,
+            ms: Some(9.0),
+            blocked: true,
+        });
         b.pihole.latency_ms = Some(9.0);
         b.link.bitrate_mbps = 433;
-        assert_eq!(change_signature(&a, false), change_signature(&b, false), "closed: nothing worth a line");
-        assert_ne!(change_signature(&a, true), change_signature(&b, true), "open: the graph needs them");
+        assert_eq!(
+            change_signature(&a, false),
+            change_signature(&b, false),
+            "closed: nothing worth a line"
+        );
+        assert_ne!(
+            change_signature(&a, true),
+            change_signature(&b, true),
+            "open: the graph needs them"
+        );
         // Everything else still counts while closed.
         let mut c = a.clone();
         c.pihole.reachable = false;
@@ -1550,8 +1780,16 @@ mod tests {
         let start = 1_794_034_200i64; // a multiple of 600
         assert_eq!(start % 600, 0);
         f.api.history = vec![
-            Bucket { t: start + 300, total: 50, blocked: 10 },
-            Bucket { t: start + 900, total: 40, blocked: 6 },
+            Bucket {
+                t: start + 300,
+                total: 50,
+                blocked: 10,
+            },
+            Bucket {
+                t: start + 900,
+                total: 40,
+                blocked: 6,
+            },
         ];
         let mut ledger = Ledger::default();
         ledger.add(start as f64 + 100.0, 12, 8); // inside the first bucket
@@ -1560,25 +1798,43 @@ mod tests {
         f.api.own_today = ledger.sums(start as f64 + 800.0);
         let st = build(&f);
         let h = &st.pihole.history;
-        assert_eq!((h[0].t, h[0].total, h[0].blocked), (start + 300, 38, 2), "own queries leave the right bucket");
+        assert_eq!(
+            (h[0].t, h[0].total, h[0].blocked),
+            (start + 300, 38, 2),
+            "own queries leave the right bucket"
+        );
         assert_eq!((h[1].t, h[1].total, h[1].blocked), (start + 900, 36, 6));
         // The same with start-labelled buckets (tests, older Pi-holes).
-        f.api.history = vec![Bucket { t: start, total: 50, blocked: 10 }];
+        f.api.history = vec![Bucket {
+            t: start,
+            total: 50,
+            blocked: 10,
+        }];
         let st = build(&f);
-        assert_eq!((st.pihole.history[0].total, st.pihole.history[0].blocked), (38, 2));
+        assert_eq!(
+            (st.pihole.history[0].total, st.pihole.history[0].blocked),
+            (38, 2)
+        );
     }
 
     #[test]
     fn failover_fallback_is_the_one_in_use_and_reason_is_shown() {
         let mut f = fixture();
-        assert_eq!(build(&f).dns.failover.fallback, "router", "configured, nothing in use");
+        assert_eq!(
+            build(&f).dns.failover.fallback,
+            "router",
+            "configured, nothing in use"
+        );
         f.fo.adopt(1_794_000_000, "Pi-hole not answering; this router is not the one the profile was pinned on, using quad9");
         f.fallback_in_use = Some(Fallback::Quad9);
         f.engaged_iface = Some("wlp7s0".into());
         f.resolver.links[0].servers = vec!["9.9.9.9".parse().unwrap()];
         let st = build(&f);
         assert!(st.dns.failover.active);
-        assert_eq!(st.dns.failover.fallback, "quad9", "what is really running, not what was configured");
+        assert_eq!(
+            st.dns.failover.fallback, "quad9",
+            "what is really running, not what was configured"
+        );
         assert!(st.dns.failover.reason.contains("quad9"));
         assert_eq!(st.dns.mode, "fallback");
         assert_eq!(st.dns.mode_source, "runtime-failover");
@@ -1609,7 +1865,9 @@ mod tests {
         f.net.primary_conn = eth.active.as_ref().map(|a| a.path.clone());
         f.net.devices.push(eth);
         f.profiles[1].dns = fx::dns_pinned();
-        f.resolver.links.push(fx::link(2, "enp8s0", &[fx::PI], true));
+        f.resolver
+            .links
+            .push(fx::link(2, "enp8s0", &[fx::PI], true));
         let st = build(&f);
         assert_eq!(st.link.kind, "ethernet");
         assert_eq!(st.dns.mode, "pihole", "the primary link is fine");
@@ -1630,28 +1888,48 @@ mod tests {
     fn health_reason_explains_each_state() {
         let mut f = fixture();
         let st = build(&f);
-        assert_eq!((st.pihole.health, st.pihole.health_reason.as_str()), ("ok", ""));
+        assert_eq!(
+            (st.pihole.health, st.pihole.health_reason.as_str()),
+            ("ok", "")
+        );
         f.upstream_ok = Some(false);
         let st = build(&f);
         assert_eq!(st.pihole.health, "degraded");
         assert!(st.pihole.health_reason.contains("upstream"));
         f.upstream_ok = Some(true);
-        f.resolved_downgrade = Some("systemd-resolved dropped 192.168.1.153 to plain UDP (EDNS0 is failing)".into());
+        f.resolved_downgrade =
+            Some("systemd-resolved dropped 192.168.1.153 to plain UDP (EDNS0 is failing)".into());
         let st = build(&f);
         assert_eq!(st.pihole.health, "degraded");
         assert!(st.pihole.health_reason.contains("EDNS0"));
         // A real outage outranks a downgrade; the web API's word is added.
-        f.probes.push_back(ProbeRec { t: 1_794_000_010.0, ok: false, ms: None, blocked: false });
-        f.probes.push_back(ProbeRec { t: 1_794_000_015.0, ok: false, ms: None, blocked: false });
+        f.probes.push_back(ProbeRec {
+            t: 1_794_000_010.0,
+            ok: false,
+            ms: None,
+            blocked: false,
+        });
+        f.probes.push_back(ProbeRec {
+            t: 1_794_000_015.0,
+            ok: false,
+            ms: None,
+            blocked: false,
+        });
         f.api_state = Some(ApiLiveness::Dead);
         let st = build(&f);
         assert_eq!(st.pihole.health, "unreachable");
         assert_eq!(st.pihole.health_reason, "no answer to DNS probes");
         f.api_state = Some(ApiLiveness::Alive);
-        assert!(build(&f).pihole.health_reason.contains("web API still does"));
+        assert!(build(&f)
+            .pihole
+            .health_reason
+            .contains("web API still does"));
         f.probes.clear();
         let st = build(&f);
-        assert_eq!((st.pihole.health, st.pihole.health_reason.as_str()), ("unknown", ""));
+        assert_eq!(
+            (st.pihole.health, st.pihole.health_reason.as_str()),
+            ("unknown", "")
+        );
     }
 
     #[test]
@@ -1659,12 +1937,21 @@ mod tests {
         let mut f = fixture();
         f.resolver.global_current = Some("9.9.9.9".parse().unwrap());
         let st = build(&f);
-        let l = st.dns.leaks.iter().find(|l| l.kind == "resolved-fallback").expect("flagged");
+        let l = st
+            .dns
+            .leaks
+            .iter()
+            .find(|l| l.kind == "resolved-fallback")
+            .expect("flagged");
         assert_eq!(l.where_, "systemd-resolved");
         assert!(l.detail.contains("9.9.9.9") && l.detail.contains("1.1.1.1"));
         assert!(!st.dns.bypassed, "it is a leak line, not the hero's bypass");
         f.resolver.global_current = None;
-        assert!(build(&f).dns.leaks.iter().all(|l| l.kind != "resolved-fallback"));
+        assert!(build(&f)
+            .dns
+            .leaks
+            .iter()
+            .all(|l| l.kind != "resolved-fallback"));
     }
 
     #[test]
@@ -1677,7 +1964,13 @@ mod tests {
         assert_eq!(j["link"]["frequencyMhz"], 5180);
         assert_eq!(j["link"]["prefix"], 24);
         // The scan list carries each network's own channel.
-        let by = |ssid: &str| st.networks.iter().find(|n| n.ssid == ssid).unwrap().frequency_mhz;
+        let by = |ssid: &str| {
+            st.networks
+                .iter()
+                .find(|n| n.ssid == ssid)
+                .unwrap()
+                .frequency_mhz
+        };
         assert_eq!((by("Redwood"), by("Cafe")), (5180, 2437));
         assert_eq!(j["networks"][0]["frequencyMhz"], 5180);
 
@@ -1688,7 +1981,10 @@ mod tests {
         eth.wifi = None;
         f.net.devices = vec![eth];
         let st = build(&f);
-        assert_eq!((st.link.kind, st.link.frequency_mhz, st.link.prefix), ("ethernet", None, Some(24)));
+        assert_eq!(
+            (st.link.kind, st.link.frequency_mhz, st.link.prefix),
+            ("ethernet", None, Some(24))
+        );
         assert_eq!(to_json(&st)["link"]["frequencyMhz"], Value::Null);
 
         // No address yet: no prefix, whatever NM left lying about.

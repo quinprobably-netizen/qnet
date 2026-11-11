@@ -15,7 +15,11 @@ pub fn downgrade_in(text: &str, pihole: IpAddr) -> Option<String> {
     let mut possible = String::new();
     let mut verified = String::new();
     let mut hit: Option<(String, String)> = None;
-    let flush = |in_block: bool, is_link: bool, possible: &str, verified: &str, hit: &mut Option<(String, String)>| {
+    let flush = |in_block: bool,
+                 is_link: bool,
+                 possible: &str,
+                 verified: &str,
+                 hit: &mut Option<(String, String)>| {
         if in_block && is_link {
             *hit = Some((possible.to_string(), verified.to_string()));
         }
@@ -40,21 +44,36 @@ pub fn downgrade_in(text: &str, pihole: IpAddr) -> Option<String> {
     flush(in_block, is_link, &possible, &verified, &mut hit);
     let (possible, verified) = hit?;
     // The level that is currently allowed; the verified one lags behind.
-    let level = if possible.is_empty() || possible == "n/a" { verified } else { possible };
+    let level = if possible.is_empty() || possible == "n/a" {
+        verified
+    } else {
+        possible
+    };
     describe(&level, &want)
 }
 
 fn describe(level: &str, addr: &str) -> Option<String> {
     match level {
-        "TCP" => Some(format!("systemd-resolved dropped {addr} to TCP only (UDP is failing)")),
-        "UDP" => Some(format!("systemd-resolved dropped {addr} to plain UDP (EDNS0 is failing)")),
+        "TCP" => Some(format!(
+            "systemd-resolved dropped {addr} to TCP only (UDP is failing)"
+        )),
+        "UDP" => Some(format!(
+            "systemd-resolved dropped {addr} to plain UDP (EDNS0 is failing)"
+        )),
         _ => None,
     }
 }
 
 /// Ask the running resolved. None when `resolvectl` is missing or fails.
 pub fn real_check(pihole: IpAddr) -> Option<String> {
-    let out = crate::proc::run("resolvectl", &["show-server-state"], None, Duration::from_secs(3), 64 * 1024).ok()?;
+    let out = crate::proc::run(
+        "resolvectl",
+        &["show-server-state"],
+        None,
+        Duration::from_secs(3),
+        64 * 1024,
+    )
+    .ok()?;
     if !out.success() {
         return None;
     }
@@ -129,6 +148,13 @@ mod tests {
     fn a_real_dump_from_this_machine_parses() {
         let real = "Server: 192.168.1.153               \n                              Type: link\n                         Interface: wlp7s0\n                   Interface Index: 4\n            Verified feature level: UDP+EDNS0\n            Possible feature level: UDP+EDNS0\n                       DNSSEC Mode: no\n                  DNSSEC Supported: yes\nMaximum UDP fragment size received: 512\n               Failed UDP attempts: 0\n               Failed TCP attempts: 0\n";
         assert_eq!(downgrade_in(real, pi()), None);
-        assert!(downgrade_in(&real.replace("Possible feature level: UDP+EDNS0", "Possible feature level: UDP"), pi()).is_some());
+        assert!(downgrade_in(
+            &real.replace(
+                "Possible feature level: UDP+EDNS0",
+                "Possible feature level: UDP"
+            ),
+            pi()
+        )
+        .is_some());
     }
 }

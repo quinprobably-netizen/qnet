@@ -52,7 +52,11 @@ fn ping_socket() -> Option<UdpSocket> {
     // SAFETY: socket(2) returns a fresh descriptor or -1; on success we hand
     // sole ownership to UdpSocket, which accepts any datagram socket.
     unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::IPPROTO_ICMP);
+        let fd = libc::socket(
+            libc::AF_INET,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_ICMP,
+        );
         if fd < 0 {
             None
         } else {
@@ -74,7 +78,9 @@ pub fn echo_rtt(dst: Ipv4Addr, timeout: Duration) -> Option<Duration> {
     sock.send(&req).ok()?;
     let mut buf = [0u8; 256];
     loop {
-        let left = timeout.checked_sub(start.elapsed()).filter(|d| !d.is_zero())?;
+        let left = timeout
+            .checked_sub(start.elapsed())
+            .filter(|d| !d.is_zero())?;
         sock.set_read_timeout(Some(left)).ok()?;
         let n = sock.recv(&mut buf).ok()?;
         if is_reply_to(&buf[..n], seq, &payload) {
@@ -90,7 +96,10 @@ mod tests {
     #[test]
     fn checksum_known_vectors() {
         // RFC 1071 example words.
-        assert_eq!(checksum(&[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]), 0x220d);
+        assert_eq!(
+            checksum(&[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]),
+            0x220d
+        );
         assert_eq!(checksum(&[]), 0xFFFF);
         // Odd length pads with a zero byte.
         assert_eq!(checksum(&[0x01]), !0x0100u16);
@@ -111,11 +120,17 @@ mod tests {
         reply[0] = ECHO_REPLY;
         assert!(is_reply_to(&reply, 7, payload));
         assert!(!is_reply_to(&reply, 8, payload), "wrong sequence");
-        assert!(!is_reply_to(&reply, 7, b"fedcba9876543210"), "wrong payload");
+        assert!(
+            !is_reply_to(&reply, 7, b"fedcba9876543210"),
+            "wrong payload"
+        );
         assert!(!is_reply_to(&reply[..10], 7, payload), "truncated");
         let mut req = reply.clone();
         req[0] = ECHO_REQUEST;
-        assert!(!is_reply_to(&req, 7, payload), "an echo request is not a reply");
+        assert!(
+            !is_reply_to(&req, 7, payload),
+            "an echo request is not a reply"
+        );
     }
 
     #[test]

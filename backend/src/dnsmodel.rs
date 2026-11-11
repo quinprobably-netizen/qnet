@@ -4,9 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use crate::net::{
-    DeviceKind, DnsSettings, NetSnapshot, Profile, ProfileKind, ResolverSnapshot,
-};
+use crate::net::{DeviceKind, DnsSettings, NetSnapshot, Profile, ProfileKind, ResolverSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -146,7 +144,8 @@ pub fn is_bypassed(
 ) -> bool {
     match mode {
         Mode::Pihole => {
-            servers.iter().any(|s| *s != pihole) || profile.is_none_or(|p| !profile_pinned(&p.dns, pihole))
+            servers.iter().any(|s| *s != pihole)
+                || profile.is_none_or(|p| !profile_pinned(&p.dns, pihole))
         }
         Mode::Custom => true,
         Mode::Auto => !auto_deliberate,
@@ -280,7 +279,9 @@ pub fn detect_leaks(inp: &LeakInput<'_>) -> Vec<Leak> {
 
     // 1. Links resolved is using right now.
     for dev in inp.net.devices.iter() {
-        let Some(active) = dev.active.as_ref() else { continue };
+        let Some(active) = dev.active.as_ref() else {
+            continue;
+        };
         active_uuids.push(&active.uuid);
         if !matches!(dev.kind, DeviceKind::Wifi | DeviceKind::Ethernet) {
             continue;
@@ -320,7 +321,8 @@ pub fn detect_leaks(inp: &LeakInput<'_>) -> Vec<Leak> {
         }
         let profile = inp.profiles.iter().find(|p| p.uuid == active.uuid);
         let all_v6 = others.iter().all(|s| s.is_ipv6());
-        let ra = all_v6 && profile.is_some_and(|p| v6_auto(&p.dns.v6_method) && !p.dns.v6_ignore_auto);
+        let ra =
+            all_v6 && profile.is_some_and(|p| v6_auto(&p.dns.v6_method) && !p.dns.v6_ignore_auto);
         let has_pihole = link.servers.contains(&inp.pihole);
         let desc = describe(&others, inp.pihole, inp.gateways);
         let detail = match (ra, has_pihole) {
@@ -393,7 +395,10 @@ pub fn detect_leaks(inp: &LeakInput<'_>) -> Vec<Leak> {
                 kind: LeakKind::Link,
                 where_: "systemd-resolved".into(),
                 uuid: String::new(),
-                detail: format!("global DNS uses {}", describe(&others, inp.pihole, inp.gateways)),
+                detail: format!(
+                    "global DNS uses {}",
+                    describe(&others, inp.pihole, inp.gateways)
+                ),
             });
         }
     }
@@ -491,10 +496,20 @@ pub mod fixtures {
         profile(U_WIFI, "Redwood", ProfileKind::Wifi, dns_pinned())
     }
     pub fn eth1() -> Profile {
-        profile(U_ETH1, "Wired connection 1", ProfileKind::Ethernet, dns_auto())
+        profile(
+            U_ETH1,
+            "Wired connection 1",
+            ProfileKind::Ethernet,
+            dns_auto(),
+        )
     }
     pub fn eth2() -> Profile {
-        profile(U_ETH2, "Wired connection 2", ProfileKind::Ethernet, dns_auto())
+        profile(
+            U_ETH2,
+            "Wired connection 2",
+            ProfileKind::Ethernet,
+            dns_auto(),
+        )
     }
 
     pub fn wifi_device(active: bool) -> Device {
@@ -503,7 +518,11 @@ pub mod fixtures {
             iface: "wlp7s0".into(),
             ifindex: 4,
             kind: DeviceKind::Wifi,
-            state: if active { NM_DEVICE_STATE_ACTIVATED } else { 30 },
+            state: if active {
+                NM_DEVICE_STATE_ACTIVATED
+            } else {
+                30
+            },
             active: active.then(|| ActiveConn {
                 path: "/org/freedesktop/NetworkManager/ActiveConnection/2".into(),
                 uuid: U_WIFI.into(),
@@ -577,9 +596,15 @@ mod tests {
         assert_eq!(classify(ip(PI), Some(pi()), &gws), Role::Pihole);
         assert_eq!(classify(gw(), Some(pi()), &gws), Role::Router);
         assert_eq!(classify(ip("9.9.9.9"), Some(pi()), &gws), Role::Public);
-        assert_eq!(classify(ip("2606:4700:4700::1111"), Some(pi()), &gws), Role::Public);
+        assert_eq!(
+            classify(ip("2606:4700:4700::1111"), Some(pi()), &gws),
+            Role::Public
+        );
         assert_eq!(classify(ip("192.168.1.50"), Some(pi()), &gws), Role::Other);
-        assert_eq!(classify(ip("100.100.100.100"), Some(pi()), &gws), Role::Other);
+        assert_eq!(
+            classify(ip("100.100.100.100"), Some(pi()), &gws),
+            Role::Other
+        );
         assert_eq!(classify(ip("fd00::53"), Some(pi()), &gws), Role::Other);
         // RA-supplied link-local resolver is the router.
         assert_eq!(classify(ip("fe80::1"), Some(pi()), &gws), Role::Router);
@@ -594,49 +619,95 @@ mod tests {
         let pinned = redwood();
         let auto = profile(U_WIFI, "Redwood", ProfileKind::Wifi, dns_auto());
         let one = [ip(PI)];
-        assert_eq!(detect_mode(true, false, &one, Some(&pinned), Some(pi())), Mode::Pihole);
+        assert_eq!(
+            detect_mode(true, false, &one, Some(&pinned), Some(pi())),
+            Mode::Pihole
+        );
         // DHCP that happens to hand out the Pi-hole is still the Pi-hole.
-        assert_eq!(detect_mode(true, false, &one, Some(&auto), Some(pi())), Mode::Pihole);
+        assert_eq!(
+            detect_mode(true, false, &one, Some(&auto), Some(pi())),
+            Mode::Pihole
+        );
         let router = [gw()];
-        assert_eq!(detect_mode(true, false, &router, Some(&auto), Some(pi())), Mode::Auto);
+        assert_eq!(
+            detect_mode(true, false, &router, Some(&auto), Some(pi())),
+            Mode::Auto
+        );
         // Pinned profile but resolved shows the router: not Pi-hole, not auto.
-        assert_eq!(detect_mode(true, false, &router, Some(&pinned), Some(pi())), Mode::Custom);
+        assert_eq!(
+            detect_mode(true, false, &router, Some(&pinned), Some(pi())),
+            Mode::Custom
+        );
         let custom = [ip("9.9.9.9")];
         let custom_prof = profile(
             U_WIFI,
             "Redwood",
             ProfileKind::Wifi,
-            DnsSettings { v4_dns: vec!["9.9.9.9".parse().unwrap()], v4_ignore_auto: true, ..dns_auto() },
+            DnsSettings {
+                v4_dns: vec!["9.9.9.9".parse().unwrap()],
+                v4_ignore_auto: true,
+                ..dns_auto()
+            },
         );
-        assert_eq!(detect_mode(true, false, &custom, Some(&custom_prof), Some(pi())), Mode::Custom);
+        assert_eq!(
+            detect_mode(true, false, &custom, Some(&custom_prof), Some(pi())),
+            Mode::Custom
+        );
         // Pi-hole + router: still the Pi-hole mode; `is_bypassed` flags it.
         let mixed = [ip(PI), gw()];
-        assert_eq!(detect_mode(true, false, &mixed, Some(&pinned), Some(pi())), Mode::Pihole);
+        assert_eq!(
+            detect_mode(true, false, &mixed, Some(&pinned), Some(pi())),
+            Mode::Pihole
+        );
         // Failover wins over the servers; no link / no servers light nothing.
-        assert_eq!(detect_mode(true, true, &router, Some(&pinned), Some(pi())), Mode::Fallback);
-        assert_eq!(detect_mode(false, false, &one, Some(&pinned), Some(pi())), Mode::None);
-        assert_eq!(detect_mode(true, false, &[], Some(&pinned), Some(pi())), Mode::None);
+        assert_eq!(
+            detect_mode(true, true, &router, Some(&pinned), Some(pi())),
+            Mode::Fallback
+        );
+        assert_eq!(
+            detect_mode(false, false, &one, Some(&pinned), Some(pi())),
+            Mode::None
+        );
+        assert_eq!(
+            detect_mode(true, false, &[], Some(&pinned), Some(pi())),
+            Mode::None
+        );
         // No Pi-hole known: auto or custom only.
-        assert_eq!(detect_mode(true, false, &router, Some(&auto), None), Mode::Auto);
-        assert_eq!(detect_mode(true, false, &one, Some(&pinned), None), Mode::Custom);
+        assert_eq!(
+            detect_mode(true, false, &router, Some(&auto), None),
+            Mode::Auto
+        );
+        assert_eq!(
+            detect_mode(true, false, &one, Some(&pinned), None),
+            Mode::Custom
+        );
         assert_eq!(Mode::None.as_str(), "none");
         assert_eq!(Mode::Unknown.as_str(), "unknown");
         // Unknown profile with servers is custom, not auto.
-        assert_eq!(detect_mode(true, false, &router, None, Some(pi())), Mode::Custom);
+        assert_eq!(
+            detect_mode(true, false, &router, None, Some(pi())),
+            Mode::Custom
+        );
     }
 
     #[test]
     fn manual_override_cases() {
         assert!(!manual_override(&dns_auto(), pi()));
         assert!(!manual_override(&dns_pinned(), pi()));
-        let custom = DnsSettings { v4_dns: vec!["9.9.9.9".parse().unwrap()], ..dns_auto() };
+        let custom = DnsSettings {
+            v4_dns: vec!["9.9.9.9".parse().unwrap()],
+            ..dns_auto()
+        };
         assert!(manual_override(&custom, pi()));
         let both = DnsSettings {
             v4_dns: vec![PI.parse().unwrap(), "1.1.1.1".parse().unwrap()],
             ..dns_pinned()
         };
         assert!(manual_override(&both, pi()));
-        let v6 = DnsSettings { v6_dns: vec!["2001:db8::53".parse().unwrap()], ..dns_pinned() };
+        let v6 = DnsSettings {
+            v6_dns: vec!["2001:db8::53".parse().unwrap()],
+            ..dns_pinned()
+        };
         assert!(manual_override(&v6, pi()));
     }
 
@@ -647,24 +718,52 @@ mod tests {
         assert_eq!(k, LeakKind::Profile);
         assert_eq!(d, "uses router DNS (automatic)");
         // v4 pinned but IPv6 RA may still supply DNS.
-        let ra = DnsSettings { v6_ignore_auto: false, ..dns_pinned() };
+        let ra = DnsSettings {
+            v6_ignore_auto: false,
+            ..dns_pinned()
+        };
         assert_eq!(profile_leak(&ra, pi()).unwrap().0, LeakKind::Ipv6Ra);
         // IPv6 disabled/ignored: nothing to leak.
-        let v6off = DnsSettings { v6_method: "disabled".into(), v6_ignore_auto: false, ..dns_pinned() };
+        let v6off = DnsSettings {
+            v6_method: "disabled".into(),
+            v6_ignore_auto: false,
+            ..dns_pinned()
+        };
         assert_eq!(profile_leak(&v6off, pi()), None);
-        let v6ignore = DnsSettings { v6_method: "ignore".into(), v6_ignore_auto: false, ..dns_pinned() };
+        let v6ignore = DnsSettings {
+            v6_method: "ignore".into(),
+            v6_ignore_auto: false,
+            ..dns_pinned()
+        };
         assert_eq!(profile_leak(&v6ignore, pi()), None);
         // Other manual servers.
-        let other = DnsSettings { v4_dns: vec!["1.1.1.1".parse().unwrap()], v4_ignore_auto: true, ..dns_pinned() };
+        let other = DnsSettings {
+            v4_dns: vec!["1.1.1.1".parse().unwrap()],
+            v4_ignore_auto: true,
+            ..dns_pinned()
+        };
         assert_eq!(profile_leak(&other, pi()).unwrap().1, "uses 1.1.1.1");
         // Ignoring auto DNS with nothing set leaves no Pi-hole at all.
-        let empty = DnsSettings { v4_dns: vec![], ..dns_pinned() };
-        assert_eq!(profile_leak(&empty, pi()).unwrap().1, "has no Pi-hole DNS server set");
+        let empty = DnsSettings {
+            v4_dns: vec![],
+            ..dns_pinned()
+        };
+        assert_eq!(
+            profile_leak(&empty, pi()).unwrap().1,
+            "has no Pi-hole DNS server set"
+        );
         // Manual IPv6 DNS.
-        let v6dns = DnsSettings { v6_dns: vec!["2001:db8::53".parse().unwrap()], ..dns_pinned() };
+        let v6dns = DnsSettings {
+            v6_dns: vec!["2001:db8::53".parse().unwrap()],
+            ..dns_pinned()
+        };
         assert_eq!(profile_leak(&v6dns, pi()).unwrap().1, "uses 2001:db8::53");
         // Shared (hotspot) profile supplies no upstream DNS.
-        let shared = DnsSettings { v4_method: "shared".into(), v6_method: "ignore".into(), ..dns_auto() };
+        let shared = DnsSettings {
+            v4_method: "shared".into(),
+            v6_method: "ignore".into(),
+            ..dns_auto()
+        };
         assert_eq!(profile_leak(&shared, pi()), None);
     }
 
@@ -842,7 +941,12 @@ mod tests {
     #[test]
     fn non_wifi_profiles_are_ignored() {
         let net = snapshot(vec![wifi_device(true)]);
-        let vpn = profile("aaaaaaaa-0000-0000-0000-000000000000", "work-vpn", ProfileKind::Other, dns_auto());
+        let vpn = profile(
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            "work-vpn",
+            ProfileKind::Other,
+            dns_auto(),
+        );
         let profiles = vec![redwood(), vpn];
         let res = resolver(vec![link(4, "wlp7s0", &[PI], true)]);
         let leaks = detect_leaks(&LeakInput {
@@ -867,7 +971,10 @@ mod tests {
         assert_eq!(pihole_candidate(&[ip("9.9.9.9")], Some(gwv4)), None);
         assert_eq!(pihole_candidate(&[ip("127.0.0.53")], Some(gwv4)), None);
         assert_eq!(pihole_candidate(&[ip("fe80::1")], Some(gwv4)), None);
-        assert_eq!(pihole_candidate(&[ip("fd00::53")], Some(gwv4)), Some(ip("fd00::53")));
+        assert_eq!(
+            pihole_candidate(&[ip("fd00::53")], Some(gwv4)),
+            Some(ip("fd00::53"))
+        );
     }
 
     #[test]
@@ -878,23 +985,58 @@ mod tests {
         // Healthy: pinned, only the Pi-hole.
         assert!(!is_bypassed(Mode::Pihole, &one, Some(&pinned), pi(), false));
         // Pinned but something else is in the server list too.
-        assert!(is_bypassed(Mode::Pihole, &mixed, Some(&pinned), pi(), false));
+        assert!(is_bypassed(
+            Mode::Pihole,
+            &mixed,
+            Some(&pinned),
+            pi(),
+            false
+        ));
         // DHCP happens to hand out only the Pi-hole, but nothing is pinned.
         assert!(is_bypassed(Mode::Pihole, &one, Some(&auto), pi(), false));
         // Pinned v4 but IPv6 router advertisements may still add servers.
-        let ra = profile(U_WIFI, "Redwood", ProfileKind::Wifi, DnsSettings { v6_ignore_auto: false, ..dns_pinned() });
+        let ra = profile(
+            U_WIFI,
+            "Redwood",
+            ProfileKind::Wifi,
+            DnsSettings {
+                v6_ignore_auto: false,
+                ..dns_pinned()
+            },
+        );
         assert!(is_bypassed(Mode::Pihole, &one, Some(&ra), pi(), false));
         // No profile known: cannot call it pinned.
         assert!(is_bypassed(Mode::Pihole, &one, None, pi(), false));
         // The Pi-hole is not used at all.
-        assert!(is_bypassed(Mode::Custom, &[ip("9.9.9.9")], Some(&pinned), pi(), false));
+        assert!(is_bypassed(
+            Mode::Custom,
+            &[ip("9.9.9.9")],
+            Some(&pinned),
+            pi(),
+            false
+        ));
         // Deliberate Automatic, failover, no DNS, undecided: not a bypass.
         // Automatic only counts as the user's choice if `qnet dns auto` said so.
         assert!(!is_bypassed(Mode::Auto, &router, Some(&auto), pi(), true));
-        assert!(is_bypassed(Mode::Auto, &router, Some(&auto), pi(), false), "an Ethernet cable that came up on its own");
-        assert!(!is_bypassed(Mode::Fallback, &router, Some(&pinned), pi(), false));
+        assert!(
+            is_bypassed(Mode::Auto, &router, Some(&auto), pi(), false),
+            "an Ethernet cable that came up on its own"
+        );
+        assert!(!is_bypassed(
+            Mode::Fallback,
+            &router,
+            Some(&pinned),
+            pi(),
+            false
+        ));
         assert!(!is_bypassed(Mode::None, &[], Some(&pinned), pi(), false));
-        assert!(!is_bypassed(Mode::Unknown, &one, Some(&pinned), pi(), false));
+        assert!(!is_bypassed(
+            Mode::Unknown,
+            &one,
+            Some(&pinned),
+            pi(),
+            false
+        ));
     }
 
     #[test]
@@ -943,7 +1085,14 @@ mod tests {
         let net = snapshot(vec![wifi_device(true)]);
         let auto = profile(U_WIFI, "Redwood", ProfileKind::Wifi, dns_auto());
         let res = resolver(vec![link(4, "wlp7s0", &["192.168.1.1"], true)]);
-        let chosen = leaks_for(&net, std::slice::from_ref(&auto), &res, Mode::Auto, true, None);
+        let chosen = leaks_for(
+            &net,
+            std::slice::from_ref(&auto),
+            &res,
+            Mode::Auto,
+            true,
+            None,
+        );
         assert!(chosen.is_empty(), "{chosen:?}");
         let unchosen = leaks_for(&net, &[auto], &res, Mode::Auto, false, None);
         assert_eq!(unchosen.len(), 1, "{unchosen:?}");
@@ -957,7 +1106,10 @@ mod tests {
         let net = snapshot(vec![wifi_device(true)]);
         let profiles = vec![redwood()];
         let res = resolver(vec![link(4, "wlp7s0", &["192.168.1.1"], true)]);
-        assert!(!leaks_for(&net, &profiles, &res, Mode::Custom, false, None).is_empty(), "custom would be one");
+        assert!(
+            !leaks_for(&net, &profiles, &res, Mode::Custom, false, None).is_empty(),
+            "custom would be one"
+        );
         assert!(leaks_for(&net, &profiles, &res, Mode::Custom, false, Some("wlp7s0")).is_empty());
     }
 
@@ -975,8 +1127,15 @@ mod tests {
         assert_eq!(leaks[0].kind, LeakKind::ResolvedFallback);
         assert_eq!(leaks[0].kind.as_str(), "resolved-fallback");
         assert_eq!(leaks[0].where_, "systemd-resolved");
-        assert!(leaks[0].detail.contains("9.9.9.9 now"), "{}", leaks[0].detail);
-        assert!(leaks[0].detail.contains("1.1.1.1") && leaks[0].detail.contains("8.8.8.8"), "names the servers");
+        assert!(
+            leaks[0].detail.contains("9.9.9.9 now"),
+            "{}",
+            leaks[0].detail
+        );
+        assert!(
+            leaks[0].detail.contains("1.1.1.1") && leaks[0].detail.contains("8.8.8.8"),
+            "names the servers"
+        );
         // Not a fallback address (a configured global server is reported the old way).
         res.global_current = Some(ip("10.1.1.1"));
         assert!(leaks_for(&net, &profiles, &res, Mode::Pihole, false, None).is_empty());

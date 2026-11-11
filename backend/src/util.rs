@@ -87,7 +87,9 @@ pub fn is_uuid(s: &str) -> bool {
 pub fn is_ap_path(s: &str) -> bool {
     const PREFIX: &str = "/org/freedesktop/NetworkManager/AccessPoint/";
     match s.strip_prefix(PREFIX) {
-        Some(rest) => !rest.is_empty() && rest.len() <= 10 && rest.bytes().all(|c| c.is_ascii_digit()),
+        Some(rest) => {
+            !rest.is_empty() && rest.len() <= 10 && rest.bytes().all(|c| c.is_ascii_digit())
+        }
         None => false,
     }
 }
@@ -190,7 +192,10 @@ pub fn sid_path() -> Option<PathBuf> {
 /// Create `dir` (and parents) and make sure the last component is mode 0700.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
@@ -199,7 +204,11 @@ pub fn is_private_file(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match fs::symlink_metadata(path) {
         // SAFETY: geteuid has no preconditions.
-        Ok(m) => m.file_type().is_file() && m.mode() & 0o077 == 0 && m.uid() == unsafe { libc::geteuid() },
+        Ok(m) => {
+            m.file_type().is_file()
+                && m.mode() & 0o077 == 0
+                && m.uid() == unsafe { libc::geteuid() }
+        }
         Err(_) => false,
     }
 }
@@ -280,7 +289,9 @@ mod tests {
     fn ap_path_shape() {
         assert!(is_ap_path("/org/freedesktop/NetworkManager/AccessPoint/12"));
         assert!(!is_ap_path("/org/freedesktop/NetworkManager/AccessPoint/"));
-        assert!(!is_ap_path("/org/freedesktop/NetworkManager/AccessPoint/1/../2"));
+        assert!(!is_ap_path(
+            "/org/freedesktop/NetworkManager/AccessPoint/1/../2"
+        ));
         assert!(!is_ap_path("/org/freedesktop/NetworkManager/Settings/1"));
         assert!(!is_ap_path("Redwood"));
     }
@@ -316,7 +327,11 @@ mod tests {
         assert!(try_lock(&p).unwrap().is_none(), "busy while held");
         drop(first);
         assert!(try_lock(&p).unwrap().is_some(), "free again");
-        let mode = fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(p.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o700);
     }
 

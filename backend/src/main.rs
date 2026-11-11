@@ -50,7 +50,9 @@ fn backend() -> Result<nm::DbusBackend, ActionErr> {
     nm::DbusBackend::connect().map_err(|e| ActionErr::new("dbus", e.detail()))
 }
 
-fn backend_cancellable(term: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<nm::DbusBackend, ActionErr> {
+fn backend_cancellable(
+    term: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<nm::DbusBackend, ActionErr> {
     Ok(backend()?.with_cancel(term.clone()))
 }
 
@@ -105,7 +107,12 @@ impl setup::Prompter for Terminal {
         eprint!("{question} [y/N] ");
         let _ = std::io::stderr().flush();
         let mut line = String::new();
-        if std::io::stdin().lock().take(256).read_line(&mut line).is_err() {
+        if std::io::stdin()
+            .lock()
+            .take(256)
+            .read_line(&mut line)
+            .is_err()
+        {
             return false;
         }
         matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
@@ -135,18 +142,37 @@ impl setup::Prompter for Terminal {
 enum Cmd {
     Watch,
     State,
-    DnsPihole { force: bool },
-    DnsAuto { force: bool },
-    DnsPin { uuids: Vec<String>, force: bool },
-    PiholePause { secs: u64 },
+    DnsPihole {
+        force: bool,
+    },
+    DnsAuto {
+        force: bool,
+    },
+    DnsPin {
+        uuids: Vec<String>,
+        force: bool,
+    },
+    PiholePause {
+        secs: u64,
+    },
     PiholeResume,
     /// The address is optional: without it setup asks the user to type one.
-    PiholeSetup { addr: Option<std::net::IpAddr> },
-    WifiConnect { ap: String },
+    PiholeSetup {
+        addr: Option<std::net::IpAddr>,
+    },
+    WifiConnect {
+        ap: String,
+    },
     WifiDown,
-    WifiScan { if_stale: Option<u64> },
-    WifiForget { uuid: String },
-    WifiRadio { on: bool },
+    WifiScan {
+        if_stale: Option<u64>,
+    },
+    WifiForget {
+        uuid: String,
+    },
+    WifiRadio {
+        on: bool,
+    },
     Portal,
     Version,
 }
@@ -165,7 +191,9 @@ fn parse(all: &[String]) -> Result<Cmd, ActionErr> {
                 .next()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| (1..=86_400).contains(v))
-                .ok_or_else(|| ActionErr::new("invalid", "--if-stale needs a number of seconds (1-86400)"))?;
+                .ok_or_else(|| {
+                    ActionErr::new("invalid", "--if-stale needs a number of seconds (1-86400)")
+                })?;
             if_stale = Some(secs);
         } else {
             args.push(a.clone());
@@ -173,7 +201,10 @@ fn parse(all: &[String]) -> Result<Cmd, ActionErr> {
     }
     let cmd = parse_positional(&args, if_stale)?;
     if if_stale.is_some() && !matches!(cmd, Cmd::WifiScan { .. }) {
-        return Err(ActionErr::new("invalid", "--if-stale only applies to `wifi scan`"));
+        return Err(ActionErr::new(
+            "invalid",
+            "--if-stale only applies to `wifi scan`",
+        ));
     }
     Ok(cmd)
 }
@@ -228,7 +259,9 @@ fn parse_positional(args: &[String], if_stale: Option<u64>) -> Result<Cmd, Actio
             if !util::is_uuid(uuid) {
                 return Err(bad_uuid());
             }
-            Ok(Cmd::WifiForget { uuid: uuid.to_string() })
+            Ok(Cmd::WifiForget {
+                uuid: uuid.to_string(),
+            })
         }
         ["wifi", "radio", "on"] => Ok(Cmd::WifiRadio { on: true }),
         ["wifi", "radio", "off"] => Ok(Cmd::WifiRadio { on: false }),
@@ -237,10 +270,12 @@ fn parse_positional(args: &[String], if_stale: Option<u64>) -> Result<Cmd, Actio
 }
 
 fn pihole_client(cfg: &config::Config) -> Result<pihole::Pihole, ActionErr> {
-    let p = cfg
-        .pihole
-        .as_ref()
-        .ok_or_else(|| ActionErr::new("unconfigured", "no Pi-hole configured; run `qnet pihole setup <address>`"))?;
+    let p = cfg.pihole.as_ref().ok_or_else(|| {
+        ActionErr::new(
+            "unconfigured",
+            "no Pi-hole configured; run `qnet pihole setup <address>`",
+        )
+    })?;
     let addr = p.address;
     Ok(pihole::Pihole::new(
         addr,
@@ -260,10 +295,19 @@ fn run_oneshot(cmd: Cmd) -> ActionResult {
             // Interactive: Ctrl-C must keep working at the prompts, so no
             // signal flag here.
             if !std::io::stdin().is_terminal() {
-                return Err(ActionErr::new("interactive", "pihole setup must be run from a terminal"));
+                return Err(ActionErr::new(
+                    "interactive",
+                    "pihole setup must be run from a terminal",
+                ));
             }
             util::harden_process();
-            setup::run(addr, 443, &mut Terminal, &setup::Keyring, &util::config_path())
+            setup::run(
+                addr,
+                443,
+                &mut Terminal,
+                &setup::Keyring,
+                &util::config_path(),
+            )
         }
         // From here on SIGTERM/SIGINT/SIGHUP only set a flag: the step in
         // progress finishes (or is undone) and sessions are logged out.
@@ -273,7 +317,10 @@ fn run_oneshot(cmd: Cmd) -> ActionResult {
             let cfg = load_config()?;
             let mut api = pihole_client(&cfg)?;
             let r = if term.load(std::sync::atomic::Ordering::SeqCst) {
-                Err(ActionErr::new("interrupted", "stopped before anything was changed"))
+                Err(ActionErr::new(
+                    "interrupted",
+                    "stopped before anything was changed",
+                ))
             } else {
                 actions::pihole_pause(&mut api, secs)
             };
@@ -286,7 +333,10 @@ fn run_oneshot(cmd: Cmd) -> ActionResult {
             let cfg = load_config()?;
             let mut api = pihole_client(&cfg)?;
             let r = if term.load(std::sync::atomic::Ordering::SeqCst) {
-                Err(ActionErr::new("interrupted", "stopped before anything was changed"))
+                Err(ActionErr::new(
+                    "interrupted",
+                    "stopped before anything was changed",
+                ))
             } else {
                 actions::pihole_resume(&mut api)
             };
@@ -298,7 +348,8 @@ fn run_oneshot(cmd: Cmd) -> ActionResult {
             // One line on stdin: the passphrase (empty for open/known).
             // Read a line, never to EOF: the caller keeps the pipe open.
             util::harden_process();
-            let pass = read_secret_line("Passphrase (empty for none): ").map_err(|e| ActionErr::new("io", e))?;
+            let pass = read_secret_line("Passphrase (empty for none): ")
+                .map_err(|e| ActionErr::new("io", e))?;
             let be = backend_cancellable(&term)?;
             let cfg = load_config()?;
             let mut ctx = Ctx::new(&be, &cfg);
@@ -359,7 +410,10 @@ fn cmd_portal() -> ExitCode {
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
-            print_result(Err(ActionErr::new("spawn", format!("could not start chromium: {e}"))))
+            print_result(Err(ActionErr::new(
+                "spawn",
+                format!("could not start chromium: {e}"),
+            )))
         }
     }
 }
@@ -426,31 +480,66 @@ mod tests {
         assert_eq!(p(&["portal"]), Ok(Cmd::Portal));
         assert_eq!(p(&["--version"]), Ok(Cmd::Version));
         assert_eq!(p(&["dns", "pihole"]), Ok(Cmd::DnsPihole { force: false }));
-        assert_eq!(p(&["dns", "pihole", "--force"]), Ok(Cmd::DnsPihole { force: true }));
-        assert_eq!(p(&["dns", "--force", "auto"]), Ok(Cmd::DnsAuto { force: true }));
-        assert_eq!(p(&["dns", "pin", U]), Ok(Cmd::DnsPin { uuids: vec![U.into()], force: false }));
+        assert_eq!(
+            p(&["dns", "pihole", "--force"]),
+            Ok(Cmd::DnsPihole { force: true })
+        );
+        assert_eq!(
+            p(&["dns", "--force", "auto"]),
+            Ok(Cmd::DnsAuto { force: true })
+        );
+        assert_eq!(
+            p(&["dns", "pin", U]),
+            Ok(Cmd::DnsPin {
+                uuids: vec![U.into()],
+                force: false
+            })
+        );
         let u2 = "f5520df2-a482-3ff6-a770-64b74a740967";
         assert_eq!(
             p(&["dns", "pin", U, "--force", u2, U]),
-            Ok(Cmd::DnsPin { uuids: vec![U.into(), u2.into()], force: true }),
+            Ok(Cmd::DnsPin {
+                uuids: vec![U.into(), u2.into()],
+                force: true
+            }),
             "several uuids, duplicates dropped"
         );
         assert_eq!(p(&["pihole", "pause"]), Ok(Cmd::PiholePause { secs: 300 }));
-        assert_eq!(p(&["pihole", "pause", "60"]), Ok(Cmd::PiholePause { secs: 60 }));
+        assert_eq!(
+            p(&["pihole", "pause", "60"]),
+            Ok(Cmd::PiholePause { secs: 60 })
+        );
         assert_eq!(p(&["pihole", "resume"]), Ok(Cmd::PiholeResume));
         assert_eq!(
             p(&["pihole", "setup", "192.168.1.153"]),
-            Ok(Cmd::PiholeSetup { addr: Some("192.168.1.153".parse().unwrap()) })
+            Ok(Cmd::PiholeSetup {
+                addr: Some("192.168.1.153".parse().unwrap())
+            })
         );
         assert_eq!(p(&["pihole", "setup"]), Ok(Cmd::PiholeSetup { addr: None }));
-        assert_eq!(p(&["wifi", "connect", AP]), Ok(Cmd::WifiConnect { ap: AP.into() }));
+        assert_eq!(
+            p(&["wifi", "connect", AP]),
+            Ok(Cmd::WifiConnect { ap: AP.into() })
+        );
         assert_eq!(p(&["wifi", "down"]), Ok(Cmd::WifiDown));
         assert_eq!(p(&["wifi", "scan"]), Ok(Cmd::WifiScan { if_stale: None }));
-        assert_eq!(p(&["wifi", "scan", "--if-stale", "60"]), Ok(Cmd::WifiScan { if_stale: Some(60) }));
-        assert_eq!(p(&["wifi", "--if-stale", "5", "scan"]), Ok(Cmd::WifiScan { if_stale: Some(5) }));
-        assert_eq!(p(&["wifi", "forget", U]), Ok(Cmd::WifiForget { uuid: U.into() }));
+        assert_eq!(
+            p(&["wifi", "scan", "--if-stale", "60"]),
+            Ok(Cmd::WifiScan { if_stale: Some(60) })
+        );
+        assert_eq!(
+            p(&["wifi", "--if-stale", "5", "scan"]),
+            Ok(Cmd::WifiScan { if_stale: Some(5) })
+        );
+        assert_eq!(
+            p(&["wifi", "forget", U]),
+            Ok(Cmd::WifiForget { uuid: U.into() })
+        );
         assert_eq!(p(&["wifi", "radio", "on"]), Ok(Cmd::WifiRadio { on: true }));
-        assert_eq!(p(&["wifi", "radio", "off"]), Ok(Cmd::WifiRadio { on: false }));
+        assert_eq!(
+            p(&["wifi", "radio", "off"]),
+            Ok(Cmd::WifiRadio { on: false })
+        );
     }
 
     #[test]
@@ -469,7 +558,11 @@ mod tests {
             &["pihole", "setup", "pi.hole"],
             &["wifi", "connect"],
             &["wifi", "connect", "Redwood"],
-            &["wifi", "connect", "/org/freedesktop/NetworkManager/AccessPoint/1/../2"],
+            &[
+                "wifi",
+                "connect",
+                "/org/freedesktop/NetworkManager/AccessPoint/1/../2",
+            ],
             &["wifi", "forget", "Redwood"],
             &["wifi", "scan", "--if-stale"],
             &["wifi", "scan", "--if-stale", "soon"],

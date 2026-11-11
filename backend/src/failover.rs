@@ -146,7 +146,8 @@ impl Failover {
             self.reset_fails();
             return Decision::Idle;
         }
-        let stable = o.link.is_some() && o.now_ms.saturating_sub(self.link_since_ms) >= LINK_STABLE_MS;
+        let stable =
+            o.link.is_some() && o.now_ms.saturating_sub(self.link_since_ms) >= LINK_STABLE_MS;
         if !stable {
             self.reset_fails();
             self.goods = 0;
@@ -311,7 +312,11 @@ mod tests {
     fn gateway_gate_blocks_and_then_releases() {
         let mut r = Rig::new();
         for _ in 0..10 {
-            assert_eq!(r.probe(false, Some(false)), Decision::Idle, "gateway also dead");
+            assert_eq!(
+                r.probe(false, Some(false)),
+                Decision::Idle,
+                "gateway also dead"
+            );
         }
         assert_eq!(r.probe(false, None), Decision::Idle, "no gateway known");
         assert!(r.f.fails() >= 3);
@@ -338,7 +343,10 @@ mod tests {
     #[test]
     fn flapping_link_never_engages() {
         let mut r = Rig::new();
-        let other = Some(LinkKey { iface: "wlp7s0".into(), uuid: "u2".into() });
+        let other = Some(LinkKey {
+            iface: "wlp7s0".into(),
+            uuid: "u2".into(),
+        });
         // Link identity or state changes between every probe (5 s apart).
         for i in 0..12 {
             r.link = if i % 2 == 0 { key() } else { other.clone() };
@@ -366,7 +374,10 @@ mod tests {
                 api_alive: false,
             }));
         }
-        assert!(decisions.iter().all(|d| *d == Decision::Idle), "{decisions:?}");
+        assert!(
+            decisions.iter().all(|d| *d == Decision::Idle),
+            "{decisions:?}"
+        );
         // After the window, failures count again.
         let t1 = t0 + 20_000;
         let mut got = Decision::Idle;
@@ -392,7 +403,11 @@ mod tests {
         r.f.engaged(100, "x");
         assert_eq!(r.good(), Decision::Idle);
         assert_eq!(r.good(), Decision::Idle);
-        assert_eq!(r.probe(false, Some(true)), Decision::Idle, "bad probe resets");
+        assert_eq!(
+            r.probe(false, Some(true)),
+            Decision::Idle,
+            "bad probe resets"
+        );
         assert_eq!(r.good(), Decision::Idle);
         assert_eq!(r.good(), Decision::Idle);
         assert_eq!(r.good(), Decision::Recover);
@@ -432,7 +447,10 @@ mod tests {
     fn different_connection_while_failed_over_clears() {
         let mut r = Rig::new();
         r.f.adopt(1, "x");
-        r.link = Some(LinkKey { iface: "wlp7s0".into(), uuid: "other".into() });
+        r.link = Some(LinkKey {
+            iface: "wlp7s0".into(),
+            uuid: "other".into(),
+        });
         assert_eq!(r.good(), Decision::Cleared("link changed"));
     }
 
@@ -502,15 +520,27 @@ mod tests {
         // Open cadence: a probe every 5 s. Six failures span only 25 s.
         let mut r = Rig::new();
         for i in 0..6 {
-            assert_eq!(r.step(5_000, false, Some(true)), Decision::Idle, "failure {i}");
+            assert_eq!(
+                r.step(5_000, false, Some(true)),
+                Decision::Idle,
+                "failure {i}"
+            );
         }
-        assert_eq!(r.step(5_000, false, Some(true)), Decision::Engage, "30 s after the first");
+        assert_eq!(
+            r.step(5_000, false, Some(true)),
+            Decision::Engage,
+            "30 s after the first"
+        );
     }
 
     #[test]
     fn closed_cadence_needs_two_failures_a_minute_apart() {
         let mut r = Rig::new();
-        assert_eq!(r.step(60_000, false, Some(true)), Decision::Idle, "one failure never engages");
+        assert_eq!(
+            r.step(60_000, false, Some(true)),
+            Decision::Idle,
+            "one failure never engages"
+        );
         assert_eq!(r.step(60_000, false, Some(true)), Decision::Engage);
     }
 
@@ -522,7 +552,11 @@ mod tests {
         }
         r.step(5_000, true, None);
         for i in 0..6 {
-            assert_eq!(r.step(5_000, false, Some(true)), Decision::Idle, "again from zero, {i}");
+            assert_eq!(
+                r.step(5_000, false, Some(true)),
+                Decision::Idle,
+                "again from zero, {i}"
+            );
         }
         assert_eq!(r.step(5_000, false, Some(true)), Decision::Engage);
     }
@@ -566,7 +600,11 @@ mod tests {
             seen.push(r.f.holddown_ms());
         }
         assert_eq!(&seen[..4], &[60_000, 120_000, 240_000, 480_000]);
-        assert_eq!(*seen.last().unwrap(), HOLDDOWN_MAX_MS, "capped at 15 min: {seen:?}");
+        assert_eq!(
+            *seen.last().unwrap(),
+            HOLDDOWN_MAX_MS,
+            "capped at 15 min: {seen:?}"
+        );
         assert!(seen.iter().all(|h| *h <= HOLDDOWN_MAX_MS));
     }
 
@@ -579,7 +617,11 @@ mod tests {
         assert_eq!(r.f.holddown_ms(), 120_000);
         r.t += HOLDDOWN_RESET_MS + 1_000; // quiet for over an hour
         engage_and_recover(&mut r);
-        assert_eq!(r.f.holddown_ms(), HOLDDOWN_START_MS, "reset to the first step");
+        assert_eq!(
+            r.f.holddown_ms(),
+            HOLDDOWN_START_MS,
+            "reset to the first step"
+        );
     }
 
     #[test]

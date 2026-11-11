@@ -62,7 +62,9 @@ pub enum Flow {
 pub enum Line {
     State(Box<State>),
     /// Liveness only: `{"type":"hb","seq":N}` with the last state's seq.
-    Hb { seq: u64 },
+    Hb {
+        seq: u64,
+    },
 }
 
 impl Line {
@@ -312,7 +314,8 @@ impl Watch {
                                 let fresh: Vec<Ap> = std::mem::take(&mut w.aps);
                                 w.aps = ow.aps.clone();
                                 for f in fresh {
-                                    if let Some(slot) = w.aps.iter_mut().find(|a| a.path == f.path) {
+                                    if let Some(slot) = w.aps.iter_mut().find(|a| a.path == f.path)
+                                    {
                                         *slot = f;
                                     } else if Some(&f.path) == active.as_ref() {
                                         w.aps.push(f);
@@ -367,7 +370,10 @@ impl Watch {
     }
 
     fn primary(&self) -> Option<&Device> {
-        self.net.as_ref().and_then(|n| n.primary_device()).filter(|d| d.is_up())
+        self.net
+            .as_ref()
+            .and_then(|n| n.primary_device())
+            .filter(|d| d.is_up())
     }
 
     fn primary_profile(&self) -> Option<&Profile> {
@@ -400,11 +406,18 @@ impl Watch {
     /// one, or a detected one that has been seen blocking the canary. Only
     /// the configured one is ever shown as `pihole.address`.
     pub fn effective_pihole(&self) -> Option<IpAddr> {
-        self.cfg.pihole.as_ref().map(|p| p.address).or(self.confirmed)
+        self.cfg
+            .pihole
+            .as_ref()
+            .map(|p| p.address)
+            .or(self.confirmed)
     }
 
     fn detect_pending(&self) -> bool {
-        self.cfg.pihole.is_none() && self.candidate.is_some() && self.confirmed.is_none() && !self.candidate_probed
+        self.cfg.pihole.is_none()
+            && self.candidate.is_some()
+            && self.confirmed.is_none()
+            && !self.candidate_probed
     }
 
     fn desired_probe_target(&self) -> Option<ProbeTarget> {
@@ -413,8 +426,18 @@ impl Watch {
             None => (self.candidate?, config::DEFAULT_CANARY.to_string()),
         };
         let gateway = self.primary().and_then(|d| d.gateway).map(IpAddr::V4);
-        let api = self.cfg.pihole.as_ref().map(|p| ApiProbe { port: 443, pin: p.tls_sha256 });
-        Some(ProbeTarget { addr, port: 53, gateway_port: 53, api, canary, gateway })
+        let api = self.cfg.pihole.as_ref().map(|p| ApiProbe {
+            port: 443,
+            pin: p.tls_sha256,
+        });
+        Some(ProbeTarget {
+            addr,
+            port: 53,
+            gateway_port: 53,
+            api,
+            canary,
+            gateway,
+        })
     }
 
     fn sync_threads(&mut self) {
@@ -481,7 +504,10 @@ impl Watch {
         let gateway = self.primary().and_then(|d| d.gateway);
         if let Ok(applied) = self.be.applied_dns(&iface) {
             if applied.v4_dns != saved {
-                self.fo.adopt(util::unix_secs(), "device was running different DNS than its saved profile");
+                self.fo.adopt(
+                    util::unix_secs(),
+                    "device was running different DNS than its saved profile",
+                );
                 self.engaged = key;
                 self.fallback_in_use = Fallback::identify(&applied.v4_dns, gateway);
             }
@@ -533,7 +559,12 @@ impl Watch {
             Event::StdinEof | Event::Signal => return Flow::Shutdown,
             Event::Nm(kind) => self.on_nm(kind, now_ms),
             Event::NmLost => {
-                self.dirty = Dirty { net: true, aps: self.open, profiles: true, resolver: true };
+                self.dirty = Dirty {
+                    net: true,
+                    aps: self.open,
+                    profiles: true,
+                    resolver: true,
+                };
             }
             Event::Probe(r) => {
                 self.on_probe(r, now_ms);
@@ -552,7 +583,12 @@ impl Watch {
     }
 
     fn mark_all_dirty(&mut self) {
-        self.dirty = Dirty { net: true, aps: true, profiles: true, resolver: true };
+        self.dirty = Dirty {
+            net: true,
+            aps: true,
+            profiles: true,
+            resolver: true,
+        };
     }
 
     fn on_command(&mut self, cmd: &str, now_ms: u64) {
@@ -664,11 +700,15 @@ impl Watch {
     /// Failover is allowed only with a configured Pi-hole, the switch on,
     /// and the watched profile pinned to that Pi-hole.
     fn eligible(&self) -> bool {
-        let Some(p) = &self.cfg.pihole else { return false };
+        let Some(p) = &self.cfg.pihole else {
+            return false;
+        };
         if !self.cfg.failover.enabled {
             return false;
         }
-        let Some((key, _)) = self.watched_link() else { return false };
+        let Some((key, _)) = self.watched_link() else {
+            return false;
+        };
         self.profiles
             .iter()
             .find(|pr| pr.uuid == key.uuid)
@@ -756,9 +796,15 @@ impl Watch {
         if self.fo.active() || !self.eligible() || now_ms < self.learn_retry_ms {
             return;
         }
-        let Some(cfg) = self.cfg.pihole.clone() else { return };
-        let Some((key, dev)) = self.watched_link() else { return };
-        let (Some(gw), iface) = (dev.gateway, dev.iface.clone()) else { return };
+        let Some(cfg) = self.cfg.pihole.clone() else {
+            return;
+        };
+        let Some((key, dev)) = self.watched_link() else {
+            return;
+        };
+        let (Some(gw), iface) = (dev.gateway, dev.iface.clone()) else {
+            return;
+        };
         if self.learned_for.as_ref() == Some(&(key.uuid.clone(), gw)) {
             return;
         }
@@ -768,17 +814,25 @@ impl Watch {
                 self.learned_for = Some((key.uuid, gw));
                 return;
             }
-            if prev.as_ref().is_some_and(|p| p.gateway_mac_addr().is_some()) {
+            if prev
+                .as_ref()
+                .is_some_and(|p| p.gateway_mac_addr().is_some())
+            {
                 self.learned_for = Some((key.uuid, gw));
                 return;
             }
         }
         self.learn_retry_ms = now_ms + LEARN_RETRY_MS;
-        let probe = ApiProbe { port: 443, pin: cfg.tls_sha256 };
+        let probe = ApiProbe {
+            port: 443,
+            pin: cfg.tls_sha256,
+        };
         if (self.api_check)(cfg.address, &probe) != ApiLiveness::Alive {
             return;
         }
-        let Some(mac) = (self.mac_lookup)(gw, &iface) else { return };
+        let Some(mac) = (self.mac_lookup)(gw, &iface) else {
+            return;
+        };
         if actions::record_link_trust(&self.state_dir, &key.uuid, gw, mac).is_ok() {
             self.learned_for = Some((key.uuid, gw));
             self.learn_retry_ms = 0;
@@ -819,7 +873,11 @@ impl Watch {
                 "Pi-hole not answering; the router forwards DNS to the Pi-hole, using quad9".into(),
             );
         }
-        (Fallback::Router, Fallback::Router.servers(gateway), "Pi-hole not answering".into())
+        (
+            Fallback::Router,
+            Fallback::Router.servers(gateway),
+            "Pi-hole not answering".into(),
+        )
     }
 
     fn engage(&mut self, now_ms: u64) {
@@ -843,7 +901,11 @@ impl Watch {
             return;
         };
         let watched = self.link_key();
-        if watched.as_ref().map(|k| (k.iface.as_str(), k.uuid.as_str())) != Some((dev.iface.as_str(), uuid.as_str())) {
+        if watched
+            .as_ref()
+            .map(|k| (k.iface.as_str(), k.uuid.as_str()))
+            != Some((dev.iface.as_str(), uuid.as_str()))
+        {
             self.fo.engage_failed(now_ms);
             return;
         }
@@ -857,9 +919,15 @@ impl Watch {
             Ok(()) => {
                 self.op_error.clear();
                 self.fo.engaged(util::unix_secs(), &reason);
-                self.engaged = Some(LinkKey { iface: dev.iface.clone(), uuid });
+                self.engaged = Some(LinkKey {
+                    iface: dev.iface.clone(),
+                    uuid,
+                });
                 self.fallback_in_use = Some(used);
-                (self.notify)("Pi-hole unreachable", &format!("Using {} DNS", used.as_str()));
+                (self.notify)(
+                    "Pi-hole unreachable",
+                    &format!("Using {} DNS", used.as_str()),
+                );
                 self.resolver_due_ms = now_ms + RESOLVER_FOLLOWUP_MS;
             }
             Err(e) => {
@@ -905,7 +973,8 @@ impl Watch {
     /// Perform pending reads. Cheap when nothing is dirty.
     pub fn process_dirty(&mut self, now_ms: u64) {
         let resolver_due = now_ms >= self.resolver_due_ms;
-        let net_ok = now_ms.saturating_sub(self.last_net_ms) >= NET_MIN_GAP_MS || self.last_net_ms == 0;
+        let net_ok =
+            now_ms.saturating_sub(self.last_net_ms) >= NET_MIN_GAP_MS || self.last_net_ms == 0;
         let mut read = false;
         if self.dirty.net && net_ok {
             let with_aps = self.open && (self.dirty.aps || self.aps_stale);
@@ -943,7 +1012,11 @@ impl Watch {
         if !self.open || now_ms < self.resolved_check_due_ms {
             return;
         }
-        let (Some(check), Some(tx), Some(addr)) = (self.resolved_check.clone(), self.event_tx.clone(), self.effective_pihole()) else {
+        let (Some(check), Some(tx), Some(addr)) = (
+            self.resolved_check.clone(),
+            self.event_tx.clone(),
+            self.effective_pihole(),
+        ) else {
             return;
         };
         self.resolved_check_due_ms = now_ms + RESOLVED_CHECK_MS;
@@ -977,7 +1050,11 @@ impl Watch {
                 resolver: self.resolver.as_ref(),
                 cfg: &self.cfg,
                 pihole: self.effective_pihole(),
-                detected: if self.cfg.pihole.is_none() { self.confirmed } else { None },
+                detected: if self.cfg.pihole.is_none() {
+                    self.confirmed
+                } else {
+                    None
+                },
                 detect_pending: self.detect_pending(),
                 probes: &self.probes,
                 upstream_ok: self.upstream_ok,
@@ -1093,7 +1170,9 @@ impl Watch {
 
 /// Write one line; false when stdout is gone.
 pub fn write_line(out: &mut impl Write, line: &Line) -> bool {
-    out.write_all(&line.to_json_line()).and_then(|_| out.flush()).is_ok()
+    out.write_all(&line.to_json_line())
+        .and_then(|_| out.flush())
+        .is_ok()
 }
 
 /// Ask the kernel to send SIGTERM when the parent process goes away, so an
@@ -1104,7 +1183,13 @@ fn die_with_parent() -> bool {
     // signal number for this process.
     unsafe {
         let ppid = libc::getppid();
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGTERM as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
         // The parent may have exited between fork and prctl.
         libc::getppid() == ppid && ppid != 1
     }
@@ -1112,7 +1197,12 @@ fn die_with_parent() -> bool {
 
 /// The event loop. `out` receives each line; returning false (a closed
 /// stdout) ends the loop. Returns when asked to shut down.
-pub fn run_loop(w: &mut Watch, rx: &Receiver<Event>, clock: &dyn Fn() -> u64, out: &mut dyn FnMut(&Line) -> bool) {
+pub fn run_loop(
+    w: &mut Watch,
+    rx: &Receiver<Event>,
+    clock: &dyn Fn() -> u64,
+    out: &mut dyn FnMut(&Line) -> bool,
+) {
     let mut shutdown = false;
 
     // Give the first probe a moment so the first line is not a false
@@ -1184,7 +1274,9 @@ pub fn run_watch(be: Box<dyn NetBackend>) -> i32 {
     w.startup(clock());
 
     let stdout = std::io::stdout();
-    run_loop(&mut w, &rx, &clock, &mut |line| write_line(&mut stdout.lock(), line));
+    run_loop(&mut w, &rx, &clock, &mut |line| {
+        write_line(&mut stdout.lock(), line)
+    });
 
     w.shutdown();
     stop_workers(probe_tx, probe_h, api_tx, api_h);
@@ -1196,7 +1288,10 @@ pub fn state_once(be: Box<dyn NetBackend>) -> State {
     let mut w = Watch::new(be, util::config_path());
     w.startup(0);
     if let Some(t) = w.probe_target.clone() {
-        let req = ProbeRequest { upstream: false, icmp: false };
+        let req = ProbeRequest {
+            upstream: false,
+            icmp: false,
+        };
         let report = run_probe(&t, &req, &mut CanaryState::default());
         w.on_probe(report, 0);
     }
@@ -1245,13 +1340,24 @@ mod tests {
         w.set_mac_lookup(Arc::new(|_, _| Some(MAC)));
         let notes: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
         let n2 = notes.clone();
-        w.set_notifier(Box::new(move |t, b| n2.lock().unwrap().push((t.into(), b.into()))));
+        w.set_notifier(Box::new(move |t, b| {
+            n2.lock().unwrap().push((t.into(), b.into()))
+        }));
         w.startup(0);
-        Rig { w, be, notes, dir, t: 0 }
+        Rig {
+            w,
+            be,
+            notes,
+            dir,
+            t: 0,
+        }
     }
 
     fn rig() -> Rig {
-        rig_with(Some(config_text("enabled = true\nfallback = \"router\"")), FakeNet::live_machine())
+        rig_with(
+            Some(config_text("enabled = true\nfallback = \"router\"")),
+            FakeNet::live_machine(),
+        )
     }
 
     fn report(ok: bool, gw: Option<bool>) -> ProbeReport {
@@ -1267,7 +1373,10 @@ mod tests {
             gateway_blocked: None,
             api: None,
             upstream: None,
-            own: OwnQueries { total: 1, blocked: u32::from(ok) },
+            own: OwnQueries {
+                total: 1,
+                blocked: u32::from(ok),
+            },
             gateway_ms: None,
         }
     }
@@ -1291,10 +1400,18 @@ mod tests {
             }
         }
         fn runtime_calls(&self) -> Vec<String> {
-            self.be.calls().into_iter().filter(|c| c.starts_with("reapply_runtime_dns")).collect()
+            self.be
+                .calls()
+                .into_iter()
+                .filter(|c| c.starts_with("reapply_runtime_dns"))
+                .collect()
         }
         fn saved_calls(&self) -> Vec<String> {
-            self.be.calls().into_iter().filter(|c| c.starts_with("reapply_saved")).collect()
+            self.be
+                .calls()
+                .into_iter()
+                .filter(|c| c.starts_with("reapply_saved"))
+                .collect()
         }
         fn state_dir(&self) -> std::path::PathBuf {
             self.dir.path().join("state")
@@ -1315,11 +1432,17 @@ mod tests {
         let mut r = rig();
         r.settle();
         r.fail3();
-        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 192.168.1.1"]);
+        assert_eq!(
+            r.runtime_calls(),
+            vec!["reapply_runtime_dns wlp7s0 192.168.1.1"]
+        );
         assert!(r.w.failover_active());
         assert_eq!(
             r.notes.lock().unwrap().as_slice(),
-            [("Pi-hole unreachable".to_string(), "Using router DNS".to_string())]
+            [(
+                "Pi-hole unreachable".to_string(),
+                "Using router DNS".to_string()
+            )]
         );
         r.w.process_dirty(r.t + 2_000);
         let st = r.w.state(false);
@@ -1329,7 +1452,11 @@ mod tests {
         assert!(st.dns.failover.since > 0);
         assert!(!st.dns.bypassed, "a failover is not a bypass");
         // The saved profile was never written.
-        assert!(!r.be.calls().iter().any(|c| c.starts_with("set_profile_dns")));
+        assert!(!r
+            .be
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("set_profile_dns")));
         assert!(r.be.profile(U_WIFI).dns.v4_dns == vec![PI.parse::<std::net::Ipv4Addr>().unwrap()]);
     }
 
@@ -1377,7 +1504,10 @@ mod tests {
 
     #[test]
     fn failover_disabled_in_config_or_profile_not_pinned_never_engages() {
-        let mut r = rig_with(Some(config_text("enabled = false")), FakeNet::live_machine());
+        let mut r = rig_with(
+            Some(config_text("enabled = false")),
+            FakeNet::live_machine(),
+        );
         r.settle();
         r.fail3();
         r.fail3();
@@ -1415,7 +1545,11 @@ mod tests {
         assert_eq!(r.w.state(false).pihole.health, "degraded");
         r.t += 15_000;
         r.w.on_probe(degraded_report(Some(true)), r.t);
-        assert_eq!(r.runtime_calls().len(), 1, "degraded for 30 s with the gateway up");
+        assert_eq!(
+            r.runtime_calls().len(),
+            1,
+            "degraded for 30 s with the gateway up"
+        );
         assert!(r.w.failover_active());
     }
 
@@ -1427,7 +1561,10 @@ mod tests {
             r.t += 15_000;
             r.w.on_probe(degraded_report(None), r.t);
         }
-        assert!(r.runtime_calls().is_empty(), "no gateway evidence, no failover");
+        assert!(
+            r.runtime_calls().is_empty(),
+            "no gateway evidence, no failover"
+        );
         // The gateway itself is down too: the network is the problem.
         for _ in 0..3 {
             r.t += 15_000;
@@ -1450,17 +1587,29 @@ mod tests {
             rep.api = Some(ApiLiveness::Alive);
             r.w.on_probe(rep, r.t);
         }
-        assert!(r.runtime_calls().is_empty(), "host alive: packet loss or spoofing, not an outage");
+        assert!(
+            r.runtime_calls().is_empty(),
+            "host alive: packet loss or spoofing, not an outage"
+        );
         let st = r.w.state(false);
         assert_eq!(st.pihole.health, "unreachable");
-        assert!(st.pihole.health_reason.contains("web API still does"), "{}", st.pihole.health_reason);
+        assert!(
+            st.pihole.health_reason.contains("web API still does"),
+            "{}",
+            st.pihole.health_reason
+        );
         // A different certificate does not count as the Pi-hole being dead either.
         r.t += 15_000;
         let mut rep = report(false, Some(true));
         rep.api = Some(ApiLiveness::Mismatch);
         r.w.on_probe(rep, r.t);
         assert!(r.runtime_calls().is_empty());
-        assert!(r.w.state(false).pihole.health_reason.contains("different certificate"));
+        assert!(r
+            .w
+            .state(false)
+            .pihole
+            .health_reason
+            .contains("different certificate"));
         // Now the API is dead as well: fail over right away.
         r.t += 15_000;
         let mut rep = report(false, Some(true));
@@ -1544,7 +1693,11 @@ mod tests {
         r.probe(false, Some(true));
         assert_eq!(r.runtime_calls().len(), 1, "still only the first failover");
         r.probe(false, Some(true));
-        assert_eq!(r.runtime_calls().len(), 2, "allowed once the hold-down has passed");
+        assert_eq!(
+            r.runtime_calls().len(),
+            2,
+            "allowed once the hold-down has passed"
+        );
     }
 
     #[test]
@@ -1569,15 +1722,24 @@ mod tests {
         r.settle();
         r.be.set_gateway(None);
         r.fail3();
-        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+        assert_eq!(
+            r.runtime_calls(),
+            vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]
+        );
     }
 
     #[test]
     fn quad9_fallback_uses_public_servers() {
-        let mut r = rig_with(Some(config_text("fallback = \"quad9\"")), FakeNet::live_machine());
+        let mut r = rig_with(
+            Some(config_text("fallback = \"quad9\"")),
+            FakeNet::live_machine(),
+        );
         r.settle();
         r.fail3();
-        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+        assert_eq!(
+            r.runtime_calls(),
+            vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]
+        );
         assert_eq!(r.notes.lock().unwrap()[0].1, "Using quad9 DNS");
     }
 
@@ -1594,11 +1756,26 @@ mod tests {
         .unwrap();
         r.settle();
         r.fail3();
-        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+        assert_eq!(
+            r.runtime_calls(),
+            vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]
+        );
         let st = r.w.state(false);
-        assert!(st.dns.failover.reason.contains("quad9"), "{}", st.dns.failover.reason);
-        assert!(st.dns.failover.reason.contains("not the one the profile was pinned on"));
-        assert_eq!(r.notes.lock().unwrap()[0].1, "Using quad9 DNS", "the notification names what is really used");
+        assert!(
+            st.dns.failover.reason.contains("quad9"),
+            "{}",
+            st.dns.failover.reason
+        );
+        assert!(st
+            .dns
+            .failover
+            .reason
+            .contains("not the one the profile was pinned on"));
+        assert_eq!(
+            r.notes.lock().unwrap()[0].1,
+            "Using quad9 DNS",
+            "the notification names what is really used"
+        );
     }
 
     #[test]
@@ -1606,14 +1783,18 @@ mod tests {
         let mut r = rig();
         assert!(actions::load_prev(&r.state_dir(), U_WIFI).is_none());
         r.settle();
-        let prev = actions::load_prev(&r.state_dir(), U_WIFI).expect("recorded on the first healthy probe");
+        let prev = actions::load_prev(&r.state_dir(), U_WIFI)
+            .expect("recorded on the first healthy probe");
         assert_eq!(prev.gateway_addr(), Some("192.168.1.1".parse().unwrap()));
         // Not rewritten on every probe, and never overwritten by a different router.
-        actions::record_link_trust(&r.state_dir(), U_WIFI, "10.0.0.1".parse().unwrap(), MAC).unwrap();
+        actions::record_link_trust(&r.state_dir(), U_WIFI, "10.0.0.1".parse().unwrap(), MAC)
+            .unwrap();
         r.probe(true, None);
         r.probe(true, None);
         assert_eq!(
-            actions::load_prev(&r.state_dir(), U_WIFI).unwrap().gateway_addr(),
+            actions::load_prev(&r.state_dir(), U_WIFI)
+                .unwrap()
+                .gateway_addr(),
             Some("10.0.0.1".parse().unwrap())
         );
     }
@@ -1644,11 +1825,19 @@ mod tests {
         r.t += 1_000;
         r.w.process_dirty(r.t);
         assert_eq!(r.w.state(false).link.kind, "ethernet");
-        assert!(r.w.failover_active(), "the engaged link is still up: nothing was reset");
+        assert!(
+            r.w.failover_active(),
+            "the engaged link is still up: nothing was reset"
+        );
         r.probe(true, None);
         r.probe(true, None);
         r.probe(true, None);
-        assert_eq!(r.saved_calls(), vec!["reapply_saved wlp7s0"], "{:?}", r.be.calls());
+        assert_eq!(
+            r.saved_calls(),
+            vec!["reapply_saved wlp7s0"],
+            "{:?}",
+            r.be.calls()
+        );
         assert!(!r.w.failover_active());
     }
 
@@ -1662,7 +1851,10 @@ mod tests {
         r.t += 1_000;
         r.w.process_dirty(r.t);
         r.probe(true, None);
-        assert!(!r.w.failover_active(), "a new activation loads the saved profile anyway");
+        assert!(
+            !r.w.failover_active(),
+            "a new activation loads the saved profile anyway"
+        );
         assert!(r.saved_calls().is_empty(), "nothing to undo on a dead link");
     }
 
@@ -1676,7 +1868,10 @@ mod tests {
         assert!(r.w.failover_active());
         r.w.shutdown();
         assert_eq!(r.saved_calls().len(), 1);
-        assert_eq!(r.be.link_servers(), vec![PI.parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(
+            r.be.link_servers(),
+            vec![PI.parse::<std::net::IpAddr>().unwrap()]
+        );
 
         // Pi-hole still dead: do not strand DNS on it.
         let mut r = rig();
@@ -1685,7 +1880,10 @@ mod tests {
         assert!(r.w.failover_active());
         r.w.shutdown();
         assert!(r.saved_calls().is_empty(), "left on the fallback");
-        assert_eq!(r.be.link_servers(), vec!["192.168.1.1".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(
+            r.be.link_servers(),
+            vec!["192.168.1.1".parse::<std::net::IpAddr>().unwrap()]
+        );
 
         // Without failover, shutdown touches nothing.
         let mut r = rig();
@@ -1696,9 +1894,13 @@ mod tests {
     #[test]
     fn stranded_failover_from_a_crash_is_adopted_and_cleaned_up() {
         let be = FakeNet::live_machine();
-        be.reapply_runtime_dns("wlp7s0", &["192.168.1.1".parse().unwrap()]).unwrap();
+        be.reapply_runtime_dns("wlp7s0", &["192.168.1.1".parse().unwrap()])
+            .unwrap();
         let mut r = rig_with(Some(config_text("enabled = true")), be);
-        assert!(r.w.failover_active(), "device runs router DNS but the profile says Pi-hole");
+        assert!(
+            r.w.failover_active(),
+            "device runs router DNS but the profile says Pi-hole"
+        );
         assert_eq!(r.w.state(false).dns.mode, "fallback");
         r.settle();
         r.probe(true, None);
@@ -1706,7 +1908,10 @@ mod tests {
         assert!(r.w.failover_active(), "two good probes are not enough");
         r.probe(true, None);
         assert!(!r.w.failover_active());
-        assert_eq!(r.be.link_servers(), vec![PI.parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(
+            r.be.link_servers(),
+            vec![PI.parse::<std::net::IpAddr>().unwrap()]
+        );
     }
 
     #[test]
@@ -1729,13 +1934,19 @@ mod tests {
         assert_eq!(st.pihole.address, "");
         assert_eq!(st.pihole.admin_url, "");
         assert_eq!(st.pihole.detected, "");
-        assert_eq!(st.dns.mode, "unknown", "never 'custom' while the candidate is still being checked");
+        assert_eq!(
+            st.dns.mode, "unknown",
+            "never 'custom' while the candidate is still being checked"
+        );
         assert_eq!(st.pihole.health, "unknown");
 
         r.t = 15_000;
         r.w.on_probe(report(true, None), r.t);
         let st = r.w.state(false);
-        assert_eq!(st.pihole.address, "", "the address comes from the config only");
+        assert_eq!(
+            st.pihole.address, "",
+            "the address comes from the config only"
+        );
         assert_eq!(st.pihole.admin_url, "");
         assert_eq!(st.pihole.detected, PI, "display only");
         assert!(st.pihole.reachable && !st.pihole.configured);
@@ -1774,7 +1985,11 @@ mod tests {
         r.w.handle(Event::Cmd("open".into()), 60_000);
         r.w.handle(Event::Cmd("refresh".into()), 61_000);
         r.w.process_dirty(62_000);
-        assert!(!r.be.calls().iter().any(|c| c.starts_with("request_scan")), "{:?}", r.be.calls());
+        assert!(
+            !r.be.calls().iter().any(|c| c.starts_with("request_scan")),
+            "{:?}",
+            r.be.calls()
+        );
         assert!(!r.w.state(false).scan.running);
         // It does report how old the last scan is, counting up between reads.
         assert!(r.w.state(false).scan.last_scan_age_s.unwrap() >= 600);
@@ -1783,7 +1998,12 @@ mod tests {
     #[test]
     fn ap_signals_are_ignored_while_closed_and_read_on_open() {
         let mut r = rig();
-        let aps_reads = |r: &Rig| r.be.calls().iter().filter(|c| *c == "snapshot aps=true").count();
+        let aps_reads = |r: &Rig| {
+            r.be.calls()
+                .iter()
+                .filter(|c| *c == "snapshot aps=true")
+                .count()
+        };
         let before = aps_reads(&r);
         r.t = 5_000;
         for _ in 0..20 {
@@ -1800,7 +2020,12 @@ mod tests {
     #[test]
     fn core_signals_are_coalesced_into_one_read() {
         let mut r = rig();
-        let reads = |r: &Rig| r.be.calls().iter().filter(|c| c.starts_with("snapshot")).count();
+        let reads = |r: &Rig| {
+            r.be.calls()
+                .iter()
+                .filter(|c| c.starts_with("snapshot"))
+                .count()
+        };
         r.t = 10_000;
         let before = reads(&r);
         for _ in 0..50 {
@@ -1853,8 +2078,15 @@ mod tests {
     fn api_report(total: u64, blocked: u64) -> ApiReport {
         ApiReport {
             status: "ok",
-            summary: Some(Summary { total, blocked, percent: 0.0 }),
-            blocking: Some(Blocking { state: BlockingState::Enabled, timer: None }),
+            summary: Some(Summary {
+                total,
+                blocked,
+                percent: 0.0,
+            }),
+            blocking: Some(Blocking {
+                state: BlockingState::Enabled,
+                timer: None,
+            }),
             history: None,
             upstreams: None,
             at: util::unix_now(),
@@ -1868,7 +2100,10 @@ mod tests {
         for _ in 0..10 {
             let mut rep = report(true, None);
             rep.t = util::unix_now();
-            rep.own = OwnQueries { total: 2, blocked: 1 }; // e.g. canary + upstream
+            rep.own = OwnQueries {
+                total: 2,
+                blocked: 1,
+            }; // e.g. canary + upstream
             r.w.on_probe(rep, r.t);
         }
         r.w.handle(Event::Api(api_report(300, 120)), r.t);
@@ -1876,11 +2111,22 @@ mod tests {
         assert_eq!(st.pihole.today.self_queries, 20);
         assert_eq!(st.pihole.today.total, 280);
         assert_eq!(st.pihole.today.blocked, 110);
-        assert!((st.pihole.today.percent - 39.3).abs() < 0.05, "{}", st.pihole.today.percent);
+        assert!(
+            (st.pihole.today.percent - 39.3).abs() < 0.05,
+            "{}",
+            st.pihole.today.percent
+        );
         // Never negative, even if Pi-hole has not caught up with our queries.
         r.w.handle(Event::Api(api_report(5, 1)), r.t);
         let st = r.w.state(false);
-        assert_eq!((st.pihole.today.total, st.pihole.today.blocked, st.pihole.today.self_queries), (0, 0, 5));
+        assert_eq!(
+            (
+                st.pihole.today.total,
+                st.pihole.today.blocked,
+                st.pihole.today.self_queries
+            ),
+            (0, 0, 5)
+        );
         assert_eq!(st.pihole.today.percent, 0.0);
     }
 
@@ -1894,15 +2140,28 @@ mod tests {
         for _ in 0..3 {
             let mut rep = report(true, None);
             rep.t = util::unix_now();
-            rep.own = OwnQueries { total: 2, blocked: 1 };
+            rep.own = OwnQueries {
+                total: 2,
+                blocked: 1,
+            };
             r.w.on_probe(rep, r.t);
         }
         let st = r.w.state(false);
-        assert_eq!((st.pihole.today.total, st.pihole.today.self_queries), (100, 0));
+        assert_eq!(
+            (st.pihole.today.total, st.pihole.today.self_queries),
+            (100, 0)
+        );
         // The next reading includes them, and now they are taken out.
         r.w.handle(Event::Api(api_report(106, 43)), r.t);
         let st = r.w.state(false);
-        assert_eq!((st.pihole.today.total, st.pihole.today.blocked, st.pihole.today.self_queries), (100, 40, 6));
+        assert_eq!(
+            (
+                st.pihole.today.total,
+                st.pihole.today.blocked,
+                st.pihole.today.self_queries
+            ),
+            (100, 40, 6)
+        );
     }
 
     #[test]
@@ -1910,7 +2169,10 @@ mod tests {
         let mut r = rig();
         let mut rep = report(true, None);
         rep.t = util::unix_now();
-        rep.own = OwnQueries { total: 7, blocked: 4 };
+        rep.own = OwnQueries {
+            total: 7,
+            blocked: 4,
+        };
         r.w.on_probe(rep, 1_000);
         r.w.shutdown();
         let saved = r.state_dir().join("self-queries.json");
@@ -1995,7 +2257,11 @@ mod tests {
         for ms in (200..9_000).step_by(100) {
             assert!(r.w.next_emission(ms).is_none());
         }
-        assert_eq!(r.w.state_builds(), built, "no inputs changed, so nothing was serialised");
+        assert_eq!(
+            r.w.state_builds(),
+            built,
+            "no inputs changed, so nothing was serialised"
+        );
         // An ignored AP signal while closed is also free.
         r.w.handle(Event::Nm(NmKind::Ap), 9_100);
         r.w.process_dirty(9_100);
@@ -2047,7 +2313,10 @@ mod tests {
         h.join().unwrap();
         let lines = lines.lock().unwrap();
         assert!(matches!(lines[0], Line::State(_)));
-        let hbs = lines.iter().filter(|l| matches!(l, Line::Hb { .. })).count();
+        let hbs = lines
+            .iter()
+            .filter(|l| matches!(l, Line::Hb { .. }))
+            .count();
         let states = lines.iter().filter(|l| matches!(l, Line::State(_))).count();
         assert_eq!(states, 1, "nothing changed, so only the first state");
         assert!(hbs >= 2, "{} heartbeats", hbs);
@@ -2089,12 +2358,30 @@ mod tests {
 
     #[test]
     fn nm_signal_paths_are_classified() {
-        assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager/AccessPoint/12"), NmKind::Ap);
-        assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager/Settings/3"), NmKind::Settings);
-        assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager/Settings"), NmKind::Settings);
-        assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager/Devices/4"), NmKind::Core);
-        assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager/IP4Config/2"), NmKind::Core);
-        assert_eq!(classify_nm_signal("/org/freedesktop/NetworkManager"), NmKind::Core);
+        assert_eq!(
+            classify_nm_signal("/org/freedesktop/NetworkManager/AccessPoint/12"),
+            NmKind::Ap
+        );
+        assert_eq!(
+            classify_nm_signal("/org/freedesktop/NetworkManager/Settings/3"),
+            NmKind::Settings
+        );
+        assert_eq!(
+            classify_nm_signal("/org/freedesktop/NetworkManager/Settings"),
+            NmKind::Settings
+        );
+        assert_eq!(
+            classify_nm_signal("/org/freedesktop/NetworkManager/Devices/4"),
+            NmKind::Core
+        );
+        assert_eq!(
+            classify_nm_signal("/org/freedesktop/NetworkManager/IP4Config/2"),
+            NmKind::Core
+        );
+        assert_eq!(
+            classify_nm_signal("/org/freedesktop/NetworkManager"),
+            NmKind::Core
+        );
     }
 
     // -- closed-panel quiet ---------------------------------------------------------
@@ -2176,7 +2463,11 @@ mod tests {
         r.w.handle(Event::Nm(NmKind::Core), 1_000);
         r.w.process_dirty(1_300);
         assert!(r.w.next_emission(1_400).is_none());
-        assert_eq!(r.w.state(false).link.bitrate_mbps, 433, "still read, just not announced");
+        assert_eq!(
+            r.w.state(false).link.bitrate_mbps,
+            433,
+            "still read, just not announced"
+        );
     }
 
     // -- router trust: IP and MAC -----------------------------------------------------
@@ -2192,19 +2483,32 @@ mod tests {
         record(&r, "192.168.1.1", MAC);
         r.settle();
         r.fail3();
-        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 192.168.1.1"]);
+        assert_eq!(
+            r.runtime_calls(),
+            vec!["reapply_runtime_dns wlp7s0 192.168.1.1"]
+        );
         assert_eq!(r.w.state(false).dns.failover.fallback, "router");
-        assert_eq!(r.w.state(false).dns.failover.reason, "Pi-hole not answering");
+        assert_eq!(
+            r.w.state(false).dns.failover.reason,
+            "Pi-hole not answering"
+        );
 
         // Same IP, different MAC (another router took the address): quad9.
         let mut r = rig();
         record(&r, "192.168.1.1", [9, 9, 9, 9, 9, 9]);
         r.settle();
         r.fail3();
-        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+        assert_eq!(
+            r.runtime_calls(),
+            vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]
+        );
         let st = r.w.state(false);
         assert_eq!(st.dns.failover.fallback, "quad9", "the one really in use");
-        assert!(st.dns.failover.reason.contains("MAC"), "{}", st.dns.failover.reason);
+        assert!(
+            st.dns.failover.reason.contains("MAC"),
+            "{}",
+            st.dns.failover.reason
+        );
 
         // The MAC cannot be determined now: not trusted either.
         let mut r = rig();
@@ -2212,7 +2516,10 @@ mod tests {
         r.w.set_mac_lookup(Arc::new(|_, _| None));
         r.settle();
         r.fail3();
-        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+        assert_eq!(
+            r.runtime_calls(),
+            vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]
+        );
     }
 
     #[test]
@@ -2226,10 +2533,20 @@ mod tests {
             rep.gateway_blocked = Some(true); // the router answered the canary 0.0.0.0
             r.w.on_probe(rep, r.t);
         }
-        assert_eq!(r.runtime_calls(), vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]);
+        assert_eq!(
+            r.runtime_calls(),
+            vec!["reapply_runtime_dns wlp7s0 9.9.9.9,149.112.112.112"]
+        );
         let st = r.w.state(false);
         assert_eq!(st.dns.failover.fallback, "quad9");
-        assert!(st.dns.failover.reason.contains("forwards DNS to the Pi-hole"), "{}", st.dns.failover.reason);
+        assert!(
+            st.dns
+                .failover
+                .reason
+                .contains("forwards DNS to the Pi-hole"),
+            "{}",
+            st.dns.failover.reason
+        );
         assert_eq!(r.notes.lock().unwrap()[0].1, "Using quad9 DNS");
     }
 
@@ -2271,7 +2588,11 @@ mod tests {
         r.probe(true, None);
         r.probe(true, None);
         r.probe(true, None);
-        assert_eq!(*calls.lock().unwrap(), 1, "one HTTPS attempt, then a quiet period");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "one HTTPS attempt, then a quiet period"
+        );
         // After the retry period it tries again.
         r.t += LEARN_RETRY_MS;
         r.probe(true, None);
@@ -2303,9 +2624,14 @@ mod tests {
     fn failover_engage_and_recover_wait_their_turn_for_the_dns_lock() {
         let mut r = rig();
         r.settle();
-        let held = util::try_lock(&r.dir.path().join("run").join("dns.lock")).unwrap().unwrap();
+        let held = util::try_lock(&r.dir.path().join("run").join("dns.lock"))
+            .unwrap()
+            .unwrap();
         r.fail3();
-        assert!(r.runtime_calls().is_empty(), "another qnet is changing DNS: no engage");
+        assert!(
+            r.runtime_calls().is_empty(),
+            "another qnet is changing DNS: no engage"
+        );
         assert!(!r.w.failover_active());
         assert!(r.w.state(false).error.contains("another qnet operation"));
         drop(held);
@@ -2316,7 +2642,9 @@ mod tests {
         assert!(r.w.failover_active());
 
         // Recovery respects the lock as well.
-        let held = util::try_lock(&r.dir.path().join("run").join("dns.lock")).unwrap().unwrap();
+        let held = util::try_lock(&r.dir.path().join("run").join("dns.lock"))
+            .unwrap()
+            .unwrap();
         for _ in 0..4 {
             r.probe(true, None);
         }
@@ -2329,7 +2657,9 @@ mod tests {
         assert_eq!(r.saved_calls().len(), 1);
         assert!(!r.w.failover_active());
         // And the lock was released again by the watcher itself.
-        assert!(util::try_lock(&r.dir.path().join("run").join("dns.lock")).unwrap().is_some());
+        assert!(util::try_lock(&r.dir.path().join("run").join("dns.lock"))
+            .unwrap()
+            .is_some());
     }
 
     // -- auto is only deliberate if it was chosen ------------------------------------
@@ -2346,7 +2676,11 @@ mod tests {
         assert_eq!(st.link.kind, "ethernet");
         assert_eq!(st.dns.mode, "auto");
         assert!(st.dns.bypassed, "nobody chose Automatic for this cable");
-        assert!(st.dns.leaks.iter().any(|l| l.where_ == "Wired connection 1" && l.kind == "link"));
+        assert!(st
+            .dns
+            .leaks
+            .iter()
+            .any(|l| l.where_ == "Wired connection 1" && l.kind == "link"));
         // The user taps Automatic: `dns auto` notes it, the profile change is seen.
         actions::set_auto_choice(&r.state_dir(), U_ETH1, true).unwrap();
         r.w.handle(Event::Nm(NmKind::Settings), 10_000);
@@ -2354,7 +2688,11 @@ mod tests {
         let st = r.w.state(false);
         assert_eq!(st.dns.mode, "auto");
         assert!(!st.dns.bypassed, "a choice, not an accident");
-        assert!(st.dns.leaks.iter().all(|l| l.where_ != "Wired connection 1" || l.kind == "profile"));
+        assert!(st
+            .dns
+            .leaks
+            .iter()
+            .all(|l| l.where_ != "Wired connection 1" || l.kind == "profile"));
         // Choosing the Pi-hole again forgets it.
         actions::set_auto_choice(&r.state_dir(), U_ETH1, false).unwrap();
         r.w.handle(Event::Nm(NmKind::Settings), 20_000);
@@ -2383,7 +2721,10 @@ mod tests {
         assert!(st.dns.failover.active, "Wi-Fi is still failed over");
         assert_eq!(st.dns.failover.fallback, "router");
         assert_eq!(st.dns.mode_source, "profile");
-        assert!(st.dns.leaks.iter().all(|l| l.where_ != "Redwood"), "the failed-over link is not a leak");
+        assert!(
+            st.dns.leaks.iter().all(|l| l.where_ != "Redwood"),
+            "the failed-over link is not a leak"
+        );
     }
 
     // -- resolved's downgrade ------------------------------------------------------------
@@ -2394,7 +2735,9 @@ mod tests {
         r.w.on_probe(report(true, None), 15_000);
         assert_eq!(r.w.state(false).pihole.health, "ok");
         r.w.handle(
-            Event::Downgrade(Some("systemd-resolved dropped 192.168.1.153 to plain UDP (EDNS0 is failing)".into())),
+            Event::Downgrade(Some(
+                "systemd-resolved dropped 192.168.1.153 to plain UDP (EDNS0 is failing)".into(),
+            )),
             16_000,
         );
         let st = r.w.state(false);
@@ -2426,7 +2769,10 @@ mod tests {
         r.w.process_dirty(40_000);
         r.w.process_dirty(100_000);
         std::thread::sleep(Duration::from_millis(100));
-        assert!(asked.lock().unwrap().is_empty(), "no process spawns while closed");
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "no process spawns while closed"
+        );
         assert!(rx.try_recv().is_err());
         // Open: once right away...
         r.w.handle(Event::Cmd("open".into()), 100_000);
@@ -2457,13 +2803,22 @@ mod tests {
     #[test]
     fn resolved_fallback_dns_shows_up_as_a_leak_once_resolved_picked_it() {
         let mut r = rig();
-        assert!(r.w.state(false).dns.leaks.iter().all(|l| l.kind != "resolved-fallback"));
+        assert!(r
+            .w
+            .state(false)
+            .dns
+            .leaks
+            .iter()
+            .all(|l| l.kind != "resolved-fallback"));
         r.be.set_global_current(Some("9.9.9.9"));
         r.w.handle(Event::Nm(NmKind::Core), 5_000);
         r.w.process_dirty(5_300);
         let st = r.w.state(false);
         assert!(st.dns.leaks.iter().any(|l| l.kind == "resolved-fallback"));
-        assert_eq!(st.dns.mode, "pihole", "it is a leak line, not a mode change");
+        assert_eq!(
+            st.dns.mode, "pihole",
+            "it is a leak line, not a mode change"
+        );
         assert!(!st.dns.bypassed);
     }
 
@@ -2473,7 +2828,10 @@ mod tests {
         for _ in 0..4 {
             let mut rep = report(true, None);
             rep.t = util::unix_now();
-            rep.own = OwnQueries { total: 2, blocked: 1 };
+            rep.own = OwnQueries {
+                total: 2,
+                blocked: 1,
+            };
             r.w.on_probe(rep, r.t);
         }
         let mut rep = api_report(100, 50);
@@ -2485,13 +2843,26 @@ mod tests {
                 count: 40,
                 response_ms: Some(15.5),
             }],
-            answered_by: crate::pihole::AnsweredBy { blocklist: 50, cache: 10, forwarded: 40 },
+            answered_by: crate::pihole::AnsweredBy {
+                blocklist: 50,
+                cache: 10,
+                forwarded: 40,
+            },
         });
         r.w.handle(Event::Api(rep), r.t);
         let st = r.w.state(false);
         assert_eq!(st.pihole.upstreams.len(), 1);
         let u = &st.pihole.upstreams[0];
-        assert_eq!((u.name.as_str(), u.ip.as_str(), u.port, u.count, u.response_ms), ("dns9.quad9.net", "9.9.9.9", 53, 40, Some(15.5)));
+        assert_eq!(
+            (
+                u.name.as_str(),
+                u.ip.as_str(),
+                u.port,
+                u.count,
+                u.response_ms
+            ),
+            ("dns9.quad9.net", "9.9.9.9", 53, 40, Some(15.5))
+        );
         // 4 cycles x (1 blocked + 1 forwarded) of our own are in those numbers.
         assert_eq!(st.pihole.answered_by.blocklist, 46);
         assert_eq!(st.pihole.answered_by.cache, 10);

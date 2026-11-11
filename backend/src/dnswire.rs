@@ -194,7 +194,9 @@ pub fn parse_response(msg: &[u8], expect_id: u16, expect_name: &str) -> Result<R
         let rtype = u16::from_be_bytes([fixed[0], fixed[1]]);
         let rclass = u16::from_be_bytes([fixed[2], fixed[3]]);
         let rdlen = u16::from_be_bytes([fixed[8], fixed[9]]) as usize;
-        let rdata = msg.get(next + 10..next + 10 + rdlen).ok_or(DnsError::Short)?;
+        let rdata = msg
+            .get(next + 10..next + 10 + rdlen)
+            .ok_or(DnsError::Short)?;
         if rtype == TYPE_A && rclass == CLASS_IN && rdlen == 4 {
             answers.push(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
         }
@@ -257,7 +259,8 @@ fn exchange(
         SocketAddr::V6(_) => "[::]:0".parse().expect("static addr"),
     };
     let sock = UdpSocket::bind(bind).map_err(|e| DnsError::Io(e.to_string()))?;
-    sock.connect(server).map_err(|e| DnsError::Io(e.to_string()))?;
+    sock.connect(server)
+        .map_err(|e| DnsError::Io(e.to_string()))?;
 
     let start = Instant::now();
     sock.send(&query).map_err(|e| DnsError::Io(e.to_string()))?;
@@ -472,7 +475,10 @@ mod tests {
     fn rejects_wrong_id_question_and_queries() {
         let r = response(1, "a.com", 0, &[Ipv4Addr::LOCALHOST]);
         assert_eq!(parse_response(&r, 2, "a.com"), Err(DnsError::IdMismatch));
-        assert_eq!(parse_response(&r, 1, "b.com"), Err(DnsError::QuestionMismatch));
+        assert_eq!(
+            parse_response(&r, 1, "b.com"),
+            Err(DnsError::QuestionMismatch)
+        );
         let q = build_query(1, "a.com", false).unwrap();
         assert_eq!(parse_response(&q, 1, "a.com"), Err(DnsError::NotResponse));
         assert_eq!(parse_response(&[0; 5], 1, "a.com"), Err(DnsError::Short));
@@ -525,17 +531,47 @@ mod tests {
             answers,
         };
         let blocked = judge(&mk(0, vec![Ipv4Addr::UNSPECIFIED]), pi, false);
-        assert_eq!(blocked, Verdict { ok: true, blocked: true });
+        assert_eq!(
+            blocked,
+            Verdict {
+                ok: true,
+                blocked: true
+            }
+        );
         let paused = judge(&mk(0, vec![Ipv4Addr::new(142, 250, 1, 1)]), pi, false);
-        assert_eq!(paused, Verdict { ok: true, blocked: false });
+        assert_eq!(
+            paused,
+            Verdict {
+                ok: true,
+                blocked: false
+            }
+        );
         let ip_mode = judge(&mk(0, vec![Ipv4Addr::new(192, 168, 1, 153)]), pi, false);
         assert!(ip_mode.blocked);
         let nx = judge(&mk(RCODE_NXDOMAIN, vec![]), pi, false);
-        assert_eq!(nx, Verdict { ok: true, blocked: true });
+        assert_eq!(
+            nx,
+            Verdict {
+                ok: true,
+                blocked: true
+            }
+        );
         let nodata = judge(&mk(0, vec![]), pi, false);
-        assert_eq!(nodata, Verdict { ok: true, blocked: true });
+        assert_eq!(
+            nodata,
+            Verdict {
+                ok: true,
+                blocked: true
+            }
+        );
         let servfail = judge(&mk(2, vec![]), pi, false);
-        assert_eq!(servfail, Verdict { ok: false, blocked: false });
+        assert_eq!(
+            servfail,
+            Verdict {
+                ok: false,
+                blocked: false
+            }
+        );
         let refused = judge(&mk(5, vec![]), pi, false);
         assert!(!refused.ok);
     }
@@ -543,14 +579,49 @@ mod tests {
     #[test]
     fn strict_verdicts_need_an_explicit_null_answer() {
         let pi = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 153));
-        let mk = |rcode, answers: Vec<Ipv4Addr>| Reply { id: 1, rcode, truncated: false, answers };
+        let mk = |rcode, answers: Vec<Ipv4Addr>| Reply {
+            id: 1,
+            rcode,
+            truncated: false,
+            answers,
+        };
         // A `.invalid` name that is not on the deny list comes back NXDOMAIN
         // from upstream; that must not read as "blocked".
-        assert_eq!(judge(&mk(RCODE_NXDOMAIN, vec![]), pi, true), Verdict { ok: true, blocked: false });
-        assert_eq!(judge(&mk(0, vec![]), pi, true), Verdict { ok: true, blocked: false });
-        assert_eq!(judge(&mk(0, vec![Ipv4Addr::UNSPECIFIED]), pi, true), Verdict { ok: true, blocked: true });
-        assert_eq!(judge(&mk(0, vec![Ipv4Addr::new(192, 168, 1, 153)]), pi, true), Verdict { ok: true, blocked: true });
-        assert_eq!(judge(&mk(0, vec![Ipv4Addr::new(1, 2, 3, 4)]), pi, true), Verdict { ok: true, blocked: false });
+        assert_eq!(
+            judge(&mk(RCODE_NXDOMAIN, vec![]), pi, true),
+            Verdict {
+                ok: true,
+                blocked: false
+            }
+        );
+        assert_eq!(
+            judge(&mk(0, vec![]), pi, true),
+            Verdict {
+                ok: true,
+                blocked: false
+            }
+        );
+        assert_eq!(
+            judge(&mk(0, vec![Ipv4Addr::UNSPECIFIED]), pi, true),
+            Verdict {
+                ok: true,
+                blocked: true
+            }
+        );
+        assert_eq!(
+            judge(&mk(0, vec![Ipv4Addr::new(192, 168, 1, 153)]), pi, true),
+            Verdict {
+                ok: true,
+                blocked: true
+            }
+        );
+        assert_eq!(
+            judge(&mk(0, vec![Ipv4Addr::new(1, 2, 3, 4)]), pi, true),
+            Verdict {
+                ok: true,
+                blocked: false
+            }
+        );
         assert!(!judge(&mk(2, vec![]), pi, true).ok);
     }
 
@@ -564,7 +635,12 @@ mod tests {
             let (n, from) = srv.recv_from(&mut buf).unwrap();
             let id = u16::from_be_bytes([buf[0], buf[1]]);
             // First send a stray datagram with the wrong id, then the real one.
-            let stray = response(id.wrapping_add(1), "doubleclick.net", 0, &[Ipv4Addr::LOCALHOST]);
+            let stray = response(
+                id.wrapping_add(1),
+                "doubleclick.net",
+                0,
+                &[Ipv4Addr::LOCALHOST],
+            );
             srv.send_to(&stray, from).unwrap();
             let good = response(id, "doubleclick.net", 0, &[Ipv4Addr::UNSPECIFIED]);
             srv.send_to(&good, from).unwrap();
@@ -581,7 +657,8 @@ mod tests {
         use std::thread;
         let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = srv.local_addr().unwrap();
-        srv.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        srv.set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
         let h = thread::spawn(move || {
             let mut buf = [0u8; 512];
             let mut seen = 0;
@@ -607,7 +684,8 @@ mod tests {
         use std::thread;
         let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = srv.local_addr().unwrap();
-        srv.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        srv.set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
         let h = thread::spawn(move || {
             let mut buf = [0u8; 512];
             let mut seen = 0;
@@ -624,7 +702,11 @@ mod tests {
         );
         assert_eq!(res, Err(DnsError::Timeout));
         assert_eq!(sent, 2);
-        assert_eq!(h.join().unwrap(), 2, "the server saw exactly what we counted");
+        assert_eq!(
+            h.join().unwrap(),
+            2,
+            "the server saw exactly what we counted"
+        );
 
         // An immediate answer is one datagram.
         let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -633,9 +715,18 @@ mod tests {
             let mut buf = [0u8; 512];
             let (_, from) = srv.recv_from(&mut buf).unwrap();
             let id = u16::from_be_bytes([buf[0], buf[1]]);
-            srv.send_to(&response(id, "a.example.com", 0, &[Ipv4Addr::LOCALHOST]), from).unwrap();
+            srv.send_to(
+                &response(id, "a.example.com", 0, &[Ipv4Addr::LOCALHOST]),
+                from,
+            )
+            .unwrap();
         });
-        let (sent, res) = query_a_counted(addr, "a.example.com", Duration::from_secs(2), Some(Duration::from_secs(1)));
+        let (sent, res) = query_a_counted(
+            addr,
+            "a.example.com",
+            Duration::from_secs(2),
+            Some(Duration::from_secs(1)),
+        );
         assert!(res.is_ok());
         assert_eq!(sent, 1);
     }

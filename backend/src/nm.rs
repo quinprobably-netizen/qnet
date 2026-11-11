@@ -53,7 +53,14 @@ impl DbusBackend {
             .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    fn call<B>(&self, dest: &str, path: &str, iface: &str, method: &str, body: &B) -> NetResult<zbus::Message>
+    fn call<B>(
+        &self,
+        dest: &str,
+        path: &str,
+        iface: &str,
+        method: &str,
+        body: &B,
+    ) -> NetResult<zbus::Message>
     where
         B: serde::Serialize + zbus::zvariant::DynamicType,
     {
@@ -64,7 +71,9 @@ impl DbusBackend {
 
     fn get_all(&self, dest: &str, path: &str, iface: &str) -> NetResult<Dict> {
         let m = self.call(dest, path, PROPS, "GetAll", &(iface,))?;
-        m.body().deserialize::<Dict>().map_err(|e| NetError::Bus(e.to_string()))
+        m.body()
+            .deserialize::<Dict>()
+            .map_err(|e| NetError::Bus(e.to_string()))
     }
 
     fn get_prop(&self, dest: &str, path: &str, iface: &str, name: &str) -> NetResult<OwnedValue> {
@@ -83,9 +92,17 @@ impl DbusBackend {
 
     fn device_by_iface(&self, iface: &str) -> NetResult<String> {
         let m = self
-            .call(NM, NM_PATH, "org.freedesktop.NetworkManager", "GetDeviceByIpIface", &(iface,))
+            .call(
+                NM,
+                NM_PATH,
+                "org.freedesktop.NetworkManager",
+                "GetDeviceByIpIface",
+                &(iface,),
+            )
             .map_err(|e| match e {
-                NetError::Bus(_) | NetError::NotFound(_) => NetError::NotFound(format!("no device {iface}")),
+                NetError::Bus(_) | NetError::NotFound(_) => {
+                    NetError::NotFound(format!("no device {iface}"))
+                }
                 other => other,
             })?;
         self.path_reply(&m)
@@ -101,7 +118,9 @@ impl DbusBackend {
                 &(uuid,),
             )
             .map_err(|e| match e {
-                NetError::Bus(_) | NetError::NotFound(_) => NetError::NotFound("no such saved connection".into()),
+                NetError::Bus(_) | NetError::NotFound(_) => {
+                    NetError::NotFound("no such saved connection".into())
+                }
                 other => other,
             })?;
         self.path_reply(&m)
@@ -147,7 +166,12 @@ impl DbusBackend {
 
     /// Replace a profile's settings, carrying its secrets along so the update
     /// can never drop a stored passphrase. Verifies that they survived.
-    fn update_profile(&self, conn_path: &str, mut settings: Settings, secrets: Settings) -> NetResult<()> {
+    fn update_profile(
+        &self,
+        conn_path: &str,
+        mut settings: Settings,
+        secrets: Settings,
+    ) -> NetResult<()> {
         for (section, entries) in &secrets {
             let dst = settings.entry(section.clone()).or_default();
             for (k, v) in entries {
@@ -188,11 +212,21 @@ impl DbusBackend {
         Ok(())
     }
 
-    fn wait_activation(&self, active_path: &str, device_path: &str, timeout: Duration) -> NetResult<()> {
+    fn wait_activation(
+        &self,
+        active_path: &str,
+        device_path: &str,
+        timeout: Duration,
+    ) -> NetResult<()> {
         let start = Instant::now();
         loop {
             let state = self
-                .get_prop(NM, active_path, "org.freedesktop.NetworkManager.Connection.Active", "State")
+                .get_prop(
+                    NM,
+                    active_path,
+                    "org.freedesktop.NetworkManager.Connection.Active",
+                    "State",
+                )
                 .ok()
                 .and_then(|v| u32::try_from(&v).ok());
             match state {
@@ -201,14 +235,21 @@ impl DbusBackend {
                 // Deactivated, or the object is already gone.
                 Some(_) | None => {
                     let reason = self
-                        .get_prop(NM, device_path, "org.freedesktop.NetworkManager.Device", "StateReason")
+                        .get_prop(
+                            NM,
+                            device_path,
+                            "org.freedesktop.NetworkManager.Device",
+                            "StateReason",
+                        )
                         .ok()
                         .and_then(|v| reason_code(&v));
                     return Err(activation_error(reason));
                 }
             }
             if self.cancelled() {
-                return Err(NetError::Interrupted("stopped while waiting for the connection".into()));
+                return Err(NetError::Interrupted(
+                    "stopped while waiting for the connection".into(),
+                ));
             }
             if start.elapsed() >= timeout {
                 return Err(NetError::Timeout("the connection did not come up".into()));
@@ -250,7 +291,10 @@ fn map_err(e: zbus::Error) -> NetError {
         zbus::Error::MethodError(name, desc, _) => {
             let n = name.as_str();
             let d = desc.unwrap_or_default();
-            if n.ends_with("PermissionDenied") || n.ends_with("NotAuthorized") || n.ends_with("AccessDenied") {
+            if n.ends_with("PermissionDenied")
+                || n.ends_with("NotAuthorized")
+                || n.ends_with("AccessDenied")
+            {
                 NetError::Denied(if d.is_empty() { n.to_string() } else { d })
             } else if n.ends_with("UnknownObject")
                 || n.ends_with("UnknownMethod")
@@ -350,7 +394,9 @@ fn d_path(d: &Dict, k: &str) -> Option<String> {
 
 fn ip_from(family: i32, bytes: &[u8]) -> Option<IpAddr> {
     match (family, bytes.len()) {
-        (AF_INET, 4) => Some(IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))),
+        (AF_INET, 4) => Some(IpAddr::V4(Ipv4Addr::new(
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ))),
         (AF_INET6, 16) => {
             let mut a = [0u8; 16];
             a.copy_from_slice(bytes);
@@ -362,11 +408,15 @@ fn ip_from(family: i32, bytes: &[u8]) -> Option<IpAddr> {
 
 /// `a(iiayqs)`: (ifindex, family, address, port, server name).
 fn parse_dns_ex(v: &Value<'_>) -> Vec<(i32, IpAddr)> {
-    let Value::Array(arr) = unwrap_variant(v) else { return vec![] };
+    let Value::Array(arr) = unwrap_variant(v) else {
+        return vec![];
+    };
     arr.inner()
         .iter()
         .filter_map(|e| {
-            let Value::Structure(s) = unwrap_variant(e) else { return None };
+            let Value::Structure(s) = unwrap_variant(e) else {
+                return None;
+            };
             let f = s.fields();
             let ifindex = as_i32(f.first()?)?;
             let family = as_i32(f.get(1)?)?;
@@ -378,7 +428,9 @@ fn parse_dns_ex(v: &Value<'_>) -> Vec<(i32, IpAddr)> {
 
 /// `(iayqs)`: the link's current server (family, address, port, name).
 fn parse_current_ex(v: &Value<'_>) -> Option<IpAddr> {
-    let Value::Structure(s) = unwrap_variant(v) else { return None };
+    let Value::Structure(s) = unwrap_variant(v) else {
+        return None;
+    };
     let f = s.fields();
     let family = as_i32(f.first()?)?;
     let addr = as_bytes(f.get(1)?)?;
@@ -388,7 +440,9 @@ fn parse_current_ex(v: &Value<'_>) -> Option<IpAddr> {
 /// The Manager's `CurrentDNSServerEx`: `(iiayqs)` = ifindex, family, address,
 /// port, name. Only an entry without a link (ifindex 0) is a global server.
 fn parse_global_current(v: &Value<'_>) -> Option<IpAddr> {
-    let Value::Structure(s) = unwrap_variant(v) else { return None };
+    let Value::Structure(s) = unwrap_variant(v) else {
+        return None;
+    };
     let f = s.fields();
     if as_i32(f.first()?)? != 0 {
         return None;
@@ -401,9 +455,13 @@ fn parse_global_current(v: &Value<'_>) -> Option<IpAddr> {
 /// NM's IP4Config `AddressData` (`aa{sv}`): the first entry's `address` and
 /// the `prefix` next to it (0..=32).
 fn parse_address_data(v: &Value<'_>) -> Option<(Ipv4Addr, Option<u32>)> {
-    let Value::Array(a) = unwrap_variant(v) else { return None };
+    let Value::Array(a) = unwrap_variant(v) else {
+        return None;
+    };
     a.inner().iter().find_map(|e| {
-        let Value::Dict(dict) = unwrap_variant(e) else { return None };
+        let Value::Dict(dict) = unwrap_variant(e) else {
+            return None;
+        };
         let addr: Ipv4Addr = dict
             .get::<_, Value>(&Value::new("address"))
             .ok()
@@ -423,9 +481,13 @@ fn parse_address_data(v: &Value<'_>) -> Option<(Ipv4Addr, Option<u32>)> {
 
 /// `a(sb)` domains: true when one is the root routing domain.
 fn has_root_route(v: &Value<'_>) -> bool {
-    let Value::Array(arr) = unwrap_variant(v) else { return false };
+    let Value::Array(arr) = unwrap_variant(v) else {
+        return false;
+    };
     arr.inner().iter().any(|e| {
-        let Value::Structure(s) = unwrap_variant(e) else { return false };
+        let Value::Structure(s) = unwrap_variant(e) else {
+            return false;
+        };
         let f = s.fields();
         matches!(
             (f.first().and_then(|d| as_string(d)), f.get(1).and_then(|r| as_bool(r))),
@@ -509,7 +571,11 @@ pub fn parse_dns_settings(s: &Settings) -> DnsSettings {
 pub fn apply_dns_settings(s: &mut Settings, dns: &DnsSettings) {
     {
         let v4 = s.entry("ipv4".into()).or_default();
-        let raw: Vec<u32> = dns.v4_dns.iter().map(|a| u32::from_ne_bytes(a.octets())).collect();
+        let raw: Vec<u32> = dns
+            .v4_dns
+            .iter()
+            .map(|a| u32::from_ne_bytes(a.octets()))
+            .collect();
         v4.insert("dns".into(), ov(raw));
         v4.remove("dns-data");
         v4.insert("ignore-auto-dns".into(), ov(dns.v4_ignore_auto));
@@ -591,7 +657,9 @@ impl DbusBackend {
     }
 
     fn read_device(&self, path: &str, with_aps: bool) -> Option<Device> {
-        let d = self.get_all(NM, path, "org.freedesktop.NetworkManager.Device").ok()?;
+        let d = self
+            .get_all(NM, path, "org.freedesktop.NetworkManager.Device")
+            .ok()?;
         let kind = match d_u32(&d, "DeviceType")? {
             1 => DeviceKind::Ethernet,
             2 => DeviceKind::Wifi,
@@ -630,7 +698,12 @@ impl DbusBackend {
         let mut speed_mbps = 0;
         if kind == DeviceKind::Ethernet && state == NM_DEVICE_STATE_ACTIVATED {
             speed_mbps = self
-                .get_prop(NM, path, "org.freedesktop.NetworkManager.Device.Wired", "Speed")
+                .get_prop(
+                    NM,
+                    path,
+                    "org.freedesktop.NetworkManager.Device.Wired",
+                    "Speed",
+                )
                 .ok()
                 .and_then(|v| as_u32(&v))
                 .unwrap_or(0);
@@ -655,7 +728,11 @@ impl DbusBackend {
                             &(),
                         )
                         .ok()
-                        .and_then(|m| m.body().deserialize::<Vec<zbus::zvariant::OwnedObjectPath>>().ok())
+                        .and_then(|m| {
+                            m.body()
+                                .deserialize::<Vec<zbus::zvariant::OwnedObjectPath>>()
+                                .ok()
+                        })
                         .map(|v| v.into_iter().map(|p| p.to_string()).collect())
                         .unwrap_or_default()
                     } else {
@@ -736,7 +813,10 @@ impl NetBackend for DbusBackend {
 
     fn resolver(&self, wanted: &[(u32, String)]) -> NetResult<ResolverSnapshot> {
         let mgr = self.get_all(RESOLVED, RESOLVED_PATH, "org.freedesktop.resolve1.Manager")?;
-        let all = mgr.get("DNSEx").map(|v| parse_dns_ex(v)).unwrap_or_default();
+        let all = mgr
+            .get("DNSEx")
+            .map(|v| parse_dns_ex(v))
+            .unwrap_or_default();
         let fallback: Vec<IpAddr> = mgr
             .get("FallbackDNSEx")
             .map(|v| parse_dns_ex(v))
@@ -744,7 +824,11 @@ impl NetBackend for DbusBackend {
             .into_iter()
             .map(|(_, a)| a)
             .collect();
-        let global: Vec<IpAddr> = all.iter().filter(|(i, _)| *i == 0).map(|(_, a)| *a).collect();
+        let global: Vec<IpAddr> = all
+            .iter()
+            .filter(|(i, _)| *i == 0)
+            .map(|(_, a)| *a)
+            .collect();
 
         let mut ifindexes: Vec<u32> = wanted.iter().map(|(i, _)| *i).collect();
         for (i, _) in &all {
@@ -763,12 +847,19 @@ impl NetBackend for DbusBackend {
             ) else {
                 continue;
             };
-            let Ok(path) = self.path_reply(&m) else { continue };
+            let Ok(path) = self.path_reply(&m) else {
+                continue;
+            };
             let Ok(l) = self.get_all(RESOLVED, &path, "org.freedesktop.resolve1.Link") else {
                 continue;
             };
-            let servers: Vec<IpAddr> = l.get("DNSEx").map(|v| parse_dns_ex_link(v)).unwrap_or_default();
-            let current = l.get("CurrentDNSServerEx").and_then(|v| parse_current_ex(v));
+            let servers: Vec<IpAddr> = l
+                .get("DNSEx")
+                .map(|v| parse_dns_ex_link(v))
+                .unwrap_or_default();
+            let current = l
+                .get("CurrentDNSServerEx")
+                .and_then(|v| parse_current_ex(v));
             let default_route = d_bool(&l, "DefaultRoute").unwrap_or(false)
                 || l.get("Domains").is_some_and(|v| has_root_route(v));
             let name = wanted
@@ -785,7 +876,9 @@ impl NetBackend for DbusBackend {
                 default_route,
             });
         }
-        let global_current = mgr.get("CurrentDNSServerEx").and_then(|v| parse_global_current(v));
+        let global_current = mgr
+            .get("CurrentDNSServerEx")
+            .and_then(|v| parse_global_current(v));
         Ok(ResolverSnapshot {
             links,
             global,
@@ -803,8 +896,10 @@ impl NetBackend for DbusBackend {
             "GetAppliedConnection",
             &(0u32,),
         )?;
-        let (settings, _version): (Settings, u64) =
-            m.body().deserialize().map_err(|e| NetError::Bus(e.to_string()))?;
+        let (settings, _version): (Settings, u64) = m
+            .body()
+            .deserialize()
+            .map_err(|e| NetError::Bus(e.to_string()))?;
         Ok(parse_dns_settings(&settings))
     }
 
@@ -838,8 +933,10 @@ impl NetBackend for DbusBackend {
             "GetAppliedConnection",
             &(0u32,),
         )?;
-        let (mut settings, version): (Settings, u64) =
-            m.body().deserialize().map_err(|e| NetError::Bus(e.to_string()))?;
+        let (mut settings, version): (Settings, u64) = m
+            .body()
+            .deserialize()
+            .map_err(|e| NetError::Bus(e.to_string()))?;
         let mut dns = parse_dns_settings(&settings);
         dns.v4_dns = servers.to_vec();
         dns.v4_ignore_auto = true;
@@ -875,15 +972,25 @@ impl NetBackend for DbusBackend {
             NM_PATH,
             PROPS,
             "Set",
-            &("org.freedesktop.NetworkManager", "WirelessEnabled", Value::from(on)),
+            &(
+                "org.freedesktop.NetworkManager",
+                "WirelessEnabled",
+                Value::from(on),
+            ),
         )
         .map(|_| ())
     }
 
     fn disconnect(&self, iface: &str) -> NetResult<()> {
         let dev = self.device_by_iface(iface)?;
-        self.call(NM, &dev, "org.freedesktop.NetworkManager.Device", "Disconnect", &())
-            .map(|_| ())
+        self.call(
+            NM,
+            &dev,
+            "org.freedesktop.NetworkManager.Device",
+            "Disconnect",
+            &(),
+        )
+        .map(|_| ())
     }
 
     fn forget(&self, uuid: &str) -> NetResult<()> {
@@ -910,8 +1017,11 @@ impl NetBackend for DbusBackend {
         if let Some(pass) = new_passphrase {
             let mut settings = self.get_settings(&conn)?;
             let secrets = self.get_secrets(&conn, &settings);
-            let sec = settings.entry("802-11-wireless-security".into()).or_default();
-            sec.entry("key-mgmt".into()).or_insert_with(|| ov("wpa-psk"));
+            let sec = settings
+                .entry("802-11-wireless-security".into())
+                .or_default();
+            sec.entry("key-mgmt".into())
+                .or_insert_with(|| ov("wpa-psk"));
             sec.insert("psk".into(), ov(pass));
             // The new psk replaces the old one; drop the old secret copy.
             let mut secrets = secrets;
@@ -926,9 +1036,12 @@ impl NetBackend for DbusBackend {
             "org.freedesktop.NetworkManager",
             "ActivateConnection",
             &(
-                zbus::zvariant::ObjectPath::try_from(conn.as_str()).map_err(|e| NetError::Invalid(e.to_string()))?,
-                zbus::zvariant::ObjectPath::try_from(dev.as_str()).map_err(|e| NetError::Invalid(e.to_string()))?,
-                zbus::zvariant::ObjectPath::try_from(ap_path).map_err(|e| NetError::Invalid(e.to_string()))?,
+                zbus::zvariant::ObjectPath::try_from(conn.as_str())
+                    .map_err(|e| NetError::Invalid(e.to_string()))?,
+                zbus::zvariant::ObjectPath::try_from(dev.as_str())
+                    .map_err(|e| NetError::Invalid(e.to_string()))?,
+                zbus::zvariant::ObjectPath::try_from(ap_path)
+                    .map_err(|e| NetError::Invalid(e.to_string()))?,
             ),
         )?;
         let active = self.path_reply(&m)?;
@@ -945,7 +1058,9 @@ impl NetBackend for DbusBackend {
         let dev = self.device_by_iface(iface)?;
         let (shown, hidden) = display_ssid(&ap.ssid);
         if hidden {
-            return Err(NetError::Invalid("hidden networks cannot be joined from the list".into()));
+            return Err(NetError::Invalid(
+                "hidden networks cannot be joined from the list".into(),
+            ));
         }
         let mut s = Settings::new();
         s.insert(
@@ -966,8 +1081,13 @@ impl NetBackend for DbusBackend {
         match security {
             Security::Open => {}
             Security::Psk | Security::Sae => {
-                let pass = passphrase.ok_or_else(|| NetError::Invalid("a passphrase is required".into()))?;
-                let key_mgmt = if *security == Security::Sae { "sae" } else { "wpa-psk" };
+                let pass = passphrase
+                    .ok_or_else(|| NetError::Invalid("a passphrase is required".into()))?;
+                let key_mgmt = if *security == Security::Sae {
+                    "sae"
+                } else {
+                    "wpa-psk"
+                };
                 s.insert(
                     "802-11-wireless-security".into(),
                     Dict::from([
@@ -986,11 +1106,19 @@ impl NetBackend for DbusBackend {
                 return Err(NetError::Invalid("WEP networks are not supported".into()));
             }
             Security::Enterprise => {
-                return Err(NetError::Invalid("802.1X networks are not supported".into()));
+                return Err(NetError::Invalid(
+                    "802.1X networks are not supported".into(),
+                ));
             }
         }
-        s.insert("ipv4".into(), Dict::from([("method".to_string(), ov("auto"))]));
-        s.insert("ipv6".into(), Dict::from([("method".to_string(), ov("auto"))]));
+        s.insert(
+            "ipv4".into(),
+            Dict::from([("method".to_string(), ov("auto"))]),
+        );
+        s.insert(
+            "ipv6".into(),
+            Dict::from([("method".to_string(), ov("auto"))]),
+        );
 
         let m = self.call(
             NM,
@@ -999,12 +1127,19 @@ impl NetBackend for DbusBackend {
             "AddAndActivateConnection",
             &(
                 &s,
-                zbus::zvariant::ObjectPath::try_from(dev.as_str()).map_err(|e| NetError::Invalid(e.to_string()))?,
-                zbus::zvariant::ObjectPath::try_from(ap.path.as_str()).map_err(|e| NetError::Invalid(e.to_string()))?,
+                zbus::zvariant::ObjectPath::try_from(dev.as_str())
+                    .map_err(|e| NetError::Invalid(e.to_string()))?,
+                zbus::zvariant::ObjectPath::try_from(ap.path.as_str())
+                    .map_err(|e| NetError::Invalid(e.to_string()))?,
             ),
         )?;
-        let (conn_path, active_path): (zbus::zvariant::OwnedObjectPath, zbus::zvariant::OwnedObjectPath) =
-            m.body().deserialize().map_err(|e| NetError::Bus(e.to_string()))?;
+        let (conn_path, active_path): (
+            zbus::zvariant::OwnedObjectPath,
+            zbus::zvariant::OwnedObjectPath,
+        ) = m
+            .body()
+            .deserialize()
+            .map_err(|e| NetError::Bus(e.to_string()))?;
         match self.wait_activation(active_path.as_str(), &dev, Duration::from_secs(30)) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -1029,8 +1164,10 @@ impl NetBackend for DbusBackend {
             "ResolveHostname",
             &(0i32, name, AF_INET, 0u64),
         )?;
-        let (addrs, _canonical, _flags): ResolveReply =
-            m.body().deserialize().map_err(|e| NetError::Bus(e.to_string()))?;
+        let (addrs, _canonical, _flags): ResolveReply = m
+            .body()
+            .deserialize()
+            .map_err(|e| NetError::Bus(e.to_string()))?;
         Ok(addrs
             .into_iter()
             .filter_map(|(_, family, bytes)| ip_from(family, &bytes))
@@ -1040,11 +1177,15 @@ impl NetBackend for DbusBackend {
 
 /// Link `DNSEx` entries are `(family, address, port, name)` without ifindex.
 fn parse_dns_ex_link(v: &Value<'_>) -> Vec<IpAddr> {
-    let Value::Array(arr) = unwrap_variant(v) else { return vec![] };
+    let Value::Array(arr) = unwrap_variant(v) else {
+        return vec![];
+    };
     arr.inner()
         .iter()
         .filter_map(|e| {
-            let Value::Structure(s) = unwrap_variant(e) else { return None };
+            let Value::Structure(s) = unwrap_variant(e) else {
+                return None;
+            };
             let f = s.fields();
             let family = as_i32(f.first()?)?;
             let addr = as_bytes(f.get(1)?)?;
@@ -1058,7 +1199,10 @@ mod tests {
     use super::*;
 
     fn dict(entries: Vec<(&str, OwnedValue)>) -> Dict {
-        entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+        entries
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
     }
 
     fn sample_settings() -> Settings {
@@ -1133,9 +1277,18 @@ mod tests {
         let mut s = sample_settings();
         let v4 = s.get_mut("ipv4").unwrap();
         v4.remove("dns");
-        v4.insert("dns-data".into(), ov(vec!["9.9.9.9#dns.quad9.net".to_string(), "1.1.1.1".to_string()]));
+        v4.insert(
+            "dns-data".into(),
+            ov(vec![
+                "9.9.9.9#dns.quad9.net".to_string(),
+                "1.1.1.1".to_string(),
+            ]),
+        );
         let d = parse_dns_settings(&s);
-        assert_eq!(d.v4_dns, vec![Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(1, 1, 1, 1)]);
+        assert_eq!(
+            d.v4_dns,
+            vec![Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(1, 1, 1, 1)]
+        );
     }
 
     #[test]
@@ -1183,7 +1336,9 @@ mod tests {
         let v6 = StructureBuilder::new()
             .add_field(0i32)
             .add_field(10i32)
-            .add_field(vec![0x26u8, 0x20, 0, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09])
+            .add_field(vec![
+                0x26u8, 0x20, 0, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09,
+            ])
             .add_field(0u16)
             .add_field("dns.quad9.net")
             .build()
@@ -1208,14 +1363,35 @@ mod tests {
             }
             Value::Dict(Dict::from(m))
         };
-        let v = Value::from(vec![entry("192.168.1.242", Some(24)), entry("10.0.0.2", Some(8))]);
-        assert_eq!(parse_address_data(&v), Some(("192.168.1.242".parse().unwrap(), Some(24))), "the first entry");
+        let v = Value::from(vec![
+            entry("192.168.1.242", Some(24)),
+            entry("10.0.0.2", Some(8)),
+        ]);
+        assert_eq!(
+            parse_address_data(&v),
+            Some(("192.168.1.242".parse().unwrap(), Some(24))),
+            "the first entry"
+        );
         let v = Value::from(vec![entry("192.168.1.242", None)]);
-        assert_eq!(parse_address_data(&v), Some(("192.168.1.242".parse().unwrap(), None)));
+        assert_eq!(
+            parse_address_data(&v),
+            Some(("192.168.1.242".parse().unwrap(), None))
+        );
         let v = Value::from(vec![entry("192.168.1.242", Some(99))]);
-        assert_eq!(parse_address_data(&v), Some(("192.168.1.242".parse().unwrap(), None)), "out of range is no prefix");
-        let v = Value::from(vec![entry("not-an-ip", Some(24)), entry("172.16.0.9", Some(16))]);
-        assert_eq!(parse_address_data(&v), Some(("172.16.0.9".parse().unwrap(), Some(16))), "skips a bad entry");
+        assert_eq!(
+            parse_address_data(&v),
+            Some(("192.168.1.242".parse().unwrap(), None)),
+            "out of range is no prefix"
+        );
+        let v = Value::from(vec![
+            entry("not-an-ip", Some(24)),
+            entry("172.16.0.9", Some(16)),
+        ]);
+        assert_eq!(
+            parse_address_data(&v),
+            Some(("172.16.0.9".parse().unwrap(), Some(16))),
+            "skips a bad entry"
+        );
         assert_eq!(parse_address_data(&Value::from(Vec::<Value>::new())), None);
         assert_eq!(parse_address_data(&Value::from(3u32)), None);
     }
@@ -1235,17 +1411,36 @@ mod tests {
                     .unwrap(),
             )
         };
-        assert_eq!(parse_global_current(&mk(0)), Some("9.9.9.9".parse().unwrap()));
-        assert_eq!(parse_global_current(&mk(4)), None, "a link's server is not a global one");
+        assert_eq!(
+            parse_global_current(&mk(0)),
+            Some("9.9.9.9".parse().unwrap())
+        );
+        assert_eq!(
+            parse_global_current(&mk(4)),
+            None,
+            "a link's server is not a global one"
+        );
         assert_eq!(parse_global_current(&Value::from(3u32)), None);
     }
 
     #[test]
     fn activation_reason_mapping() {
-        assert!(matches!(activation_error(Some(7)), NetError::Activation { auth: true, .. }));
-        assert!(matches!(activation_error(Some(11)), NetError::Activation { auth: true, .. }));
-        assert!(matches!(activation_error(Some(5)), NetError::Activation { auth: false, .. }));
-        assert!(matches!(activation_error(None), NetError::Activation { auth: false, .. }));
+        assert!(matches!(
+            activation_error(Some(7)),
+            NetError::Activation { auth: true, .. }
+        ));
+        assert!(matches!(
+            activation_error(Some(11)),
+            NetError::Activation { auth: true, .. }
+        ));
+        assert!(matches!(
+            activation_error(Some(5)),
+            NetError::Activation { auth: false, .. }
+        ));
+        assert!(matches!(
+            activation_error(None),
+            NetError::Activation { auth: false, .. }
+        ));
     }
 
     #[test]

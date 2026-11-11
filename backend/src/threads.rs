@@ -225,7 +225,8 @@ pub struct CanaryState {
     checked: Option<Instant>,
 }
 
-pub type ProbeFn = Arc<dyn Fn(&ProbeTarget, &ProbeRequest, &mut CanaryState) -> ProbeReport + Send + Sync>;
+pub type ProbeFn =
+    Arc<dyn Fn(&ProbeTarget, &ProbeRequest, &mut CanaryState) -> ProbeReport + Send + Sync>;
 
 pub fn real_probe() -> ProbeFn {
     Arc::new(run_probe)
@@ -240,7 +241,13 @@ struct NameProbe {
 /// One name, one server. A timeout is retried once at once (new id): Wi-Fi
 /// loses datagrams, and an outage should be 30 s of failures, not one drop.
 /// Every datagram sent is added to `own`.
-fn probe_name(addr: IpAddr, port: u16, name: &str, strict: bool, own: &mut OwnQueries) -> NameProbe {
+fn probe_name(
+    addr: IpAddr,
+    port: u16,
+    name: &str,
+    strict: bool,
+    own: &mut OwnQueries,
+) -> NameProbe {
     for attempt in 0..2 {
         let (sent, res) = dnswire::query_a_counted(
             SocketAddr::new(addr, port),
@@ -265,17 +272,26 @@ fn probe_name(addr: IpAddr, port: u16, name: &str, strict: bool, own: &mut OwnQu
             Err(_) => break,
         }
     }
-    NameProbe { ok: false, ms: None, blocked: false }
+    NameProbe {
+        ok: false,
+        ms: None,
+        blocked: false,
+    }
 }
 
 fn outcome(p: &NameProbe) -> ProbeOutcome {
-    ProbeOutcome { ok: p.ok, ms: p.ms, blocked: p.blocked }
+    ProbeOutcome {
+        ok: p.ok,
+        ms: p.ms,
+        blocked: p.blocked,
+    }
 }
 
 /// The canary probe: the dedicated name when the Pi-hole blocks it, the
 /// configured one otherwise.
 fn canary_probe(t: &ProbeTarget, st: &mut CanaryState, own: &mut OwnQueries) -> ProbeOutcome {
-    let look = st.dedicated == Some(true) || st.checked.is_none_or(|c| c.elapsed() >= DEDICATED_RECHECK);
+    let look =
+        st.dedicated == Some(true) || st.checked.is_none_or(|c| c.elapsed() >= DEDICATED_RECHECK);
     if !look {
         return outcome(&probe_name(t.addr, t.port, &t.canary, false, own));
     }
@@ -314,7 +330,10 @@ fn upstream_probe(addr: IpAddr, port: u16, own: &mut OwnQueries) -> bool {
         );
         own.total += sent;
         match res {
-            Ok(p) => return p.reply.rcode == dnswire::RCODE_NOERROR || p.reply.rcode == dnswire::RCODE_NXDOMAIN,
+            Ok(p) => {
+                return p.reply.rcode == dnswire::RCODE_NOERROR
+                    || p.reply.rcode == dnswire::RCODE_NXDOMAIN
+            }
             Err(DnsError::Timeout) if attempt == 0 => continue,
             Err(_) => return false,
         }
@@ -365,22 +384,38 @@ pub fn run_probe(t: &ProbeTarget, req: &ProbeRequest, st: &mut CanaryState) -> P
 
 /// The probe thread: one probe cycle per interval, immediately on a new
 /// target, and no more often than `min_gap` however often it is kicked.
-pub fn spawn_prober(tx: Sender<Event>, cadence: Cadence, probe: ProbeFn) -> (Sender<ProbeCtl>, JoinHandle<()>) {
+pub fn spawn_prober(
+    tx: Sender<Event>,
+    cadence: Cadence,
+    probe: ProbeFn,
+) -> (Sender<ProbeCtl>, JoinHandle<()>) {
     let (ctl_tx, ctl_rx) = mpsc::channel::<ProbeCtl>();
     let h = thread::spawn(move || {
         let mut target: Option<ProbeTarget> = None;
         let mut open = false;
         let mut canary = CanaryState::default();
-        let mut last = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
+        let mut last = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or_else(Instant::now);
         let mut last_upstream: Option<Instant> = None;
         let mut next_due = Instant::now();
         // Good cycles still needed before leaving the fast `suspect` cadence.
         let mut unsettled: u32 = 0;
         let interval = |open: bool, unsettled: u32| {
             let base = if open { cadence.open } else { cadence.closed };
-            if unsettled > 0 { base.min(cadence.suspect) } else { base }
+            if unsettled > 0 {
+                base.min(cadence.suspect)
+            } else {
+                base
+            }
         };
-        let upstream_every = |open: bool| if open { cadence.upstream_open } else { cadence.upstream_closed };
+        let upstream_every = |open: bool| {
+            if open {
+                cadence.upstream_open
+            } else {
+                cadence.upstream_closed
+            }
+        };
         loop {
             let now = Instant::now();
             let wait = if target.is_some() {
@@ -412,7 +447,8 @@ pub fn spawn_prober(tx: Sender<Event>, cadence: Cadence, probe: ProbeFn) -> (Sen
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(t) = &target {
                         let req = ProbeRequest {
-                            upstream: last_upstream.is_none_or(|u| u.elapsed() >= upstream_every(open)),
+                            upstream: last_upstream
+                                .is_none_or(|u| u.elapsed() >= upstream_every(open)),
                             icmp: open,
                         };
                         let report = probe(t, &req, &mut canary);
@@ -424,7 +460,11 @@ pub fn spawn_prober(tx: Sender<Event>, cadence: Cadence, probe: ProbeFn) -> (Sen
                             last_upstream = None;
                         }
                         let failed = !report.pihole.ok || report.upstream == Some(false);
-                        unsettled = if failed { cadence.settle_good } else { unsettled.saturating_sub(1) };
+                        unsettled = if failed {
+                            cadence.settle_good
+                        } else {
+                            unsettled.saturating_sub(1)
+                        };
                         next_due = last + interval(open, unsettled);
                         if tx.send(Event::Probe(report)).is_err() {
                             break;
@@ -468,9 +508,7 @@ pub type ApiFactory = Arc<dyn Fn(&ApiCfg) -> Result<Pihole, ApiError> + Send + S
 /// Both a missing secret and a keyring that will not answer are "auth"
 /// problems: they get the long backoff, not a retry every few seconds.
 fn password_fn(addr: IpAddr) -> crate::pihole::PasswordFn {
-    Box::new(move || {
-        config::lookup_password(addr).map_err(|e| ApiError::Auth(e.to_string()))
-    })
+    Box::new(move || config::lookup_password(addr).map_err(|e| ApiError::Auth(e.to_string())))
 }
 
 pub fn real_api_factory() -> ApiFactory {
@@ -499,9 +537,17 @@ fn failure(e: &ApiError) -> ApiReport {
 fn poll(api: &mut Pihole, with_history: bool, with_upstreams: bool) -> Result<ApiReport, ApiError> {
     let summary = api.summary()?;
     let blocking = api.blocking()?;
-    let history = if with_history { Some(api.history()?) } else { None };
+    let history = if with_history {
+        Some(api.history()?)
+    } else {
+        None
+    };
     // Nice to have: an older Pi-hole or an odd answer must not fail the poll.
-    let upstreams = if with_upstreams { api.upstreams().ok() } else { None };
+    let upstreams = if with_upstreams {
+        api.upstreams().ok()
+    } else {
+        None
+    };
     Ok(ApiReport {
         status: "ok",
         summary: Some(summary),
@@ -514,14 +560,20 @@ fn poll(api: &mut Pihole, with_history: bool, with_upstreams: bool) -> Result<Ap
 
 /// The API thread: polls only while open, reuses its session, and logs it
 /// out when told to stop (so `Stop` followed by `join` means "logged out").
-pub fn spawn_api(tx: Sender<Event>, timing: ApiTiming, factory: ApiFactory) -> (Sender<ApiCtl>, JoinHandle<()>) {
+pub fn spawn_api(
+    tx: Sender<Event>,
+    timing: ApiTiming,
+    factory: ApiFactory,
+) -> (Sender<ApiCtl>, JoinHandle<()>) {
     let (ctl_tx, ctl_rx) = mpsc::channel::<ApiCtl>();
     let h = thread::spawn(move || {
         let mut cfg: Option<ApiCfg> = None;
         let mut client: Option<Pihole> = None;
         let mut open = false;
         let mut next_poll = Instant::now();
-        let mut last_poll = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
+        let mut last_poll = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or_else(Instant::now);
         let mut last_history: Option<Instant> = None;
         let mut last_upstreams: Option<Instant> = None;
         // A failure's backoff: neither `Kick` nor `Open` may shorten it.
@@ -549,7 +601,9 @@ pub fn spawn_api(tx: Sender<Event>, timing: ApiTiming, factory: ApiFactory) -> (
                     if o {
                         // The Route view wants fresh upstream figures on open.
                         last_upstreams = None;
-                        next_poll = backoff_until.unwrap_or_else(Instant::now).max(Instant::now());
+                        next_poll = backoff_until
+                            .unwrap_or_else(Instant::now)
+                            .max(Instant::now());
                     } else if let Some(c) = client.as_mut() {
                         c.close_idle();
                     }
@@ -579,8 +633,10 @@ pub fn spawn_api(tx: Sender<Event>, timing: ApiTiming, factory: ApiFactory) -> (
                     }
                     let api = client.as_mut().expect("just created");
                     last_poll = Instant::now();
-                    let history_due = last_history.is_none_or(|t| t.elapsed() >= timing.history_every);
-                    let upstreams_due = last_upstreams.is_none_or(|t| t.elapsed() >= timing.history_every);
+                    let history_due =
+                        last_history.is_none_or(|t| t.elapsed() >= timing.history_every);
+                    let upstreams_due =
+                        last_upstreams.is_none_or(|t| t.elapsed() >= timing.history_every);
                     let res = poll(api, history_due, upstreams_due);
                     api.close_idle();
                     match res {
@@ -623,7 +679,12 @@ pub fn spawn_api(tx: Sender<Event>, timing: ApiTiming, factory: ApiFactory) -> (
 
 /// Stop both workers and wait for them. The API thread is joined last so its
 /// logout has really happened when this returns.
-pub fn stop_workers(probe: Sender<ProbeCtl>, probe_h: JoinHandle<()>, api: Sender<ApiCtl>, api_h: JoinHandle<()>) {
+pub fn stop_workers(
+    probe: Sender<ProbeCtl>,
+    probe_h: JoinHandle<()>,
+    api: Sender<ApiCtl>,
+    api_h: JoinHandle<()>,
+) {
     let _ = probe.send(ProbeCtl::Stop);
     let _ = api.send(ApiCtl::Stop);
     let _ = probe_h.join();
@@ -677,7 +738,10 @@ pub fn spawn_nm_watcher(tx: Sender<Event>) {
                     for msg in iter {
                         let Ok(msg) = msg else { break };
                         let hdr = msg.header();
-                        let path = hdr.path().map(|p| p.as_str().to_string()).unwrap_or_default();
+                        let path = hdr
+                            .path()
+                            .map(|p| p.as_str().to_string())
+                            .unwrap_or_default();
                         let kind = classify_nm_signal(&path);
                         if tx.send(Event::Nm(kind)).is_err() {
                             return;
@@ -740,12 +804,19 @@ mod tests {
         ProbeReport {
             target: t.addr,
             t: util::unix_now(),
-            pihole: ProbeOutcome { ok: true, ms: Some(1.0), blocked: true },
+            pihole: ProbeOutcome {
+                ok: true,
+                ms: Some(1.0),
+                blocked: true,
+            },
             gateway: None,
             gateway_blocked: None,
             api: None,
             upstream: req.upstream.then_some(true),
-            own: OwnQueries { total: 1, blocked: 1 },
+            own: OwnQueries {
+                total: 1,
+                blocked: 1,
+            },
             gateway_ms: req.icmp.then_some(0.5),
         }
     }
@@ -797,7 +868,10 @@ mod tests {
         ctl.send(ProbeCtl::Target(Some(tgt(53)))).unwrap();
         sleep(60);
         assert_eq!(seen.lock().unwrap().len(), 1, "immediately on a new target");
-        assert!(seen.lock().unwrap()[0].1.upstream, "the first cycle includes the upstream check");
+        assert!(
+            seen.lock().unwrap()[0].1.upstream,
+            "the first cycle includes the upstream check"
+        );
         assert!(!seen.lock().unwrap()[0].1.icmp, "closed: no ICMP");
         sleep(450);
         let n = seen.lock().unwrap().len();
@@ -820,7 +894,11 @@ mod tests {
                 let mut f = fails.lock().unwrap();
                 if *f > 0 {
                     *f -= 1;
-                    r.pihole = ProbeOutcome { ok: false, ms: None, blocked: false };
+                    r.pihole = ProbeOutcome {
+                        ok: false,
+                        ms: None,
+                        blocked: false,
+                    };
                 }
                 r
             })
@@ -836,7 +914,11 @@ mod tests {
         let before = seen.lock().unwrap().len();
         sleep(300);
         let after = seen.lock().unwrap().len();
-        assert!(after - before <= 2, "settled cadence is slow again, got {}", after - before);
+        assert!(
+            after - before <= 2,
+            "settled cadence is slow again, got {}",
+            after - before
+        );
         ctl.send(ProbeCtl::Stop).unwrap();
         h.join().unwrap();
     }
@@ -854,10 +936,21 @@ mod tests {
         {
             let s = seen.lock().unwrap();
             let open: Vec<_> = s.iter().skip(before).collect();
-            assert!(open.len() >= 8, "open cadence is ~30 ms, got {}", open.len());
-            assert!(open.iter().all(|(_, r)| r.icmp), "every open cycle pings the gateway");
+            assert!(
+                open.len() >= 8,
+                "open cadence is ~30 ms, got {}",
+                open.len()
+            );
+            assert!(
+                open.iter().all(|(_, r)| r.icmp),
+                "every open cycle pings the gateway"
+            );
             let upstream = open.iter().filter(|(_, r)| r.upstream).count();
-            assert!(upstream >= 2 && upstream < open.len() / 2, "upstream every ~100 ms: {upstream} of {}", open.len());
+            assert!(
+                upstream >= 2 && upstream < open.len() / 2,
+                "upstream every ~100 ms: {upstream} of {}",
+                open.len()
+            );
         }
         ctl.send(ProbeCtl::Open(false)).unwrap();
         sleep(60);
@@ -886,7 +979,11 @@ mod tests {
             ctl.send(ProbeCtl::Kick).unwrap();
         }
         sleep(60);
-        assert_eq!(seen.lock().unwrap().len(), 1, "held back by the minimum gap");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "held back by the minimum gap"
+        );
         sleep(250);
         assert_eq!(seen.lock().unwrap().len(), 2, "ten kicks, one probe");
         let s = seen.lock().unwrap();
@@ -911,7 +1008,10 @@ mod tests {
         ctl.send(ProbeCtl::Target(Some(tgt(53)))).unwrap();
         sleep(60);
         assert_eq!(seen.lock().unwrap().len(), n + 1);
-        assert!(seen.lock().unwrap().last().unwrap().1.upstream, "a new target gets a full first cycle");
+        assert!(
+            seen.lock().unwrap().last().unwrap().1.upstream,
+            "a new target gets a full first cycle"
+        );
         ctl.send(ProbeCtl::Stop).unwrap();
         h.join().unwrap();
     }
@@ -933,7 +1033,10 @@ mod tests {
         drop(ctl);
         let t0 = Instant::now();
         h.join().unwrap();
-        assert!(t0.elapsed() < Duration::from_millis(500), "owner gone, thread gone");
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "owner gone, thread gone"
+        );
     }
 
     #[test]
@@ -950,7 +1053,11 @@ mod tests {
             s2.lock().unwrap().push((Instant::now(), *req));
             let mut rep = ok_report(t, req);
             if (2..=3).contains(&*n) {
-                rep.pihole = ProbeOutcome { ok: false, ms: None, blocked: false };
+                rep.pihole = ProbeOutcome {
+                    ok: false,
+                    ms: None,
+                    blocked: false,
+                };
                 rep.upstream = None;
             }
             rep
@@ -970,8 +1077,14 @@ mod tests {
         assert!(!s[1].1.upstream, "just done, not due again on the clock");
         // Cycles 2 and 3 get no answer, so upstream was not (and could not
         // be) checked: it is asked for again every time until it runs.
-        assert!(s[2].1.upstream && s[3].1.upstream, "cycle 4 is the first answered one after the outage");
-        assert!(!s[4].1.upstream, "and once it has run it waits for its schedule again");
+        assert!(
+            s[2].1.upstream && s[3].1.upstream,
+            "cycle 4 is the first answered one after the outage"
+        );
+        assert!(
+            !s[4].1.upstream,
+            "and once it has run it waits for its schedule again"
+        );
     }
 
     // -- canary and upstream probing against a fake DNS server ---------------
@@ -1007,14 +1120,19 @@ mod tests {
                 }
                 let name = labels.join(".");
                 let question_end = p + 1 + 4; // root label + type + class
-                let edns = q.len() > question_end && q[question_end] == 0 && q[question_end + 1] == 0 && q[question_end + 2] == 41;
+                let edns = q.len() > question_end
+                    && q[question_end] == 0
+                    && q[question_end + 1] == 0
+                    && q[question_end + 2] == 41;
                 e2.lock().unwrap().push(edns);
                 let idx = {
                     let mut g = n2.lock().unwrap();
                     g.push(name.clone());
                     g.len()
                 };
-                let Some((rcode, ips)) = reply(&name, idx) else { continue };
+                let Some((rcode, ips)) = reply(&name, idx) else {
+                    continue;
+                };
                 // Echo the header and question only (the probes ask with an
                 // EDNS0 OPT record, which the answers must not be glued after).
                 let mut r = q[..question_end].to_vec();
@@ -1036,14 +1154,21 @@ mod tests {
                 let _ = sock.send_to(&r, from);
             }
         });
-        FakeDns { port, names, edns: edns_seen }
+        FakeDns {
+            port,
+            names,
+            edns: edns_seen,
+        }
     }
 
     const NULL: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
     const REAL: Ipv4Addr = Ipv4Addr::new(142, 250, 74, 14);
 
     fn req(upstream: bool) -> ProbeRequest {
-        ProbeRequest { upstream, icmp: false }
+        ProbeRequest {
+            upstream,
+            icmp: false,
+        }
     }
 
     #[test]
@@ -1057,10 +1182,20 @@ mod tests {
         let mut st = CanaryState::default();
         let r = run_probe(&t, &req(false), &mut st);
         assert!(r.pihole.ok && r.pihole.blocked);
-        assert_eq!(r.own, OwnQueries { total: 1, blocked: 1 });
+        assert_eq!(
+            r.own,
+            OwnQueries {
+                total: 1,
+                blocked: 1
+            }
+        );
         let r = run_probe(&t, &req(false), &mut st);
         assert!(r.pihole.blocked);
-        assert_eq!(*dns.names.lock().unwrap(), vec!["qnet-canary.invalid", "qnet-canary.invalid"], "never the real domain");
+        assert_eq!(
+            *dns.names.lock().unwrap(),
+            vec!["qnet-canary.invalid", "qnet-canary.invalid"],
+            "never the real domain"
+        );
     }
 
     #[test]
@@ -1074,11 +1209,27 @@ mod tests {
         let r = run_probe(&t, &req(false), &mut st);
         // First cycle looks for the dedicated name, then falls back.
         assert!(r.pihole.ok && r.pihole.blocked);
-        assert_eq!(r.own, OwnQueries { total: 2, blocked: 1 });
+        assert_eq!(
+            r.own,
+            OwnQueries {
+                total: 2,
+                blocked: 1
+            }
+        );
         // NXDOMAIN on the dedicated name must not read as "blocked".
-        assert_eq!(*dns.names.lock().unwrap(), vec!["qnet-canary.invalid", "doubleclick.net"]);
+        assert_eq!(
+            *dns.names.lock().unwrap(),
+            vec!["qnet-canary.invalid", "doubleclick.net"]
+        );
         let r = run_probe(&t, &req(false), &mut st);
-        assert_eq!(r.own, OwnQueries { total: 1, blocked: 1 }, "only the configured canary now");
+        assert_eq!(
+            r.own,
+            OwnQueries {
+                total: 1,
+                blocked: 1
+            },
+            "only the configured canary now"
+        );
         assert_eq!(dns.names.lock().unwrap().len(), 3);
         // Ten minutes later it looks again.
         st.checked = Instant::now().checked_sub(DEDICATED_RECHECK + Duration::from_secs(1));
@@ -1092,7 +1243,11 @@ mod tests {
         let p2 = paused.clone();
         let dns = fake_dns(move |name, _| {
             if *p2.lock().unwrap() {
-                return Some(if name == "qnet-canary.invalid" { (3, vec![]) } else { (0, vec![REAL]) });
+                return Some(if name == "qnet-canary.invalid" {
+                    (3, vec![])
+                } else {
+                    (0, vec![REAL])
+                });
             }
             Some((0, vec![NULL]))
         });
@@ -1103,7 +1258,11 @@ mod tests {
         let r = run_probe(&t, &req(false), &mut st);
         assert!(r.pihole.ok && !r.pihole.blocked, "answering, not blocking");
         assert_eq!(r.own.blocked, 0);
-        assert_eq!(st.dedicated, Some(true), "pause is not a missing deny entry");
+        assert_eq!(
+            st.dedicated,
+            Some(true),
+            "pause is not a missing deny entry"
+        );
         *paused.lock().unwrap() = false;
         assert!(run_probe(&t, &req(false), &mut st).pihole.blocked);
     }
@@ -1112,14 +1271,25 @@ mod tests {
     fn a_timed_out_probe_is_retried_once_at_once_and_every_datagram_is_counted() {
         // Swallow the first attempt (its datagram and the half-time resend),
         // answer the second attempt.
-        let dns = fake_dns(|_, idx| if idx <= 2 { None } else { Some((0, vec![NULL])) });
+        let dns = fake_dns(|_, idx| {
+            if idx <= 2 {
+                None
+            } else {
+                Some((0, vec![NULL]))
+            }
+        });
         let t = tgt(dns.port);
         let mut st = CanaryState::default();
         let t0 = Instant::now();
         let r = run_probe(&t, &req(false), &mut st);
         assert!(r.pihole.ok && r.pihole.blocked, "the retry got through");
-        assert_eq!(r.own.total, 3, "two lost datagrams and the one that was answered");
-        assert!(t0.elapsed() >= Duration::from_millis(1400) && t0.elapsed() < Duration::from_secs(4));
+        assert_eq!(
+            r.own.total, 3,
+            "two lost datagrams and the one that was answered"
+        );
+        assert!(
+            t0.elapsed() >= Duration::from_millis(1400) && t0.elapsed() < Duration::from_secs(4)
+        );
     }
 
     #[test]
@@ -1148,13 +1318,18 @@ mod tests {
         *mode.lock().unwrap() = 0; // NOERROR with nothing: fine too
         assert_eq!(run_probe(&t, &req(true), &mut st).upstream, Some(true));
         let names = dns.names.lock().unwrap();
-        let upstream: Vec<&String> = names.iter().filter(|n| n.ends_with(".example.com")).collect();
+        let upstream: Vec<&String> = names
+            .iter()
+            .filter(|n| n.ends_with(".example.com"))
+            .collect();
         assert_eq!(upstream.len(), 4);
         let mut uniq = upstream.clone();
         uniq.sort();
         uniq.dedup();
         assert_eq!(uniq.len(), 4, "a fresh label every time, never cached");
-        assert!(upstream.iter().all(|n| n.split('.').next().unwrap().len() == 16));
+        assert!(upstream
+            .iter()
+            .all(|n| n.split('.').next().unwrap().len() == 16));
     }
 
     #[test]
@@ -1165,7 +1340,10 @@ mod tests {
         let mut st = CanaryState::default();
         let r = run_probe(&t, &req(true), &mut st);
         assert!(!r.pihole.ok);
-        assert_eq!(r.upstream, None, "no point asking a silent server for upstream");
+        assert_eq!(
+            r.upstream, None,
+            "no point asking a silent server for upstream"
+        );
         assert_eq!(r.gateway, None, "no gateway known, no gate evidence");
     }
 
@@ -1179,9 +1357,23 @@ mod tests {
         let mut t = tgt(dns.port);
         t.gateway = Some("127.0.0.1".parse().unwrap());
         let mut st = CanaryState::default();
-        let r = run_probe(&t, &ProbeRequest { upstream: false, icmp: true }, &mut st);
+        let r = run_probe(
+            &t,
+            &ProbeRequest {
+                upstream: false,
+                icmp: true,
+            },
+            &mut st,
+        );
         assert!(r.gateway_ms.is_some_and(|ms| ms < 500.0));
-        let r = run_probe(&t, &ProbeRequest { upstream: false, icmp: false }, &mut st);
+        let r = run_probe(
+            &t,
+            &ProbeRequest {
+                upstream: false,
+                icmp: false,
+            },
+            &mut st,
+        );
         assert_eq!(r.gateway_ms, None);
     }
 
@@ -1200,7 +1392,10 @@ mod tests {
         assert!(r.pihole.ok && r.upstream == Some(true));
         let seen = dns.edns.lock().unwrap();
         assert!(seen.len() >= 2, "canary and upstream were both asked");
-        assert!(seen.iter().all(|e| *e), "{seen:?}: EDNS0 like systemd-resolved, so a server that mishandles it shows up here");
+        assert!(
+            seen.iter().all(|e| *e),
+            "{seen:?}: EDNS0 like systemd-resolved, so a server that mishandles it shows up here"
+        );
     }
 
     #[test]
@@ -1220,9 +1415,20 @@ mod tests {
         let r = run_probe(&t, &req(true), &mut st);
         assert!(r.pihole.ok);
         assert_eq!(r.upstream, Some(false));
-        assert_eq!(r.gateway, Some(true), "gate evidence collected for a degraded Pi-hole too");
-        assert_eq!(r.gateway_blocked, Some(false), "this router resolves for real");
-        assert_eq!(r.api, None, "the canary was answered: no need to ask the web API");
+        assert_eq!(
+            r.gateway,
+            Some(true),
+            "gate evidence collected for a degraded Pi-hole too"
+        );
+        assert_eq!(
+            r.gateway_blocked,
+            Some(false),
+            "this router resolves for real"
+        );
+        assert_eq!(
+            r.api, None,
+            "the canary was answered: no need to ask the web API"
+        );
         // A healthy Pi-hole is not bothering the router at all.
         let mut st = CanaryState::default();
         let dns2 = fake_dns(|_, _| Some((0, vec![NULL])));
@@ -1230,7 +1436,15 @@ mod tests {
         t2.gateway = Some("127.0.0.1".parse().unwrap());
         let r = run_probe(&t2, &req(true), &mut st);
         assert_eq!((r.gateway, r.gateway_blocked), (None, None));
-        assert_eq!(dns2.names.lock().unwrap().iter().filter(|n| *n == "doubleclick.net").count(), 0);
+        assert_eq!(
+            dns2.names
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|n| *n == "doubleclick.net")
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -1253,7 +1467,10 @@ mod tests {
         let srv = serve(3, |_, _| Some(ok_json("{}")));
         let silent = fake_dns(|_, _| None);
         let mut t = tgt(silent.port);
-        t.api = Some(ApiProbe { port: srv.addr.port(), pin: srv.fingerprint });
+        t.api = Some(ApiProbe {
+            port: srv.addr.port(),
+            pin: srv.fingerprint,
+        });
         let mut st = CanaryState::default();
         let r = run_probe(&t, &req(false), &mut st);
         assert!(!r.pihole.ok);
@@ -1261,8 +1478,14 @@ mod tests {
         // Answering canary: the API is left alone.
         let fine = fake_dns(|_, _| Some((0, vec![NULL])));
         let mut t = tgt(fine.port);
-        t.api = Some(ApiProbe { port: srv.addr.port(), pin: srv.fingerprint });
-        assert_eq!(run_probe(&t, &req(false), &mut CanaryState::default()).api, None);
+        t.api = Some(ApiProbe {
+            port: srv.addr.port(),
+            pin: srv.fingerprint,
+        });
+        assert_eq!(
+            run_probe(&t, &req(false), &mut CanaryState::default()).api,
+            None
+        );
     }
 
     #[test]
@@ -1270,18 +1493,43 @@ mod tests {
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let t = Duration::from_millis(600);
         // Pinned handshake completes: alive, even if the page is a 401.
-        let srv = serve(1, |_, _| Some(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}".to_vec()));
-        assert_eq!(check_api(ip, &ApiProbe { port: srv.addr.port(), pin: srv.fingerprint }, t), ApiLiveness::Alive);
+        let srv = serve(1, |_, _| {
+            Some(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}".to_vec())
+        });
+        assert_eq!(
+            check_api(
+                ip,
+                &ApiProbe {
+                    port: srv.addr.port(),
+                    pin: srv.fingerprint
+                },
+                t
+            ),
+            ApiLiveness::Alive
+        );
         // Another certificate: not the Pi-hole.
         let srv = serve(1, |_, _| Some(ok_json("{}")));
         let mut wrong = srv.fingerprint;
         wrong[0] ^= 1;
-        assert_eq!(check_api(ip, &ApiProbe { port: srv.addr.port(), pin: wrong }, t), ApiLiveness::Mismatch);
+        assert_eq!(
+            check_api(
+                ip,
+                &ApiProbe {
+                    port: srv.addr.port(),
+                    pin: wrong
+                },
+                t
+            ),
+            ApiLiveness::Mismatch
+        );
         // Nothing listening: dead.
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         drop(l);
-        assert_eq!(check_api(ip, &ApiProbe { port, pin: [0; 32] }, t), ApiLiveness::Dead);
+        assert_eq!(
+            check_api(ip, &ApiProbe { port, pin: [0; 32] }, t),
+            ApiLiveness::Dead
+        );
         // A host that accepts and never speaks: the deadline makes it dead.
         let srv = serve(1, |_, _| {
             thread::sleep(Duration::from_secs(2));
@@ -1289,11 +1537,22 @@ mod tests {
         });
         let t0 = Instant::now();
         assert_eq!(
-            check_api(ip, &ApiProbe { port: srv.addr.port(), pin: srv.fingerprint }, Duration::from_millis(300)),
+            check_api(
+                ip,
+                &ApiProbe {
+                    port: srv.addr.port(),
+                    pin: srv.fingerprint
+                },
+                Duration::from_millis(300)
+            ),
             ApiLiveness::Dead
         );
         assert!(t0.elapsed() < Duration::from_secs(2));
-        assert!(ApiLiveness::Alive.answered() && ApiLiveness::Mismatch.answered() && ApiLiveness::Other.answered());
+        assert!(
+            ApiLiveness::Alive.answered()
+                && ApiLiveness::Mismatch.answered()
+                && ApiLiveness::Other.answered()
+        );
         assert!(!ApiLiveness::Dead.answered());
     }
 
@@ -1310,13 +1569,19 @@ mod tests {
             if first.starts_with("POST /api/auth") {
                 Some(ok_json(LOGIN))
             } else if first.starts_with("GET /api/stats/summary") {
-                Some(ok_json(r#"{"queries":{"total":10,"blocked":2,"percent_blocked":20.0}}"#))
+                Some(ok_json(
+                    r#"{"queries":{"total":10,"blocked":2,"percent_blocked":20.0}}"#,
+                ))
             } else if first.starts_with("GET /api/dns/blocking") {
                 Some(ok_json(r#"{"blocking":"enabled","timer":null}"#))
             } else if first.starts_with("GET /api/stats/upstreams") {
-                Some(ok_json(r#"{"upstreams":[{"ip":"blocklist","name":"blocklist","port":-1,"count":5},{"ip":"9.9.9.9","name":"dns9.quad9.net","port":53,"count":9,"statistics":{"response":0.05}}],"forwarded_queries":9}"#))
+                Some(ok_json(
+                    r#"{"upstreams":[{"ip":"blocklist","name":"blocklist","port":-1,"count":5},{"ip":"9.9.9.9","name":"dns9.quad9.net","port":53,"count":9,"statistics":{"response":0.05}}],"forwarded_queries":9}"#,
+                ))
             } else if first.starts_with("GET /api/history") {
-                Some(ok_json(r#"{"history":[{"timestamp":600,"total":3,"blocked":1}]}"#))
+                Some(ok_json(
+                    r#"{"history":[{"timestamp":600,"total":3,"blocked":1}]}"#,
+                ))
             } else if first.starts_with("DELETE /api/auth") {
                 Some(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec())
             } else {
@@ -1326,7 +1591,11 @@ mod tests {
     }
 
     fn count(log: &Log, prefix: &str) -> usize {
-        log.lock().unwrap().iter().filter(|l| l.starts_with(prefix)).count()
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with(prefix))
+            .count()
     }
 
     fn timing() -> ApiTiming {
@@ -1342,13 +1611,15 @@ mod tests {
 
     fn factory_for(srv: &TestServer) -> ApiFactory {
         let (addr, fp) = (srv.addr, srv.fingerprint);
-        Arc::new(move |_c| {
-            Pihole::at(addr, fp, Box::new(|| Ok(Zeroizing::new("pw".to_string()))))
-        })
+        Arc::new(move |_c| Pihole::at(addr, fp, Box::new(|| Ok(Zeroizing::new("pw".to_string())))))
     }
 
     fn cfg() -> ApiCfg {
-        ApiCfg { addr: "127.0.0.1".parse().unwrap(), port: 443, pin: [0; 32] }
+        ApiCfg {
+            addr: "127.0.0.1".parse().unwrap(),
+            port: 443,
+            pin: [0; 32],
+        }
     }
 
     fn api_events(rx: &mpsc::Receiver<Event>) -> Vec<ApiReport> {
@@ -1369,7 +1640,10 @@ mod tests {
         let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         sleep(200);
-        assert!(log.lock().unwrap().is_empty(), "closed panel: no HTTPS at all");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "closed panel: no HTTPS at all"
+        );
         assert!(api_events(&rx).is_empty());
 
         ctl.send(ApiCtl::Open(true)).unwrap();
@@ -1378,7 +1652,10 @@ mod tests {
         assert!(reports.len() >= 2, "{} reports", reports.len());
         assert_eq!(reports[0].status, "ok");
         assert_eq!(reports[0].summary.unwrap().total, 10);
-        assert!(reports[0].history.is_some(), "history comes with the first poll");
+        assert!(
+            reports[0].history.is_some(),
+            "history comes with the first poll"
+        );
         assert!(reports[1].history.is_none(), "and not on every poll");
         assert_eq!(count(&log, "POST /api/auth"), 1, "one login for all of it");
 
@@ -1386,12 +1663,20 @@ mod tests {
         sleep(60);
         let frozen = count(&log, "GET /api/stats/summary");
         sleep(300);
-        assert_eq!(count(&log, "GET /api/stats/summary"), frozen, "closed again: silent");
+        assert_eq!(
+            count(&log, "GET /api/stats/summary"),
+            frozen,
+            "closed again: silent"
+        );
 
         let t0 = Instant::now();
         ctl.send(ApiCtl::Stop).unwrap();
         h.join().unwrap();
-        assert_eq!(count(&log, "DELETE /api/auth"), 1, "logged out before the thread ended");
+        assert_eq!(
+            count(&log, "DELETE /api/auth"),
+            1,
+            "logged out before the thread ended"
+        );
         assert!(t0.elapsed() < Duration::from_secs(2));
     }
 
@@ -1403,7 +1688,11 @@ mod tests {
         let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         sleep(150);
-        assert_eq!(count(&log, "GET /api/stats/upstreams"), 0, "closed: nothing");
+        assert_eq!(
+            count(&log, "GET /api/stats/upstreams"),
+            0,
+            "closed: nothing"
+        );
         ctl.send(ApiCtl::Open(true)).unwrap();
         sleep(250);
         let first = api_events(&rx);
@@ -1439,7 +1728,9 @@ mod tests {
             if first.starts_with("POST /api/auth") {
                 Some(ok_json(LOGIN))
             } else if first.starts_with("GET /api/stats/summary") {
-                Some(ok_json(r#"{"queries":{"total":10,"blocked":2,"percent_blocked":20.0}}"#))
+                Some(ok_json(
+                    r#"{"queries":{"total":10,"blocked":2,"percent_blocked":20.0}}"#,
+                ))
             } else if first.starts_with("GET /api/dns/blocking") {
                 Some(ok_json(r#"{"blocking":"enabled","timer":null}"#))
             } else if first.starts_with("GET /api/history") {
@@ -1459,7 +1750,9 @@ mod tests {
         sleep(250);
         let reports = api_events(&rx);
         assert!(!reports.is_empty());
-        assert!(reports.iter().all(|r| r.status == "ok" && r.upstreams.is_none()));
+        assert!(reports
+            .iter()
+            .all(|r| r.status == "ok" && r.upstreams.is_none()));
         ctl.send(ApiCtl::Stop).unwrap();
         h.join().unwrap();
     }
@@ -1478,7 +1771,10 @@ mod tests {
         let polls = count(&log, "GET /api/stats/summary");
         let hist = count(&log, "GET /api/history");
         assert!(polls >= 5, "polls every ~80 ms over 900 ms, got {polls}");
-        assert!((2..=3).contains(&hist), "history every ~500 ms, got {hist} for {polls} polls");
+        assert!(
+            (2..=3).contains(&hist),
+            "history every ~500 ms, got {hist} for {polls} polls"
+        );
     }
 
     #[test]
@@ -1493,13 +1789,25 @@ mod tests {
         assert_eq!(count(&log, "POST /api/auth"), 1);
         ctl.send(ApiCtl::Config(None)).unwrap();
         sleep(100);
-        assert_eq!(count(&log, "DELETE /api/auth"), 1, "unconfigured: session ended");
+        assert_eq!(
+            count(&log, "DELETE /api/auth"),
+            1,
+            "unconfigured: session ended"
+        );
         let before = count(&log, "GET /api/stats/summary");
         sleep(250);
-        assert_eq!(count(&log, "GET /api/stats/summary"), before, "nothing to poll");
+        assert_eq!(
+            count(&log, "GET /api/stats/summary"),
+            before,
+            "nothing to poll"
+        );
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         sleep(250);
-        assert_eq!(count(&log, "POST /api/auth"), 2, "a new configuration logs in afresh");
+        assert_eq!(
+            count(&log, "POST /api/auth"),
+            2,
+            "a new configuration logs in afresh"
+        );
         ctl.send(ApiCtl::Stop).unwrap();
         h.join().unwrap();
         assert_eq!(count(&log, "DELETE /api/auth"), 2);
@@ -1537,7 +1845,10 @@ mod tests {
         ctl.send(ApiCtl::Open(false)).unwrap();
         ctl.send(ApiCtl::Open(true)).unwrap();
         sleep(400);
-        assert!(api_events(&rx).is_empty(), "refresh and reopening do not hammer the keyring");
+        assert!(
+            api_events(&rx).is_empty(),
+            "refresh and reopening do not hammer the keyring"
+        );
         assert_eq!(*attempts.lock().unwrap(), 1);
         // A new configuration (e.g. after setup) does reset it.
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
@@ -1583,7 +1894,11 @@ mod tests {
         assert_eq!(count(&log, "DELETE /api/auth"), 0);
         let t0 = Instant::now();
         stop_workers(ptx, ph, atx, ah);
-        assert_eq!(count(&log, "DELETE /api/auth"), 1, "no sleep needed: the join waited for the logout");
+        assert_eq!(
+            count(&log, "DELETE /api/auth"),
+            1,
+            "no sleep needed: the join waited for the logout"
+        );
         assert!(t0.elapsed() < Duration::from_secs(2));
         // Nothing keeps running afterwards.
         while rx.try_recv().is_ok() {}
@@ -1606,7 +1921,11 @@ mod tests {
         let t0 = Instant::now();
         ctl.send(ApiCtl::Stop).unwrap();
         h.join().unwrap();
-        assert!(t0.elapsed() < Duration::from_secs(8), "bounded by the 3 s request timeout: {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_secs(8),
+            "bounded by the 3 s request timeout: {:?}",
+            t0.elapsed()
+        );
     }
 
     /// Read-only checks against the real machine: `cargo test live_ -- --ignored`.
@@ -1615,15 +1934,30 @@ mod tests {
     fn live_api_liveness_and_the_gateway_mac() {
         let cfg = crate::config::load(&util::config_path()).expect("config");
         let p = cfg.pihole.expect("a configured Pi-hole");
-        let probe = ApiProbe { port: 443, pin: p.tls_sha256 };
-        assert_eq!(check_api(p.address, &probe, Duration::from_millis(1500)), ApiLiveness::Alive);
+        let probe = ApiProbe {
+            port: 443,
+            pin: p.tls_sha256,
+        };
+        assert_eq!(
+            check_api(p.address, &probe, Duration::from_millis(1500)),
+            ApiLiveness::Alive
+        );
         let mut wrong = probe;
         wrong.pin[0] ^= 1;
-        assert_eq!(check_api(p.address, &wrong, Duration::from_millis(1500)), ApiLiveness::Mismatch);
-        let gw: Ipv4Addr = std::env::var("QNET_LIVE_GATEWAY").unwrap_or_else(|_| "192.168.1.1".into()).parse().unwrap();
+        assert_eq!(
+            check_api(p.address, &wrong, Duration::from_millis(1500)),
+            ApiLiveness::Mismatch
+        );
+        let gw: Ipv4Addr = std::env::var("QNET_LIVE_GATEWAY")
+            .unwrap_or_else(|_| "192.168.1.1".into())
+            .parse()
+            .unwrap();
         let iface = std::env::var("QNET_LIVE_IFACE").unwrap_or_else(|_| "wlp7s0".into());
         let mac = crate::neigh::mac_of(gw, &iface).expect("gateway in the neighbour table");
-        eprintln!("gateway {gw} on {iface} is {}", crate::neigh::format_mac(&mac));
+        eprintln!(
+            "gateway {gw} on {iface} is {}",
+            crate::neigh::format_mac(&mac)
+        );
         let q = crate::rstate::real_check(p.address);
         eprintln!("resolved's view of {}: {q:?}", p.address);
     }

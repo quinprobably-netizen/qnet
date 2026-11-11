@@ -99,7 +99,8 @@ struct RawFailover {
 }
 
 pub fn parse(text: &str) -> Result<Config, String> {
-    let raw: RawConfig = toml::from_str(text).map_err(|e| format!("config.toml: {}", e.message()))?;
+    let raw: RawConfig =
+        toml::from_str(text).map_err(|e| format!("config.toml: {}", e.message()))?;
     let pihole = match raw.pihole {
         None => None,
         Some(p) => {
@@ -108,8 +109,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 .trim()
                 .parse()
                 .map_err(|_| "config.toml: pihole.address must be an IP address".to_string())?;
-            let tls_sha256 = util::parse_fingerprint(&p.tls_sha256)
-                .ok_or_else(|| "config.toml: pihole.tls_sha256 must be a SHA-256 fingerprint".to_string())?;
+            let tls_sha256 = util::parse_fingerprint(&p.tls_sha256).ok_or_else(|| {
+                "config.toml: pihole.tls_sha256 must be a SHA-256 fingerprint".to_string()
+            })?;
             let canary = p.canary.unwrap_or_else(|| DEFAULT_CANARY.to_string());
             if !util::valid_dns_name(&canary) {
                 return Err("config.toml: pihole.canary is not a valid host name".into());
@@ -131,7 +133,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 "router" => Fallback::Router,
                 "quad9" => Fallback::Quad9,
                 "cloudflare" => Fallback::Cloudflare,
-                _ => return Err("config.toml: failover.fallback must be router, quad9 or cloudflare".into()),
+                _ => {
+                    return Err(
+                        "config.toml: failover.fallback must be router, quad9 or cloudflare".into(),
+                    )
+                }
             };
         }
     }
@@ -156,7 +162,9 @@ pub fn save_pihole(
     canary: Option<&str>,
 ) -> Result<(), String> {
     let mut doc: toml::Table = match std::fs::read_to_string(path) {
-        Ok(t) => t.parse().map_err(|e: toml::de::Error| format!("config.toml: {}", e.message()))?,
+        Ok(t) => t
+            .parse()
+            .map_err(|e: toml::de::Error| format!("config.toml: {}", e.message()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(e) => return Err(format!("config.toml: {e}")),
     };
@@ -237,9 +245,12 @@ pub fn lookup_password(address: IpAddr) -> Result<Zeroizing<String>, SecretError
         return Err(SecretError::Failed("keyring did not answer".into()));
     }
     if !out.success() || out.stdout.is_empty() {
-        return Err(SecretError::Missing("no app password in the keyring".into()));
+        return Err(SecretError::Missing(
+            "no app password in the keyring".into(),
+        ));
     }
-    let s = std::str::from_utf8(&out.stdout).map_err(|_| SecretError::Failed("secret is not UTF-8".into()))?;
+    let s = std::str::from_utf8(&out.stdout)
+        .map_err(|_| SecretError::Failed("secret is not UTF-8".into()))?;
     Ok(Zeroizing::new(s.trim_end_matches(['\n', '\r']).to_string()))
 }
 
@@ -249,7 +260,9 @@ pub fn store_password(address: IpAddr, secret: &str) -> Result<(), SecretError> 
     let label = format!("qnet Pi-hole {addr}");
     let out = crate::proc::run(
         "secret-tool",
-        &["store", "--label", &label, "service", "qnet", "pihole", &addr],
+        &[
+            "store", "--label", &label, "service", "qnet", "pihole", &addr,
+        ],
         Some(secret.as_bytes()),
         SECRET_TIMEOUT,
         4096,
@@ -258,7 +271,9 @@ pub fn store_password(address: IpAddr, secret: &str) -> Result<(), SecretError> 
     if out.success() {
         Ok(())
     } else {
-        Err(SecretError::Failed("could not store the secret in the keyring".into()))
+        Err(SecretError::Failed(
+            "could not store the secret in the keyring".into(),
+        ))
     }
 }
 
@@ -278,7 +293,13 @@ mod tests {
         assert_eq!(p.address, "192.168.1.153".parse::<IpAddr>().unwrap());
         assert_eq!(p.canary, "doubleclick.net");
         assert_eq!(util::format_fingerprint(&p.tls_sha256), FP);
-        assert_eq!(c.failover, FailoverCfg { enabled: true, fallback: Fallback::Router });
+        assert_eq!(
+            c.failover,
+            FailoverCfg {
+                enabled: true,
+                fallback: Fallback::Router
+            }
+        );
     }
 
     #[test]
@@ -300,7 +321,8 @@ mod tests {
         assert!(parse(&bad_addr).unwrap_err().contains("IP address"));
         let bad_fp = "[pihole]\naddress = \"10.0.0.2\"\ntls_sha256 = \"abc\"\n";
         assert!(parse(bad_fp).unwrap_err().contains("SHA-256"));
-        let bad_canary = format!("[pihole]\naddress = \"10.0.0.2\"\ntls_sha256 = \"{FP}\"\ncanary = \"a b\"\n");
+        let bad_canary =
+            format!("[pihole]\naddress = \"10.0.0.2\"\ntls_sha256 = \"{FP}\"\ncanary = \"a b\"\n");
         assert!(parse(&bad_canary).unwrap_err().contains("canary"));
         assert!(parse("[failover]\nfallback = \"evil\"\n").is_err());
         assert!(parse("this is not toml").is_err());
@@ -309,10 +331,16 @@ mod tests {
     #[test]
     fn fallback_servers() {
         let gw = Some(Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(Fallback::Router.servers(gw), vec![Ipv4Addr::new(192, 168, 1, 1)]);
+        assert_eq!(
+            Fallback::Router.servers(gw),
+            vec![Ipv4Addr::new(192, 168, 1, 1)]
+        );
         assert!(Fallback::Router.servers(None).is_empty());
         assert_eq!(Fallback::Quad9.servers(None)[0], Ipv4Addr::new(9, 9, 9, 9));
-        assert_eq!(Fallback::Cloudflare.servers(None)[0], Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(
+            Fallback::Cloudflare.servers(None)[0],
+            Ipv4Addr::new(1, 1, 1, 1)
+        );
     }
 
     #[test]
@@ -327,7 +355,9 @@ mod tests {
 
         // Hand-edit: custom canary + failover choice, then re-run setup.
         let mut text = std::fs::read_to_string(&p).unwrap();
-        text = text.replace("doubleclick.net", "ads.example.com").replace("router", "quad9");
+        text = text
+            .replace("doubleclick.net", "ads.example.com")
+            .replace("router", "quad9");
         std::fs::write(&p, text).unwrap();
         let fp2 = [7u8; 32];
         save_pihole(&p, "192.168.1.200".parse().unwrap(), &fp2, None).unwrap();
@@ -342,6 +372,9 @@ mod tests {
     #[test]
     fn missing_file_is_default() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load(&dir.path().join("nope.toml")).unwrap(), Config::default());
+        assert_eq!(
+            load(&dir.path().join("nope.toml")).unwrap(),
+            Config::default()
+        );
     }
 }

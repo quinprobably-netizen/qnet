@@ -52,7 +52,10 @@ impl std::fmt::Display for HttpError {
             HttpError::Connect(e) => write!(f, "connect: {e}"),
             HttpError::Timeout => write!(f, "timed out"),
             HttpError::PinMismatch(got) => {
-                write!(f, "certificate does not match the pinned fingerprint (saw {got})")
+                write!(
+                    f,
+                    "certificate does not match the pinned fingerprint (saw {got})"
+                )
             }
             HttpError::Tls(e) => write!(f, "TLS: {e}"),
             HttpError::TooLarge => write!(f, "response too large"),
@@ -272,7 +275,9 @@ fn read_head<R: BufRead>(r: &mut R) -> Result<Head, HttpError> {
     let mut parts = status_line.splitn(3, ' ');
     let version = parts.next().unwrap_or("");
     if !version.starts_with("HTTP/1.") {
-        return Err(HttpError::Protocol(format!("bad status line {status_line:?}")));
+        return Err(HttpError::Protocol(format!(
+            "bad status line {status_line:?}"
+        )));
     }
     let status: u16 = parts
         .next()
@@ -353,7 +358,8 @@ fn read_response<R: BufRead>(
     cap: usize,
 ) -> Result<(Response, bool), HttpError> {
     let head = read_head(r)?;
-    let no_body = head_request || head.status == 204 || head.status == 304 || head.status / 100 == 1;
+    let no_body =
+        head_request || head.status == 204 || head.status == 304 || head.status / 100 == 1;
     let mut reusable = !head.close && !head.http10;
     let body = if no_body {
         Vec::new()
@@ -450,7 +456,10 @@ impl HttpsClient {
             .filter(|d| !d.is_zero())
             .ok_or(HttpError::Timeout)?;
         let sock = TcpStream::connect_timeout(&self.addr, left).map_err(|e| {
-            if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
+            if matches!(
+                e.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) {
                 HttpError::Timeout
             } else {
                 HttpError::Connect(e.to_string())
@@ -649,7 +658,9 @@ pub mod testutil {
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             for n in 0..conns {
-                let Ok((sock, _)) = listener.accept() else { return };
+                let Ok((sock, _)) = listener.accept() else {
+                    return;
+                };
                 let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
                 let conn = rustls::ServerConnection::new(cfg.clone()).unwrap();
                 let mut tls = StreamOwned::new(conn, sock);
@@ -794,7 +805,9 @@ mod tests {
             Some(ok_json(r#"{"ok":true}"#))
         });
         let mut c = HttpsClient::new(srv.addr, Some(srv.fingerprint)).unwrap();
-        let r = c.request("GET", "/api/ping", &[("X-FTL-SID", "abc")], None).unwrap();
+        let r = c
+            .request("GET", "/api/ping", &[("X-FTL-SID", "abc")], None)
+            .unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(r.body, br#"{"ok":true}"#);
         c.close();
@@ -943,7 +956,10 @@ mod tests {
     fn chunked_cap_and_garbage() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n20\r\n";
         let mut r = BufReader::new(Cursor::new(&raw[..]));
-        assert_eq!(read_response(&mut r, false, 16).unwrap_err(), HttpError::TooLarge);
+        assert_eq!(
+            read_response(&mut r, false, 16).unwrap_err(),
+            HttpError::TooLarge
+        );
 
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n";
         let mut r = BufReader::new(Cursor::new(&raw[..]));
@@ -993,11 +1009,20 @@ mod tests {
         let mut wrong = srv.fingerprint;
         wrong[0] ^= 0xFF;
         let mut c = HttpsClient::new(srv.addr, Some(wrong)).unwrap();
-        assert!(matches!(c.request("GET", "/x", &[], None), Err(HttpError::PinMismatch(_))));
+        assert!(matches!(
+            c.request("GET", "/x", &[], None),
+            Err(HttpError::PinMismatch(_))
+        ));
         srv.handle.join().unwrap();
         // The server is gone now. This failure is a plain connect error, and
         // must be reported as one rather than as the earlier mismatch.
-        assert!(matches!(c.request("GET", "/x", &[], None), Err(HttpError::Connect(_))), "stale flag");
+        assert!(
+            matches!(
+                c.request("GET", "/x", &[], None),
+                Err(HttpError::Connect(_))
+            ),
+            "stale flag"
+        );
         assert!(!c.verifier.mismatched());
     }
 
@@ -1008,7 +1033,9 @@ mod tests {
         pin[0] ^= 1;
         let v = PinVerifier::new(Some(pin));
         let name = ServerName::try_from("pi.hole").unwrap();
-        assert!(v.verify_server_cert(&CertificateDer::from(der), &[], &name, &[], UnixTime::now()).is_err());
+        assert!(v
+            .verify_server_cert(&CertificateDer::from(der), &[], &name, &[], UnixTime::now())
+            .is_err());
         assert!(v.mismatched() && v.seen().is_some());
         v.reset();
         assert!(!v.mismatched() && v.seen().is_none());

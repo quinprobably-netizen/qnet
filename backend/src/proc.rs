@@ -37,7 +37,9 @@ type Captured = Arc<Mutex<Zeroizing<Vec<u8>>>>;
 /// Read `r` into a shared buffer (capped); the receiver fires at EOF.
 fn drain<R: Read + Send + 'static>(mut r: R, cap: usize) -> (Captured, Receiver<()>) {
     // Reserve up front so growth never leaves unwiped copies behind.
-    let buf: Captured = Arc::new(Mutex::new(Zeroizing::new(Vec::with_capacity(cap.min(1 << 16)))));
+    let buf: Captured = Arc::new(Mutex::new(Zeroizing::new(Vec::with_capacity(
+        cap.min(1 << 16),
+    ))));
     let sink = buf.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -81,7 +83,11 @@ pub fn run(
     let mut child = Command::new(program)
         .args(args)
         .process_group(0)
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
@@ -138,13 +144,27 @@ mod tests {
 
     #[test]
     fn args_are_not_interpreted_by_a_shell() {
-        let o = run("echo", &["$(id)", ";", "`id`"], None, Duration::from_secs(5), 1024).unwrap();
+        let o = run(
+            "echo",
+            &["$(id)", ";", "`id`"],
+            None,
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap();
         assert_eq!(&o.stdout[..], b"$(id) ; `id`\n");
     }
 
     #[test]
     fn caps_output_and_reports_exit_code() {
-        let o = run("sh", &["-c", "yes | head -c 100000; exit 3"], None, Duration::from_secs(5), 100).unwrap();
+        let o = run(
+            "sh",
+            &["-c", "yes | head -c 100000; exit 3"],
+            None,
+            Duration::from_secs(5),
+            100,
+        )
+        .unwrap();
         assert_eq!(o.stdout.len(), 100);
         assert_eq!(o.code, Some(3));
     }
@@ -171,30 +191,58 @@ mod tests {
         .unwrap();
         assert!(o.timed_out);
         assert_eq!(&o.stdout[..], b"partial\n");
-        assert!(t0.elapsed() < Duration::from_secs(3), "must not wait for the grandchild");
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "must not wait for the grandchild"
+        );
     }
 
     #[test]
     fn a_grandchild_holding_the_pipe_cannot_hang_us() {
         // The shell exits at once; the background sleep keeps stdout open.
         let t0 = Instant::now();
-        let o = run("sh", &["-c", "echo hi; sleep 8 &"], None, Duration::from_secs(5), 1024).unwrap();
+        let o = run(
+            "sh",
+            &["-c", "echo hi; sleep 8 &"],
+            None,
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap();
         assert!(!o.timed_out);
         assert_eq!(&o.stdout[..], b"hi\n");
-        assert!(t0.elapsed() < Duration::from_secs(3), "returned after {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "returned after {:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]
     fn a_child_that_never_reads_stdin_does_not_block() {
         let big = vec![b'x'; 1 << 20];
         let t0 = Instant::now();
-        let o = run("sh", &["-c", "exit 0"], Some(&big), Duration::from_secs(5), 16).unwrap();
+        let o = run(
+            "sh",
+            &["-c", "exit 0"],
+            Some(&big),
+            Duration::from_secs(5),
+            16,
+        )
+        .unwrap();
         assert!(o.success());
         assert!(t0.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
     fn missing_program_is_an_error() {
-        assert!(run("/nonexistent/qnet-test", &[], None, Duration::from_secs(1), 1).is_err());
+        assert!(run(
+            "/nonexistent/qnet-test",
+            &[],
+            None,
+            Duration::from_secs(1),
+            1
+        )
+        .is_err());
     }
 }

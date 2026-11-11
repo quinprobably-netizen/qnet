@@ -90,7 +90,9 @@ pub fn run(
     let addr = match addr {
         Some(a) => a,
         None => {
-            let typed = prompt.line("Pi-hole address: ").map_err(|e| ActionErr::new("io", e))?;
+            let typed = prompt
+                .line("Pi-hole address: ")
+                .map_err(|e| ActionErr::new("io", e))?;
             typed
                 .trim()
                 .parse::<IpAddr>()
@@ -109,18 +111,28 @@ pub fn run(
         .map_err(|e| ActionErr::new("unreachable", format!("could not reach {target}: {e}")))?;
     match existing_pin {
         Some(old) if old == pin => {
-            prompt.say(&format!("Certificate matches the pinned fingerprint ({}).", format_fingerprint(&pin)));
+            prompt.say(&format!(
+                "Certificate matches the pinned fingerprint ({}).",
+                format_fingerprint(&pin)
+            ));
         }
         Some(old) => {
             prompt.say("!!! CERTIFICATE CHANGED !!!");
-            prompt.say(&format!("CERTIFICATE CHANGED (was {}, now {})", format_fingerprint(&old), format_fingerprint(&pin)));
+            prompt.say(&format!(
+                "CERTIFICATE CHANGED (was {}, now {})",
+                format_fingerprint(&old),
+                format_fingerprint(&pin)
+            ));
             prompt.say("The Pi-hole's certificate is not the one pinned earlier. That happens when you reinstall it");
             prompt.say("or renew its certificate, and also when something is impersonating it.");
             let typed = prompt
                 .line("Type \"yes\" to trust the new certificate and send the password: ")
                 .map_err(|e| ActionErr::new("io", e))?;
             if typed.trim() != "yes" {
-                return Err(ActionErr::new("declined", "certificate change not accepted"));
+                return Err(ActionErr::new(
+                    "declined",
+                    "certificate change not accepted",
+                ));
             }
         }
         None => {
@@ -148,7 +160,12 @@ pub fn run(
     // If this cannot be read, stop: a later rollback would otherwise "restore"
     // an empty hash over an app password that was really there.
     let current = match ph.json("GET", "/api/config/webserver/api", None) {
-        Ok(v) if v.pointer("/config/webserver/api").is_some_and(Value::is_object) => v,
+        Ok(v)
+            if v.pointer("/config/webserver/api")
+                .is_some_and(Value::is_object) =>
+        {
+            v
+        }
         Ok(_) => {
             ph.logout();
             return Err(ActionErr::new(
@@ -175,7 +192,8 @@ pub fn run(
     let in_keyring = secrets.exists(addr);
     if !old_hash.is_empty() || in_keyring {
         prompt.say("This Pi-hole already has an app password (or one is stored for it here).");
-        prompt.say("Creating a new one REPLACES it: anything using the old password stops working.");
+        prompt
+            .say("Creating a new one REPLACES it: anything using the old password stops working.");
         if !prompt.confirm("Replace the existing app password?") {
             ph.logout();
             return Err(ActionErr::new("declined", "kept the existing app password"));
@@ -220,7 +238,9 @@ pub fn run(
     //    falls back to the configured canary.
     let canary = match add_canary_domain(&mut ph) {
         Ok(true) => {
-            prompt.say(&format!("Added {DEDICATED_CANARY} to the deny list (comment \"qnet canary\")."));
+            prompt.say(&format!(
+                "Added {DEDICATED_CANARY} to the deny list (comment \"qnet canary\")."
+            ));
             "added"
         }
         Ok(false) => "present",
@@ -337,13 +357,18 @@ mod tests {
                 .find_map(|l| l.strip_prefix("X-FTL-SID: "))
                 .unwrap_or("")
                 .to_string();
-            let unauthorized = || Some(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}".to_vec());
+            let unauthorized =
+                || Some(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}".to_vec());
             if first.starts_with("POST /api/auth") {
                 let pw_ok = body.contains("web-secret") || body.contains("app-secret");
                 if pw_ok {
                     let mut n = logins.lock().unwrap();
                     *n += 1;
-                    let kind = if body.contains("web-secret") { "WEB" } else { "APP" };
+                    let kind = if body.contains("web-secret") {
+                        "WEB"
+                    } else {
+                        "APP"
+                    };
                     Some(ok_json(&format!(
                         r#"{{"session":{{"valid":true,"sid":"{kind}{n}","validity":300}}}}"#
                     )))
@@ -352,9 +377,12 @@ mod tests {
                 }
             } else if !first.starts_with("DELETE") && dead.lock().unwrap().contains(&sid) {
                 unauthorized()
-            } else if first.starts_with("GET /api/config/webserver/api") && existing_hash == "@500" {
+            } else if first.starts_with("GET /api/config/webserver/api") && existing_hash == "@500"
+            {
                 Some(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\n\r\n{}".to_vec())
-            } else if first.starts_with("GET /api/config/webserver/api") && existing_hash == "@shape" {
+            } else if first.starts_with("GET /api/config/webserver/api")
+                && existing_hash == "@shape"
+            {
                 Some(ok_json(r#"{"took":0.1}"#))
             } else if first.starts_with("GET /api/config/webserver/api") {
                 Some(ok_json(&format!(
@@ -371,7 +399,9 @@ mod tests {
                 }
             } else if first.starts_with("GET /api/auth/app") {
                 dead.lock().unwrap().push(sid);
-                Some(ok_json(r#"{"app":{"password":"app-secret","hash":"$BALLOON-HASH"}}"#))
+                Some(ok_json(
+                    r#"{"app":{"password":"app-secret","hash":"$BALLOON-HASH"}}"#,
+                ))
             } else if first.starts_with("PATCH /api/config") {
                 Some(ok_json(r#"{"config":{}}"#))
             } else if first.starts_with("DELETE /api/auth") {
@@ -383,12 +413,7 @@ mod tests {
     }
 
     /// Run setup against a fake server with the address given on the command line.
-    fn go(
-        addr: SocketAddr,
-        p: &mut Script,
-        store: &Store,
-        cfg: &std::path::Path,
-    ) -> ActionResult {
+    fn go(addr: SocketAddr, p: &mut Script, store: &Store, cfg: &std::path::Path) -> ActionResult {
         run(Some(addr.ip()), addr.port(), p, store, cfg)
     }
 
@@ -409,26 +434,49 @@ mod tests {
         let srv = fake_pihole("", log.clone());
         let dir = tempfile::tempdir().unwrap();
         let cfgp = dir.path().join("qnet").join("config.toml");
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
         let mut p = script(vec![true]);
         let r = go(srv.addr, &mut p, &store, &cfgp).unwrap();
         assert_eq!(r["ok"], true);
         assert_eq!(r["replacedExisting"], false);
         assert_eq!(store.stored.borrow().as_slice(), ["app-secret"]);
         // The fingerprint was shown.
-        assert!(p.said.iter().any(|l| l.contains(&format_fingerprint(&srv.fingerprint))));
+        assert!(p
+            .said
+            .iter()
+            .any(|l| l.contains(&format_fingerprint(&srv.fingerprint))));
         // Config pins exactly that certificate.
         let c = config::load(&cfgp).unwrap();
         assert_eq!(c.pihole.unwrap().tls_sha256, srv.fingerprint);
         let log = log.lock().unwrap();
         // Only the new app-password hash was patched.
-        let patch = log.iter().find(|l| l.starts_with("PATCH /api/config")).unwrap();
-        assert!(patch.contains(r#"{"config":{"webserver":{"api":{"app_pwhash":"$BALLOON-HASH"}}}}"#), "{patch}");
+        let patch = log
+            .iter()
+            .find(|l| l.starts_with("PATCH /api/config"))
+            .unwrap();
+        assert!(
+            patch.contains(r#"{"config":{"webserver":{"api":{"app_pwhash":"$BALLOON-HASH"}}}}"#),
+            "{patch}"
+        );
         // The web session was killed by the app-password creation, so setup
         // logged in a second time to apply the hash; every session it
         // opened was closed again (two web sessions + the verification one).
-        assert_eq!(log.iter().filter(|l| l.starts_with("POST /api/auth")).count(), 3);
-        assert_eq!(log.iter().filter(|l| l.starts_with("DELETE /api/auth")).count(), 2);
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.starts_with("POST /api/auth"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.starts_with("DELETE /api/auth"))
+                .count(),
+            2
+        );
         // The app password never appears in a request except the verify login.
         assert_eq!(log.iter().filter(|l| l.contains("app-secret")).count(), 1);
     }
@@ -439,11 +487,18 @@ mod tests {
         let srv = fake_pihole("", log.clone());
         let dir = tempfile::tempdir().unwrap();
         let cfgp = dir.path().join("config.toml");
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
         let mut p = script(vec![false]);
         let e = go(srv.addr, &mut p, &store, &cfgp).unwrap_err();
         assert_eq!(e.code, "declined");
-        assert!(log.lock().unwrap().is_empty(), "no request before the user accepts the pin");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "no request before the user accepts the pin"
+        );
         assert!(!cfgp.exists());
     }
 
@@ -453,13 +508,20 @@ mod tests {
         let srv = fake_pihole("$OLD-HASH", log.clone());
         let dir = tempfile::tempdir().unwrap();
         let cfgp = dir.path().join("config.toml");
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
         let mut p = script(vec![true, false]);
         let e = go(srv.addr, &mut p, &store, &cfgp).unwrap_err();
         assert_eq!(e.code, "declined");
         assert!(p.questions[1].contains("Replace"));
         assert!(p.said.iter().any(|l| l.contains("REPLACES")));
-        assert!(!log.lock().unwrap().iter().any(|l| l.starts_with("PATCH")), "nothing changed");
+        assert!(
+            !log.lock().unwrap().iter().any(|l| l.starts_with("PATCH")),
+            "nothing changed"
+        );
         assert!(!cfgp.exists());
         assert!(store.stored.borrow().is_empty());
 
@@ -477,7 +539,11 @@ mod tests {
         let srv = fake_pihole("", log.clone());
         let dir = tempfile::tempdir().unwrap();
         let cfgp = dir.path().join("config.toml");
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
         let mut p = script(vec![true]);
         p.password = "wrong".into();
         let e = go(srv.addr, &mut p, &store, &cfgp).unwrap_err();
@@ -492,7 +558,11 @@ mod tests {
         let srv = fake_pihole("$OLD-HASH", log.clone());
         let dir = tempfile::tempdir().unwrap();
         let cfgp = dir.path().join("config.toml");
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: true };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: true,
+        };
         let mut p = script(vec![true, true]);
         let e = go(srv.addr, &mut p, &store, &cfgp).unwrap_err();
         assert_eq!(e.code, "keyring");
@@ -512,7 +582,11 @@ mod tests {
         let addr = l.local_addr().unwrap();
         drop(l);
         let dir = tempfile::tempdir().unwrap();
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
         let mut p = script(vec![true]);
         let e = go(addr, &mut p, &store, &dir.path().join("c.toml")).unwrap_err();
         assert_eq!(e.code, "unreachable");
@@ -524,21 +598,37 @@ mod tests {
         let srv = fake_pihole("", log.clone());
         let dir = tempfile::tempdir().unwrap();
         let cfgp = dir.path().join("config.toml");
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
         let mut p = script(vec![true]);
         let r = go(srv.addr, &mut p, &store, &cfgp).unwrap();
         assert_eq!(r["canary"], "added");
         let log = log.lock().unwrap();
-        let post = log.iter().find(|l| l.starts_with("POST /api/domains/deny/exact")).unwrap();
+        let post = log
+            .iter()
+            .find(|l| l.starts_with("POST /api/domains/deny/exact"))
+            .unwrap();
         assert!(post.contains(r#""domain":"qnet-canary.invalid""#), "{post}");
         assert!(post.contains(r#""comment":"qnet canary""#));
-        assert_eq!(log.iter().filter(|l| l.starts_with("POST /api/domains")).count(), 1);
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.starts_with("POST /api/domains"))
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn an_existing_canary_entry_is_fine_and_a_failure_is_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
 
         let srv = fake_pihole_with("", "dup", Arc::default());
         let mut p = script(vec![true]);
@@ -550,7 +640,10 @@ mod tests {
         let r = go(srv.addr, &mut p, &store, &dir.path().join("b.toml")).unwrap();
         assert_eq!(r["ok"], true);
         assert_eq!(r["canary"], "unavailable");
-        assert!(p.said.iter().any(|l| l.contains("configured canary will be used")));
+        assert!(p
+            .said
+            .iter()
+            .any(|l| l.contains("configured canary will be used")));
     }
 
     #[test]
@@ -559,7 +652,11 @@ mod tests {
         let srv = fake_pihole("", log.clone());
         let dir = tempfile::tempdir().unwrap();
         let cfgp = dir.path().join("config.toml");
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
         let mut p = script(vec![true]);
         p.lines = vec![srv.addr.ip().to_string()];
         let r = run(None, srv.addr.port(), &mut p, &store, &cfgp).unwrap();
@@ -575,7 +672,10 @@ mod tests {
         }
         // No input at all (stdin closed).
         let mut p = script(vec![true]);
-        assert_eq!(run(None, 443, &mut p, &store, &cfgp).unwrap_err().code, "io");
+        assert_eq!(
+            run(None, 443, &mut p, &store, &cfgp).unwrap_err().code,
+            "io"
+        );
     }
 
     #[test]
@@ -587,7 +687,11 @@ mod tests {
         // An earlier setup pinned a different certificate for this address.
         let old = [9u8; 32];
         config::save_pihole(&cfgp, srv.addr.ip(), &old, None).unwrap();
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
 
         // y/N is not enough, and neither is anything but "yes".
         for answer in ["y", "Y", "yes please", "", "YES"] {
@@ -596,14 +700,23 @@ mod tests {
             let e = go(srv.addr, &mut p, &store, &cfgp).unwrap_err();
             assert_eq!(e.code, "declined", "{answer:?}");
             assert!(
-                p.said.iter().any(|l| l.contains("CERTIFICATE CHANGED (was ")
-                    && l.contains(&format_fingerprint(&old))
-                    && l.contains(&format_fingerprint(&srv.fingerprint))),
+                p.said
+                    .iter()
+                    .any(|l| l.contains("CERTIFICATE CHANGED (was ")
+                        && l.contains(&format_fingerprint(&old))
+                        && l.contains(&format_fingerprint(&srv.fingerprint))),
                 "{:?}",
                 p.said
             );
-            assert!(log.lock().unwrap().is_empty(), "the password must not be sent: {answer:?}");
-            assert_eq!(config::load(&cfgp).unwrap().pihole.unwrap().tls_sha256, old, "pin untouched");
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "the password must not be sent: {answer:?}"
+            );
+            assert_eq!(
+                config::load(&cfgp).unwrap().pihole.unwrap().tls_sha256,
+                old,
+                "pin untouched"
+            );
         }
 
         // Typing yes proceeds and re-pins.
@@ -611,8 +724,14 @@ mod tests {
         p.lines = vec!["yes".into()];
         let r = go(srv.addr, &mut p, &store, &cfgp).unwrap();
         assert_eq!(r["ok"], true);
-        assert!(p.questions.is_empty(), "no extra y/N prompt on top of the typed yes");
-        assert_eq!(config::load(&cfgp).unwrap().pihole.unwrap().tls_sha256, srv.fingerprint);
+        assert!(
+            p.questions.is_empty(),
+            "no extra y/N prompt on top of the typed yes"
+        );
+        assert_eq!(
+            config::load(&cfgp).unwrap().pihole.unwrap().tls_sha256,
+            srv.fingerprint
+        );
     }
 
     #[test]
@@ -621,11 +740,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfgp = dir.path().join("config.toml");
         config::save_pihole(&cfgp, srv.addr.ip(), &srv.fingerprint, None).unwrap();
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
         let mut p = script(vec![]);
         let r = go(srv.addr, &mut p, &store, &cfgp).unwrap();
         assert_eq!(r["ok"], true);
-        assert!(p.said.iter().any(|l| l.contains("matches the pinned fingerprint")));
+        assert!(p
+            .said
+            .iter()
+            .any(|l| l.contains("matches the pinned fingerprint")));
         assert!(!p.said.iter().any(|l| l.contains("CHANGED")));
         assert!(p.questions.is_empty());
     }
@@ -636,7 +762,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfgp = dir.path().join("config.toml");
         config::save_pihole(&cfgp, "10.9.9.9".parse().unwrap(), &[9u8; 32], None).unwrap();
-        let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+        let store = Store {
+            has: false,
+            stored: RefCell::new(vec![]),
+            fail: false,
+        };
         let mut p = script(vec![true]);
         let r = go(srv.addr, &mut p, &store, &cfgp).unwrap();
         assert_eq!(r["ok"], true);
@@ -650,16 +780,29 @@ mod tests {
             let srv = fake_pihole(mode, log.clone());
             let dir = tempfile::tempdir().unwrap();
             let cfgp = dir.path().join("config.toml");
-            let store = Store { has: false, stored: RefCell::new(vec![]), fail: false };
+            let store = Store {
+                has: false,
+                stored: RefCell::new(vec![]),
+                fail: false,
+            };
             let mut p = script(vec![true]);
             let e = go(srv.addr, &mut p, &store, &cfgp).unwrap_err();
             assert_eq!(e.code, "api", "{mode}: {e:?}");
             assert!(e.detail.contains("nothing was changed"), "{}", e.detail);
             let log = log.lock().unwrap();
-            assert!(!log.iter().any(|l| l.starts_with("GET /api/auth/app")), "{mode}: no app password made");
-            assert!(!log.iter().any(|l| l.starts_with("PATCH")), "{mode}: nothing patched, nothing to roll back");
+            assert!(
+                !log.iter().any(|l| l.starts_with("GET /api/auth/app")),
+                "{mode}: no app password made"
+            );
+            assert!(
+                !log.iter().any(|l| l.starts_with("PATCH")),
+                "{mode}: nothing patched, nothing to roll back"
+            );
             assert!(!log.iter().any(|l| l.starts_with("POST /api/domains")));
-            assert!(log.iter().any(|l| l.starts_with("DELETE /api/auth")), "the web session was closed");
+            assert!(
+                log.iter().any(|l| l.starts_with("DELETE /api/auth")),
+                "the web session was closed"
+            );
             assert!(!cfgp.exists());
             assert!(store.stored.borrow().is_empty());
         }

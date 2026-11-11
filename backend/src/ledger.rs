@@ -52,7 +52,9 @@ impl Ledger {
             .iter()
             // A bucket counts while any of it is inside the window.
             .filter(|b| b.0 + BUCKET_S > cutoff)
-            .fold((0, 0), |(t, bl), b| (t + u64::from(b.1), bl + u64::from(b.2)))
+            .fold((0, 0), |(t, bl), b| {
+                (t + u64::from(b.1), bl + u64::from(b.2))
+            })
     }
 
     /// (total, blocked) sent in the bucket that starts at `bucket_start`.
@@ -65,7 +67,9 @@ impl Ledger {
         self.buckets
             .iter()
             .filter(|b| b.0 == bucket_start)
-            .fold((0, 0), |(t, bl), b| (t + u64::from(b.1), bl + u64::from(b.2)))
+            .fold((0, 0), |(t, bl), b| {
+                (t + u64::from(b.1), bl + u64::from(b.2))
+            })
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -131,7 +135,11 @@ mod tests {
         l.add(1_000_100.0, 3, 2); // bucket 999_600..1_000_200
         let start = 1_000_100i64.div_euclid(BUCKET_S) * BUCKET_S;
         assert_eq!(l.bucket(start), (3, 2));
-        assert_eq!(l.bucket(start + 300), (3, 2), "the centre label finds the same bucket");
+        assert_eq!(
+            l.bucket(start + 300),
+            (3, 2),
+            "the centre label finds the same bucket"
+        );
         assert_eq!(l.bucket(start + 599), (3, 2));
         assert_eq!(l.bucket(start + 600), (0, 0), "the next bucket");
         assert_eq!(l.bucket(start - 1), (0, 0));
