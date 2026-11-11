@@ -5,6 +5,7 @@
 
 use std::io::BufRead;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -16,6 +17,8 @@ use crate::icmp;
 use crate::pihole::{ApiError, Blocking, Bucket, Pihole, Summary, Upstreams};
 use crate::setup::DEDICATED_CANARY;
 use crate::util;
+use crate::watchdog::{Poller, Presence, WatchdogReport};
+use crate::wdstore::Store;
 
 // ---- Messages ---------------------------------------------------------------
 
@@ -106,6 +109,8 @@ pub enum Event {
     NmLost,
     Probe(ProbeReport),
     Api(ApiReport),
+    /// The watchdog's view after a cycle (open or closed).
+    Watchdog(WatchdogReport),
     /// systemd-resolved's view of the Pi-hole: Some(reason) if downgraded.
     Downgrade(Option<String>),
 }
@@ -487,6 +492,11 @@ pub struct ApiTiming {
     pub auth_backoff: Duration,
     pub tls_backoff: Duration,
     pub setup_backoff: Duration,
+    /// With the panel closed: the first watchdog cycle comes this long after
+    /// the configuration arrives.
+    pub wd_first_delay: Duration,
+    /// With the panel closed: the watchdog cycle repeats this often.
+    pub wd_closed_every: Duration,
 }
 
 impl Default for ApiTiming {
@@ -498,8 +508,21 @@ impl Default for ApiTiming {
             auth_backoff: Duration::from_secs(60),
             tls_backoff: Duration::from_secs(30),
             setup_backoff: Duration::from_secs(30),
+            wd_first_delay: Duration::from_secs(30),
+            wd_closed_every: Duration::from_secs(60),
         }
     }
+}
+
+/// Shows a desktop notification: (title, body).
+pub type NotifyFn = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// What the watchdog needs from the outside, so tests never touch the real
+/// state directory or `notify-send`.
+pub struct WatchdogDeps {
+    /// The PC-side store (`watchdog.json`).
+    pub store_path: PathBuf,
+    pub notify: NotifyFn,
 }
 
 /// Builds the API client for a configuration (and picks up a saved session).
@@ -558,12 +581,141 @@ fn poll(api: &mut Pihole, with_history: bool, with_upstreams: bool) -> Result<Ap
     })
 }
 
+/// The watchdog's share of the API thread's state: the poller, when the
+/// closed poll is next due, and what parks it.
+struct WdRun {
+    poller: Poller,
+    deps: WatchdogDeps,
+    /// When the next closed cycle is due; `None` = no closed polling.
+    next: Option<Instant>,
+    /// An auth failure (no secret, a keyring that will not answer) parks the
+    /// closed poll until the next `Open` or `Config`: it must never ask a
+    /// locked keyring every minute.
+    parked: bool,
+    last_devices: Option<Instant>,
+}
+
+impl WdRun {
+    fn new(deps: WatchdogDeps) -> Self {
+        Self {
+            poller: Poller::new(),
+            deps,
+            next: None,
+            parked: false,
+            last_devices: None,
+        }
+    }
+
+    /// A new configuration (or none): start over.
+    fn reset(&mut self) {
+        self.poller = Poller::new();
+        self.next = None;
+        self.parked = false;
+        self.last_devices = None;
+    }
+
+    /// The panel closed: poll again `every` from now, unless that is pointless
+    /// (nothing configured, parked, or the Pi-hole has no watchdog).
+    fn schedule_closed(&mut self, configured: bool, every: Duration) {
+        let pointless = !configured || self.parked || self.poller.presence() == Presence::Absent;
+        self.next = (!pointless).then(|| Instant::now() + every);
+    }
+
+    /// One cycle on `api`; the notifications it produced are shown. A
+    /// failure is also kept as the watchdog's status.
+    fn run(&mut self, api: &mut Pihole, with_devices: bool) -> Result<(), ApiError> {
+        let now = util::unix_secs();
+        match self
+            .poller
+            .cycle(api, &self.deps.store_path, now, with_devices)
+        {
+            Ok(out) => {
+                for (title, body) in &out.notifications {
+                    (self.deps.notify)(title, body);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.poller.fail(&e);
+                Err(e)
+            }
+        }
+    }
+
+    fn report(&self) -> Event {
+        Event::Watchdog(self.poller.report(&Store::load(&self.deps.store_path)))
+    }
+
+    /// The closed poll: the watchdog cycle alone (alerts, no devices, no
+    /// stats), on a client made for the occasion if need be. Returns false
+    /// when the receiver is gone.
+    ///
+    /// What comes next depends on how it went: another cycle after
+    /// `wd_closed_every`; none at all when the Pi-hole has no watchdog (the
+    /// session is ended at once, as a closed qnet holds none) or on an auth
+    /// failure (parked, session dropped); after `tls_backoff` for a TLS
+    /// failure.
+    fn closed_cycle(
+        &mut self,
+        client: &mut Option<Pihole>,
+        factory: &ApiFactory,
+        cfg: &ApiCfg,
+        timing: &ApiTiming,
+        tx: &Sender<Event>,
+    ) -> bool {
+        let mut result = Ok(());
+        if client.is_none() {
+            match factory(cfg) {
+                Ok(p) => {
+                    self.poller.client_replaced();
+                    *client = Some(p);
+                }
+                Err(e) => {
+                    self.poller.fail(&e);
+                    result = Err(e);
+                }
+            }
+        }
+        if let (Ok(()), Some(api)) = (&result, client.as_mut()) {
+            result = self.run(api, false);
+            api.close_idle();
+        }
+        let absent = self.poller.presence() == Presence::Absent;
+        let now = Instant::now();
+        self.next = match &result {
+            Ok(()) if absent => None,
+            Err(ApiError::Auth(_)) => {
+                self.parked = true;
+                None
+            }
+            Err(ApiError::Tls(_)) => Some(now + timing.tls_backoff),
+            _ => Some(now + timing.wd_closed_every),
+        };
+        if absent || matches!(result, Err(ApiError::Auth(_))) {
+            if let Some(mut c) = client.take() {
+                c.logout();
+            }
+        }
+        tx.send(self.report()).is_ok()
+    }
+}
+
 /// The API thread: polls only while open, reuses its session, and logs it
 /// out when told to stop (so `Stop` followed by `join` means "logged out").
+///
+/// The watchdog rides on it. While open, every good stats poll is followed
+/// by a watchdog cycle on the same connection (with the device list on open
+/// and then on the `history_every` cadence). While closed there is a poll of
+/// its own, `wd_first_delay` after the configuration and then every
+/// `wd_closed_every`, that sends no stats and no `Event::Api`: see
+/// [`WdRun::closed_cycle`]. Its failures only ever show in the
+/// `Event::Watchdog` status, except an auth failure, which drops the client
+/// like a failed stats poll does.
 pub fn spawn_api(
     tx: Sender<Event>,
     timing: ApiTiming,
     factory: ApiFactory,
+    deps: WatchdogDeps,
 ) -> (Sender<ApiCtl>, JoinHandle<()>) {
     let (ctl_tx, ctl_rx) = mpsc::channel::<ApiCtl>();
     let h = thread::spawn(move || {
@@ -578,13 +730,17 @@ pub fn spawn_api(
         let mut last_upstreams: Option<Instant> = None;
         // A failure's backoff: neither `Kick` nor `Open` may shorten it.
         let mut backoff_until: Option<Instant> = None;
+        let mut wd = WdRun::new(deps);
         loop {
             let now = Instant::now();
-            let wait = if open && cfg.is_some() {
-                next_poll.saturating_duration_since(now)
-            } else {
-                Duration::from_secs(3600)
+            let due = match (open, cfg.is_some()) {
+                (true, true) => Some(next_poll),
+                (false, true) => wd.next,
+                _ => None,
             };
+            let wait = due.map_or(Duration::from_secs(3600), |t| {
+                t.saturating_duration_since(now)
+            });
             match ctl_rx.recv_timeout(wait) {
                 Ok(ApiCtl::Config(c)) => {
                     if let Some(mut old) = client.take() {
@@ -595,17 +751,27 @@ pub fn spawn_api(
                     last_upstreams = None;
                     backoff_until = None;
                     next_poll = Instant::now();
+                    wd.reset();
+                    if cfg.is_some() && !open {
+                        wd.next = Some(Instant::now() + timing.wd_first_delay);
+                    }
                 }
                 Ok(ApiCtl::Open(o)) => {
                     open = o;
                     if o {
                         // The Route view wants fresh upstream figures on open.
                         last_upstreams = None;
+                        wd.last_devices = None;
+                        wd.parked = false;
+                        wd.next = None;
                         next_poll = backoff_until
                             .unwrap_or_else(Instant::now)
                             .max(Instant::now());
-                    } else if let Some(c) = client.as_mut() {
-                        c.close_idle();
+                    } else {
+                        if let Some(c) = client.as_mut() {
+                            c.close_idle();
+                        }
+                        wd.schedule_closed(cfg.is_some(), timing.wd_closed_every);
                     }
                 }
                 Ok(ApiCtl::Kick) => {
@@ -620,10 +786,21 @@ pub fn spawn_api(
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     let Some(c) = cfg.clone() else { continue };
+                    if !open {
+                        let due = wd.next.is_some_and(|t| t <= Instant::now());
+                        if due && !wd.closed_cycle(&mut client, &factory, &c, &timing, &tx) {
+                            break;
+                        }
+                        continue;
+                    }
                     if client.is_none() {
                         match factory(&c) {
-                            Ok(p) => client = Some(p),
+                            Ok(p) => {
+                                wd.poller.client_replaced();
+                                client = Some(p);
+                            }
                             Err(e) => {
+                                wd.parked |= matches!(e, ApiError::Auth(_));
                                 let _ = tx.send(Event::Api(failure(&e)));
                                 next_poll = Instant::now() + timing.setup_backoff;
                                 backoff_until = Some(next_poll);
@@ -638,6 +815,13 @@ pub fn spawn_api(
                     let upstreams_due =
                         last_upstreams.is_none_or(|t| t.elapsed() >= timing.history_every);
                     let res = poll(api, history_due, upstreams_due);
+                    // The watchdog follows a good poll, on the same connection.
+                    let wd_res = res.is_ok().then(|| {
+                        let devices_due = wd
+                            .last_devices
+                            .is_none_or(|t| t.elapsed() >= timing.history_every);
+                        (wd.run(api, devices_due), devices_due)
+                    });
                     api.close_idle();
                     match res {
                         Ok(report) => {
@@ -664,10 +848,29 @@ pub fn spawn_api(
                             backoff_until = Some(next_poll);
                             if matches!(e, ApiError::Auth(_)) {
                                 client = None;
+                                wd.parked = true;
                             }
                             if tx.send(Event::Api(failure(&e))).is_err() {
                                 break;
                             }
+                        }
+                    }
+                    if let Some((res, devices_due)) = wd_res {
+                        match res {
+                            Ok(()) if devices_due => wd.last_devices = Some(Instant::now()),
+                            Ok(()) => {}
+                            Err(ApiError::Auth(_)) => {
+                                // As for the stats: drop the client and wait.
+                                client = None;
+                                wd.parked = true;
+                                next_poll = Instant::now() + timing.auth_backoff;
+                                backoff_until = Some(next_poll);
+                            }
+                            // Shown in the watchdog status only.
+                            Err(_) => {}
+                        }
+                        if tx.send(wd.report()).is_err() {
+                            break;
                         }
                     }
                 }
@@ -1624,7 +1827,23 @@ mod tests {
             auth_backoff: Duration::from_secs(30),
             tls_backoff: Duration::from_secs(30),
             setup_backoff: Duration::from_secs(30),
+            // The closed watchdog poll is out of the picture here.
+            wd_first_delay: Duration::from_secs(3600),
+            wd_closed_every: Duration::from_secs(3600),
         }
+    }
+
+    type Notes = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Watchdog deps with a store in `dir` and a notifier that records.
+    fn deps_in(dir: &tempfile::TempDir) -> (WatchdogDeps, Notes) {
+        let notes: Notes = Arc::default();
+        let n2 = notes.clone();
+        let deps = WatchdogDeps {
+            store_path: dir.path().join("watchdog.json"),
+            notify: Arc::new(move |t, b| n2.lock().unwrap().push((t.to_string(), b.to_string()))),
+        };
+        (deps, notes)
     }
 
     fn factory_for(srv: &TestServer) -> ApiFactory {
@@ -1652,10 +1871,12 @@ mod tests {
 
     #[test]
     fn the_api_poller_is_idle_until_open_stops_when_closed_and_logs_out_on_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
         let log: Log = Arc::default();
         let srv = fake_api(log.clone());
         let (tx, rx) = mpsc::channel();
-        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
+        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv), deps);
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         sleep(200);
         assert!(
@@ -1700,10 +1921,12 @@ mod tests {
 
     #[test]
     fn upstreams_come_on_open_and_then_on_the_slow_schedule_only_while_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
         let log: Log = Arc::default();
         let srv = fake_api(log.clone());
         let (tx, rx) = mpsc::channel();
-        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
+        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv), deps);
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         sleep(150);
         assert_eq!(
@@ -1738,6 +1961,8 @@ mod tests {
 
     #[test]
     fn a_broken_upstreams_endpoint_does_not_fail_the_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
         let log: Log = Arc::default();
         let l2 = log.clone();
         let srv = serve(40, move |_, req| {
@@ -1762,7 +1987,7 @@ mod tests {
             }
         });
         let (tx, rx) = mpsc::channel();
-        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
+        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv), deps);
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         ctl.send(ApiCtl::Open(true)).unwrap();
         sleep(250);
@@ -1777,10 +2002,12 @@ mod tests {
 
     #[test]
     fn history_is_refreshed_on_its_own_slower_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
         let log: Log = Arc::default();
         let srv = fake_api(log.clone());
         let (tx, _rx) = mpsc::channel();
-        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
+        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv), deps);
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         ctl.send(ApiCtl::Open(true)).unwrap();
         sleep(900);
@@ -1797,10 +2024,12 @@ mod tests {
 
     #[test]
     fn changing_the_config_logs_the_old_session_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
         let log: Log = Arc::default();
         let srv = fake_api(log.clone());
         let (tx, rx) = mpsc::channel();
-        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
+        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv), deps);
         ctl.send(ApiCtl::Open(true)).unwrap();
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         sleep(250);
@@ -1834,6 +2063,8 @@ mod tests {
 
     #[test]
     fn a_keyring_failure_gets_the_long_backoff_and_refresh_cannot_shorten_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
         let attempts = Arc::new(Mutex::new(0u32));
         let a2 = attempts.clone();
         let srv = fake_api(Arc::default());
@@ -1850,7 +2081,7 @@ mod tests {
             )
         });
         let (tx, rx) = mpsc::channel();
-        let (ctl, h) = spawn_api(tx, timing(), factory);
+        let (ctl, h) = spawn_api(tx, timing(), factory, deps);
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         ctl.send(ApiCtl::Open(true)).unwrap();
         sleep(200);
@@ -1878,6 +2109,8 @@ mod tests {
 
     #[test]
     fn a_client_that_cannot_be_built_is_reported_and_retried_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
         let tries = Arc::new(Mutex::new(0u32));
         let t2 = tries.clone();
         let factory: ApiFactory = Arc::new(move |_c| {
@@ -1885,7 +2118,7 @@ mod tests {
             Err(ApiError::Tls("no usable TLS configuration".into()))
         });
         let (tx, rx) = mpsc::channel();
-        let (ctl, h) = spawn_api(tx, timing(), factory);
+        let (ctl, h) = spawn_api(tx, timing(), factory, deps);
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         ctl.send(ApiCtl::Open(true)).unwrap();
         sleep(250);
@@ -1899,11 +2132,13 @@ mod tests {
 
     #[test]
     fn stop_workers_returns_only_after_the_api_session_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
         let log: Log = Arc::default();
         let srv = fake_api(log.clone());
         let (tx, rx) = mpsc::channel();
         let (ptx, ph) = spawn_prober(tx.clone(), fast(), recording_probe(Arc::default()));
-        let (atx, ah) = spawn_api(tx, timing(), factory_for(&srv));
+        let (atx, ah) = spawn_api(tx, timing(), factory_for(&srv), deps);
         ptx.send(ProbeCtl::Target(Some(tgt(53)))).unwrap();
         atx.send(ApiCtl::Config(Some(cfg()))).unwrap();
         atx.send(ApiCtl::Open(true)).unwrap();
@@ -1926,13 +2161,15 @@ mod tests {
 
     #[test]
     fn a_hung_pihole_cannot_stall_shutdown_beyond_the_request_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
         // The server accepts and never answers; Stop arrives mid-poll.
         let srv = serve(5, |_, _| {
             thread::sleep(Duration::from_secs(6));
             None
         });
         let (tx, _rx) = mpsc::channel();
-        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv));
+        let (ctl, h) = spawn_api(tx, timing(), factory_for(&srv), deps);
         ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
         ctl.send(ApiCtl::Open(true)).unwrap();
         sleep(300);
@@ -1944,6 +2181,401 @@ mod tests {
             "bounded by the 3 s request timeout: {:?}",
             t0.elapsed()
         );
+    }
+
+    // -- the watchdog in the API thread ----------------------------------------
+
+    use crate::fakeqbp::{self, FakePi};
+    use crate::wdstore;
+
+    /// Short timings for the watchdog: a cycle after each 40 ms stats poll
+    /// while open, the first closed one 30 ms after the config, then every
+    /// 100 ms.
+    fn wd_timing() -> ApiTiming {
+        ApiTiming {
+            every: Duration::from_millis(40),
+            history_every: Duration::from_millis(200),
+            min_gap: Duration::from_millis(10),
+            wd_first_delay: Duration::from_millis(30),
+            wd_closed_every: Duration::from_millis(100),
+            ..timing()
+        }
+    }
+
+    /// What the thread has sent so far, collected as it arrives.
+    struct Arrived {
+        rx: mpsc::Receiver<Event>,
+        api: Vec<ApiReport>,
+        wd: Vec<WatchdogReport>,
+    }
+
+    impl Arrived {
+        fn new(rx: mpsc::Receiver<Event>) -> Self {
+            Self {
+                rx,
+                api: vec![],
+                wd: vec![],
+            }
+        }
+        fn pump(&mut self) {
+            while let Ok(ev) = self.rx.try_recv() {
+                match ev {
+                    Event::Api(r) => self.api.push(r),
+                    Event::Watchdog(r) => self.wd.push(r),
+                    _ => {}
+                }
+            }
+        }
+        /// Wait up to `ms` for `cond` to come true of what has arrived.
+        fn wait(&mut self, ms: u64, cond: impl Fn(&Arrived) -> bool) -> bool {
+            let end = Instant::now() + Duration::from_millis(ms);
+            loop {
+                self.pump();
+                if cond(self) {
+                    return true;
+                }
+                if Instant::now() >= end {
+                    return false;
+                }
+                sleep(10);
+            }
+        }
+    }
+
+    /// Poll `cond` every 10 ms for up to `ms`; true when it came true.
+    fn wait_for(ms: u64, cond: impl Fn() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            sleep(10);
+        }
+        cond()
+    }
+
+    #[test]
+    fn a_real_pihole_gets_one_qbp_request_per_session_and_the_stats_keep_working() {
+        let pi = FakePi::pihole_only(400);
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, notes) = deps_in(&dir);
+        // An acknowledged key waiting to be pushed makes the push the first
+        // (and only) qbp request.
+        wdstore::update(&deps.store_path, |s| s.add_acked(&fakeqbp::key(1), 5)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut seen = Arrived::new(rx);
+        let (ctl, h) = spawn_api(tx, wd_timing(), factory_for(&pi.srv), deps);
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        ctl.send(ApiCtl::Open(true)).unwrap();
+        assert!(seen.wait(3000, |s| s.api.len() >= 5 && s.wd.len() >= 5));
+        assert_eq!(pi.qbp_requests(), 1, "one per session, not one per poll");
+        assert_eq!(pi.count("PUT /api/qbp/alerts/acked"), 1);
+        assert_eq!(pi.count("POST /api/auth"), 1);
+        assert!(seen.api.iter().all(|r| r.status == "ok"));
+        assert_eq!(seen.wd[0].status, "absent");
+        assert!(seen
+            .wd
+            .iter()
+            .all(|r| r.status == "absent" && r.alerts.is_empty()));
+
+        // Closing keeps the session and asks nothing more, closed poll or not.
+        ctl.send(ApiCtl::Open(false)).unwrap();
+        sleep(400);
+        assert_eq!(pi.qbp_requests(), 1);
+        assert_eq!(pi.count("DELETE /api/auth"), 0);
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+        assert_eq!(pi.count("DELETE /api/auth"), 1);
+        assert!(notes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_closed_poll_on_a_real_pihole_asks_once_logs_out_and_then_stays_silent() {
+        let pi = FakePi::pihole_only(400);
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
+        let (tx, rx) = mpsc::channel();
+        let mut seen = Arrived::new(rx);
+        let (ctl, h) = spawn_api(tx, wd_timing(), factory_for(&pi.srv), deps);
+        let t0 = Instant::now();
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        assert!(wait_for(3000, || pi.count("DELETE /api/auth") == 1));
+        assert_eq!(
+            pi.with(|s| s.log.clone()),
+            vec![
+                "POST /api/auth HTTP/1.1",
+                "GET /api/qbp/alerts?since=0 HTTP/1.1",
+                "DELETE /api/auth HTTP/1.1"
+            ],
+            "one login, one qbp request, a logout"
+        );
+        assert!(
+            pi.times("GET /api/qbp/alerts")[0].duration_since(t0) >= Duration::from_millis(30),
+            "not before wd_first_delay"
+        );
+        // Many closed periods later: nothing.
+        sleep(500);
+        assert_eq!(pi.with(|s| s.log.len()), 3);
+        seen.pump();
+        assert!(
+            seen.api.is_empty(),
+            "the closed poll never sends Event::Api"
+        );
+        assert_eq!(seen.wd.len(), 1);
+        assert_eq!(seen.wd[0].status, "absent");
+
+        // Opening is a new session: one more look, once.
+        ctl.send(ApiCtl::Open(true)).unwrap();
+        assert!(wait_for(3000, || pi.count("GET /api/stats/summary") >= 4));
+        assert_eq!(pi.count("POST /api/auth"), 2);
+        assert_eq!(pi.qbp_requests(), 2);
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+        assert_eq!(pi.count("DELETE /api/auth"), 2);
+        assert_eq!(pi.qbp_requests(), 2);
+    }
+
+    #[test]
+    fn a_closed_panel_polls_the_alerts_alone_on_its_own_schedule_and_notifies() {
+        let pi = FakePi::start(400);
+        pi.raise("new_device", "02:00:00:00:00:07", None, 1);
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, notes) = deps_in(&dir);
+        wdstore::update(&deps.store_path, |s| s.add_acked(&fakeqbp::key(101), 5)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut seen = Arrived::new(rx);
+        let (ctl, h) = spawn_api(tx, wd_timing(), factory_for(&pi.srv), deps);
+        let t0 = Instant::now();
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        assert!(seen.wait(5000, |s| s.wd.len() >= 4));
+
+        // Only the alerts (and the first push): no stats, no devices.
+        assert_eq!(pi.count("GET /api/stats"), 0);
+        assert_eq!(pi.count("GET /api/dns"), 0);
+        assert_eq!(pi.count("GET /api/history"), 0);
+        assert_eq!(pi.count("GET /api/qbp/devices"), 0);
+        assert_eq!(
+            pi.count("PUT /api/qbp/alerts/acked"),
+            1,
+            "the first push only"
+        );
+        assert_eq!(
+            pi.count("PUT /api/qbp/devices/known"),
+            0,
+            "an empty list is not pushed"
+        );
+        assert_eq!(pi.count("POST /api/auth"), 1, "the session is kept");
+        assert_eq!(pi.count("DELETE /api/auth"), 0);
+        // The cadence: the first after wd_first_delay, then every 100 ms.
+        let at = pi.times("GET /api/qbp/alerts");
+        assert!(at[0].duration_since(t0) >= Duration::from_millis(30));
+        for w in at.windows(2) {
+            assert!(w[1].duration_since(w[0]) >= Duration::from_millis(100));
+        }
+        // Each cycle reports; the alert was announced once.
+        assert!(seen.api.is_empty());
+        let last = seen.wd.last().unwrap();
+        assert_eq!((last.status, last.alerts.len(), last.unacked), ("ok", 1, 1));
+        assert!(last.pushed_at > 0 && last.polled_at >= last.pushed_at);
+        assert_eq!(
+            *notes.lock().unwrap(),
+            vec![(
+                "New device on the network".to_string(),
+                "02:00:00:00:00:07".to_string()
+            )]
+        );
+
+        // A new alert shows up in the next report and is announced.
+        pi.raise("dga", "x.example", Some("192.0.2.5"), 2);
+        assert!(wait_for(3000, || notes.lock().unwrap().len() == 2));
+        assert_eq!(
+            notes.lock().unwrap()[1],
+            (
+                "Suspicious lookups (DGA)".to_string(),
+                "x.example · 192.0.2.5".to_string()
+            )
+        );
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+        assert_eq!(pi.count("DELETE /api/auth"), 1);
+    }
+
+    #[test]
+    fn an_open_panel_follows_each_poll_with_a_cycle_and_reads_devices_on_open_and_slowly() {
+        let pi = FakePi::start(600);
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
+        let (tx, rx) = mpsc::channel();
+        let mut seen = Arrived::new(rx);
+        let (ctl, h) = spawn_api(tx, wd_timing(), factory_for(&pi.srv), deps);
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        ctl.send(ApiCtl::Open(true)).unwrap();
+        assert!(wait_for(3000, || pi.count("GET /api/stats/summary") >= 6));
+        assert!(wait_for(3000, || pi.count("GET /api/qbp/devices") >= 2));
+        // One snapshot, so the two counts belong together.
+        let (polls, cycles, devices) = pi.with(|s| {
+            let n = |p: &str| s.log.iter().filter(|l| l.starts_with(p)).count();
+            (
+                n("GET /api/stats/summary"),
+                n("GET /api/qbp/alerts"),
+                n("GET /api/qbp/devices"),
+            )
+        });
+        assert!(
+            cycles + 1 >= polls && cycles <= polls + 1,
+            "a cycle per poll: {cycles} for {polls}"
+        );
+        assert!(
+            devices < cycles,
+            "devices only now and then: {devices}/{cycles}"
+        );
+        assert_eq!(pi.count("POST /api/auth"), 1);
+        seen.pump();
+        assert!(seen.api.iter().all(|r| r.status == "ok"));
+        assert_eq!(seen.wd[0].devices.len(), 3, "the devices come on open");
+        assert_eq!(seen.wd[0].known_list, "waiting");
+
+        // Closing: the stats stop, the alerts go on at the closed pace.
+        ctl.send(ApiCtl::Open(false)).unwrap();
+        sleep(150);
+        let frozen = pi.count("GET /api/stats/summary");
+        let devices = pi.count("GET /api/qbp/devices");
+        let alerts = pi.count("GET /api/qbp/alerts");
+        assert!(wait_for(3000, || pi.count("GET /api/qbp/alerts") >= alerts + 3));
+        assert_eq!(pi.count("GET /api/stats/summary"), frozen);
+        assert_eq!(pi.count("GET /api/qbp/devices"), devices);
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn a_failing_watchdog_shows_in_its_own_status_and_never_in_the_stats() {
+        let pi = FakePi::start(600);
+        pi.with(|s| s.fail_qbp = true);
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
+        let (tx, rx) = mpsc::channel();
+        let mut seen = Arrived::new(rx);
+        let (ctl, h) = spawn_api(tx, wd_timing(), factory_for(&pi.srv), deps);
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        ctl.send(ApiCtl::Open(true)).unwrap();
+        // Five stats polls at their own 40 ms pace: no backoff for the
+        // failing watchdog.
+        assert!(seen.wait(3000, |s| s.api.len() >= 5 && s.wd.len() >= 5));
+        assert!(seen.api.iter().all(|r| r.status == "ok"), "{:?}", seen.api);
+        assert!(seen.wd.iter().all(|r| r.status == "unreachable"));
+        pi.with(|s| s.fail_qbp = false);
+        assert!(seen.wait(3000, |s| s.wd.last().is_some_and(|r| r.status == "ok")));
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn an_auth_failure_parks_the_closed_poll_until_the_panel_opens() {
+        let attempts = Arc::new(Mutex::new(0u32));
+        let a2 = attempts.clone();
+        let factory: ApiFactory = Arc::new(move |_c| {
+            *a2.lock().unwrap() += 1;
+            Err(ApiError::Auth("no secret".into()))
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
+        let (tx, rx) = mpsc::channel();
+        let mut seen = Arrived::new(rx);
+        let (ctl, h) = spawn_api(tx, wd_timing(), factory, deps);
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        assert!(wait_for(3000, || *attempts.lock().unwrap() == 1));
+        // Five closed periods later it still has not asked again.
+        sleep(500);
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        seen.pump();
+        assert!(seen.api.is_empty());
+        assert_eq!(seen.wd.len(), 1);
+        assert_eq!(seen.wd[0].status, "auth");
+
+        // Opening asks again (that is the stats poll's attempt) ...
+        ctl.send(ApiCtl::Open(true)).unwrap();
+        assert!(wait_for(3000, || *attempts.lock().unwrap() == 2));
+        // ... and closing after that failure stays parked.
+        ctl.send(ApiCtl::Open(false)).unwrap();
+        sleep(400);
+        assert_eq!(*attempts.lock().unwrap(), 2);
+        // A new configuration starts over: a first poll after its delay.
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        assert!(wait_for(3000, || *attempts.lock().unwrap() == 3));
+        sleep(300);
+        assert_eq!(*attempts.lock().unwrap(), 3);
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn a_locked_keyring_is_asked_once_by_the_closed_poll() {
+        let pi = FakePi::start(100);
+        let asked = Arc::new(Mutex::new(0u32));
+        let a2 = asked.clone();
+        let (addr, fp) = (pi.srv.addr, pi.srv.fingerprint);
+        // The client is built fine; the password is wanted at login.
+        let factory: ApiFactory = Arc::new(move |_c| {
+            let a3 = a2.clone();
+            Pihole::at(
+                addr,
+                fp,
+                Box::new(move || {
+                    *a3.lock().unwrap() += 1;
+                    Err(ApiError::Auth("keyring did not answer".into()))
+                }),
+            )
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
+        let (tx, rx) = mpsc::channel();
+        let mut seen = Arrived::new(rx);
+        let (ctl, h) = spawn_api(tx, wd_timing(), factory, deps);
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        assert!(wait_for(3000, || *asked.lock().unwrap() == 1));
+        sleep(500);
+        assert_eq!(*asked.lock().unwrap(), 1, "never every minute");
+        assert!(pi.with(|s| s.log.is_empty()), "nothing reached the Pi");
+        seen.pump();
+        assert!(seen.api.is_empty());
+        assert_eq!(seen.wd.last().unwrap().status, "auth");
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn a_tls_failure_waits_the_tls_backoff_and_other_failures_the_closed_period() {
+        for (tls, want_many) in [(true, false), (false, true)] {
+            let attempts = Arc::new(Mutex::new(0u32));
+            let a2 = attempts.clone();
+            let factory: ApiFactory = Arc::new(move |_c| {
+                *a2.lock().unwrap() += 1;
+                Err(if tls {
+                    ApiError::Tls("pin".into())
+                } else {
+                    ApiError::Unreachable("down".into())
+                })
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let (deps, _notes) = deps_in(&dir);
+            let (tx, rx) = mpsc::channel();
+            let mut seen = Arrived::new(rx);
+            let (ctl, h) = spawn_api(tx, wd_timing(), factory, deps);
+            ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+            if want_many {
+                assert!(wait_for(3000, || *attempts.lock().unwrap() >= 3));
+            } else {
+                assert!(wait_for(3000, || *attempts.lock().unwrap() == 1));
+                sleep(500);
+                assert_eq!(*attempts.lock().unwrap(), 1, "tls_backoff is 30 s");
+            }
+            seen.pump();
+            assert!(seen.api.is_empty());
+            assert_eq!(seen.wd[0].status, if tls { "tls" } else { "unreachable" });
+            ctl.send(ApiCtl::Stop).unwrap();
+            h.join().unwrap();
+        }
     }
 
     /// Read-only checks against the real machine: `cargo test live_ -- --ignored`.

@@ -14,6 +14,7 @@ use crate::net::*;
 use crate::pihole::{Blocking, BlockingState, Bucket, Summary, Upstreams};
 use crate::threads::ApiLiveness;
 use crate::util::round1;
+use crate::watchdog::{title_for, WatchdogReport};
 
 pub const MAX_NETWORKS: usize = 40;
 pub const MAX_PROBES: usize = 60;
@@ -101,6 +102,8 @@ pub struct Inputs<'a> {
     pub api: &'a ApiView,
     pub failover: &'a Failover,
     pub scan: ScanView,
+    /// What the watchdog said at its last cycle; `None` before the first.
+    pub watchdog: Option<&'a WatchdogReport>,
     pub error: &'a str,
     pub now_unix: f64,
     /// Seconds since `net` was read; NM's "last scan" age keeps growing.
@@ -277,6 +280,124 @@ pub struct PiholeOut {
     pub probes: Vec<ProbeOut>,
 }
 
+/// One watchdog alert for the panel.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchdogAlertOut {
+    pub id: u64,
+    pub key: String,
+    pub kind: String,
+    pub severity: String,
+    /// The notification title for the kind.
+    pub title: &'static str,
+    pub client: Option<String>,
+    pub subject: String,
+    pub first_unix: u64,
+    pub last_unix: u64,
+    pub count: u64,
+    pub acked: bool,
+}
+
+/// One device of the Pi's inventory for the panel.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchdogDeviceOut {
+    pub mac: String,
+    pub ipv4: Vec<String>,
+    pub hostname: String,
+    pub first_unix: u64,
+    pub last_unix: u64,
+    /// The Pi counts it as known.
+    pub known_on_pi: bool,
+    /// It is on this PC's known list.
+    pub known: bool,
+    pub label: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchdogOut {
+    /// unknown | ok | absent | auth | tls | unreachable | unconfigured
+    pub status: &'static str,
+    pub rev: u64,
+    pub suppressed: u64,
+    pub unacked: u64,
+    /// Newest change first, at most 50.
+    pub alerts: Vec<WatchdogAlertOut>,
+    /// waiting | learned | received | "" (not fetched yet)
+    pub known_list: String,
+    /// Last seen first, at most 128; empty until fetched (panel open).
+    pub devices: Vec<WatchdogDeviceOut>,
+    pub known_count: u64,
+    pub pushed_at: u64,
+    pub push_error: String,
+    pub polled_at: u64,
+}
+
+impl WatchdogOut {
+    /// No data: nothing configured, or nothing heard yet.
+    pub fn empty(status: &'static str) -> Self {
+        Self {
+            status,
+            rev: 0,
+            suppressed: 0,
+            unacked: 0,
+            alerts: Vec::new(),
+            known_list: String::new(),
+            devices: Vec::new(),
+            known_count: 0,
+            pushed_at: 0,
+            push_error: String::new(),
+            polled_at: 0,
+        }
+    }
+
+    pub fn from_report(r: &WatchdogReport) -> Self {
+        Self {
+            status: r.status,
+            rev: r.rev,
+            suppressed: r.suppressed,
+            unacked: r.unacked,
+            alerts: r
+                .alerts
+                .iter()
+                .map(|a| WatchdogAlertOut {
+                    id: a.id,
+                    key: a.key.clone(),
+                    kind: a.kind.clone(),
+                    severity: a.severity.clone(),
+                    title: title_for(&a.kind),
+                    client: a.client.clone(),
+                    subject: a.subject.clone(),
+                    first_unix: a.first_unix,
+                    last_unix: a.last_unix,
+                    count: a.count,
+                    acked: a.acked,
+                })
+                .collect(),
+            known_list: r.known_list.clone(),
+            devices: r
+                .devices
+                .iter()
+                .map(|d| WatchdogDeviceOut {
+                    mac: d.device.mac.clone(),
+                    ipv4: d.device.ipv4.clone(),
+                    hostname: d.device.hostname.clone(),
+                    first_unix: d.device.first_unix,
+                    last_unix: d.device.last_unix,
+                    known_on_pi: d.device.known,
+                    known: d.known,
+                    label: d.label.clone(),
+                })
+                .collect(),
+            known_count: r.known_count,
+            pushed_at: r.pushed_at,
+            push_error: r.push_error.clone(),
+            polled_at: r.polled_at,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct State {
     #[serde(rename = "type")]
@@ -288,6 +409,7 @@ pub struct State {
     pub scan: ScanOut,
     pub dns: DnsOut,
     pub pihole: PiholeOut,
+    pub watchdog: WatchdogOut,
     pub error: String,
     /// Present (and true) only on the periodic heartbeat line.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -765,6 +887,12 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
         .and_then(|w| w.last_scan_age_ms)
         .map(|ms| (ms as f64 / 1000.0 + i.net_age_s.max(0.0)) as u64);
 
+    let watchdog = match (configured, i.watchdog) {
+        (false, _) => WatchdogOut::empty("unconfigured"),
+        (true, None) => WatchdogOut::empty("unknown"),
+        (true, Some(r)) => WatchdogOut::from_report(r),
+    };
+
     State {
         type_: "state",
         seq,
@@ -780,6 +908,7 @@ pub fn build_state(i: &Inputs<'_>, seq: u64, heartbeat: bool) -> State {
         },
         dns,
         pihole,
+        watchdog,
         error: i.error.to_string(),
         heartbeat,
     }
@@ -806,6 +935,10 @@ pub fn signature_of(mut v: serde_json::Value, open: bool) -> String {
         o.remove("heartbeat");
         if let Some(scan) = o.get_mut("scan").and_then(|s| s.as_object_mut()) {
             scan.remove("lastScanAgeS");
+        }
+        // A quiet watchdog cycle only moves `polledAt`: a heartbeat, not news.
+        if let Some(w) = o.get_mut("watchdog").and_then(|s| s.as_object_mut()) {
+            w.remove("polledAt");
         }
         if let Some(p) = o.get_mut("pihole").and_then(|s| s.as_object_mut()) {
             p.remove("pauseRemainingS");
@@ -838,6 +971,7 @@ mod tests {
     use crate::dnsmodel::fixtures as fx;
     use crate::net::fake::{fake_cfg, FakeNet, U_ETH1, U_WIFI};
     use crate::pihole::{AnsweredBy, Upstream};
+    use crate::watchdog::{Alert, Device, ReportDevice};
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
 
@@ -858,6 +992,48 @@ mod tests {
         fallback_in_use: Option<Fallback>,
         resolved_downgrade: Option<String>,
         api_state: Option<ApiLiveness>,
+        watchdog: Option<WatchdogReport>,
+    }
+
+    /// What the watchdog tells the state in the fixtures: one unacknowledged
+    /// alert (client unknown) and one device on this PC's list.
+    fn sample_report() -> WatchdogReport {
+        WatchdogReport {
+            status: "ok",
+            rev: 41,
+            suppressed: 0,
+            unacked: 1,
+            alerts: vec![Alert {
+                id: 7,
+                key: "a1b2c3d400000007".into(),
+                rev: 41,
+                kind: "new_device".into(),
+                severity: "warn".into(),
+                client: None,
+                subject: "02:00:00:00:00:07".into(),
+                first_unix: 1_794_000_000,
+                last_unix: 1_794_000_050,
+                count: 1,
+                acked: false,
+            }],
+            known_list: "received".into(),
+            devices: vec![ReportDevice {
+                device: Device {
+                    mac: "02:00:00:00:00:07".into(),
+                    ipv4: vec!["192.0.2.7".into()],
+                    hostname: String::new(),
+                    first_unix: 1_794_000_000,
+                    last_unix: 1_794_000_050,
+                    known: false,
+                },
+                known: true,
+                label: "Printer".into(),
+            }],
+            known_count: 12,
+            pushed_at: 1_794_000_001,
+            push_error: String::new(),
+            polled_at: 1_794_000_005,
+        }
     }
 
     fn fixture() -> Fixture {
@@ -931,6 +1107,7 @@ mod tests {
             fallback_in_use: None,
             resolved_downgrade: None,
             api_state: None,
+            watchdog: Some(sample_report()),
         }
     }
 
@@ -955,6 +1132,7 @@ mod tests {
                 api: &f.api,
                 failover: &f.fo,
                 scan: ScanView { running: false },
+                watchdog: f.watchdog.as_ref(),
                 error: "",
                 now_unix: 1_794_000_006.0,
                 net_age_s: 0.0,
@@ -1031,6 +1209,24 @@ mod tests {
                     {"t": 1794000005.0, "ok": true, "ms": 3.0, "blocked": true}
                 ]
             },
+            "watchdog": {
+                "status": "ok", "rev": 41, "suppressed": 0, "unacked": 1,
+                "alerts": [{
+                    "id": 7, "key": "a1b2c3d400000007", "kind": "new_device",
+                    "severity": "warn", "title": "New device on the network",
+                    "client": null, "subject": "02:00:00:00:00:07",
+                    "firstUnix": 1794000000, "lastUnix": 1794000050,
+                    "count": 1, "acked": false
+                }],
+                "knownList": "received",
+                "devices": [{
+                    "mac": "02:00:00:00:00:07", "ipv4": ["192.0.2.7"], "hostname": "",
+                    "firstUnix": 1794000000, "lastUnix": 1794000050,
+                    "knownOnPi": false, "known": true, "label": "Printer"
+                }],
+                "knownCount": 12, "pushedAt": 1794000001, "pushError": "",
+                "polledAt": 1794000005
+            },
             "error": ""
         });
         assert_eq!(
@@ -1104,6 +1300,115 @@ mod tests {
         st.heartbeat = true;
         assert_eq!(to_json(&st)["heartbeat"], true);
         assert_eq!(to_json(&st)["type"], "state");
+    }
+
+    // -- the watchdog section -------------------------------------------------
+
+    #[test]
+    fn the_watchdog_section_is_unconfigured_without_a_pihole_whatever_was_reported() {
+        let mut f = fixture();
+        f.cfg = Config::default();
+        assert_eq!(f.watchdog.as_ref().unwrap().alerts.len(), 1);
+        let st = build(&f);
+        assert_eq!(st.watchdog, WatchdogOut::empty("unconfigured"));
+        let v = to_json(&st);
+        assert_eq!(v["watchdog"]["status"], "unconfigured");
+        assert_eq!(v["watchdog"]["alerts"], json!([]));
+        assert_eq!(v["watchdog"]["devices"], json!([]));
+    }
+
+    #[test]
+    fn the_watchdog_section_is_unknown_and_empty_until_the_first_report() {
+        let mut f = fixture();
+        f.watchdog = None;
+        let st = build(&f);
+        assert_eq!(st.watchdog, WatchdogOut::empty("unknown"));
+        assert_eq!(
+            (
+                st.watchdog.rev,
+                st.watchdog.known_count,
+                st.watchdog.polled_at
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(st.watchdog.known_list, "");
+    }
+
+    #[test]
+    fn a_report_shows_in_the_state_with_titles_and_labels() {
+        let mut f = fixture();
+        let r = f.watchdog.as_mut().unwrap();
+        let mut second = r.alerts[0].clone();
+        second.id = 8;
+        second.kind = "something_new".into();
+        second.client = Some("192.0.2.9".into());
+        second.acked = true;
+        r.alerts.push(second);
+        let w = build(&f).watchdog;
+        assert_eq!(w.status, "ok");
+        assert_eq!(
+            (w.rev, w.suppressed, w.unacked, w.known_count),
+            (41, 0, 1, 12)
+        );
+        assert_eq!(w.alerts.len(), 2);
+        assert_eq!(w.alerts[0].title, "New device on the network");
+        assert_eq!(w.alerts[0].client, None);
+        assert_eq!(w.alerts[1].title, "Watchdog alert", "an unknown kind");
+        assert_eq!(w.alerts[1].client.as_deref(), Some("192.0.2.9"));
+        assert!(w.alerts[1].acked);
+        assert_eq!(w.known_list, "received");
+        assert_eq!(w.devices[0].mac, "02:00:00:00:00:07");
+        assert_eq!(
+            (w.devices[0].known, w.devices[0].known_on_pi),
+            (true, false)
+        );
+        assert_eq!(w.devices[0].label, "Printer");
+        assert_eq!((w.pushed_at, w.polled_at), (1_794_000_001, 1_794_000_005));
+    }
+
+    #[test]
+    fn a_quiet_watchdog_cycle_is_not_a_new_state_line_but_news_is() {
+        let f = fixture();
+        let base = build(&f);
+        for open in [false, true] {
+            // Only the time of the last cycle moved.
+            let mut g = fixture();
+            g.watchdog.as_mut().unwrap().polled_at += 60;
+            assert_eq!(
+                change_signature(&build(&g), open),
+                change_signature(&base, open),
+                "polledAt alone (open: {open})"
+            );
+            // A new alert.
+            let mut g = fixture();
+            let r = g.watchdog.as_mut().unwrap();
+            let mut a = r.alerts[0].clone();
+            a.id = 8;
+            a.rev = 42;
+            r.alerts.insert(0, a);
+            r.rev = 42;
+            assert_ne!(
+                change_signature(&build(&g), open),
+                change_signature(&base, open),
+                "a new alert (open: {open})"
+            );
+            // The unacknowledged count.
+            let mut g = fixture();
+            g.watchdog.as_mut().unwrap().unacked = 0;
+            assert_ne!(
+                change_signature(&build(&g), open),
+                change_signature(&base, open),
+                "unacked (open: {open})"
+            );
+            // The status.
+            let mut g = fixture();
+            g.watchdog.as_mut().unwrap().status = "unreachable";
+            assert_ne!(
+                change_signature(&build(&g), open),
+                change_signature(&base, open),
+                "status (open: {open})"
+            );
+        }
     }
 
     #[test]
@@ -1332,6 +1637,7 @@ mod tests {
                     api: &ApiView::unconfigured(),
                     failover: &f.fo,
                     scan: ScanView::default(),
+                    watchdog: None,
                     error: "",
                     now_unix: 1.0,
                     net_age_s: 0.0,
@@ -1544,6 +1850,7 @@ mod tests {
                 api: &f.api,
                 failover: &f.fo,
                 scan: ScanView::default(),
+                watchdog: None,
                 error: "",
                 now_unix: 1_794_000_006.0,
                 net_age_s: 0.0,
@@ -1624,6 +1931,7 @@ mod tests {
                 api: &ApiView::unconfigured(),
                 failover: &f.fo,
                 scan: ScanView::default(),
+                watchdog: None,
                 error: "",
                 now_unix: 1_794_000_006.0,
                 net_age_s: 0.0,

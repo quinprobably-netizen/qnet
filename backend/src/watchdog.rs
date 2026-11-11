@@ -7,15 +7,14 @@
 //! that into [`Qbp::Absent`], so the caller can treat the watchdog as not
 //! there and behave exactly as it did before.
 
-// Tasks 2 and 3 (the watcher cycle and the CLI verbs) wire these items in.
-#![allow(dead_code)]
-
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
 
 use serde_json::{json, Value};
 
 use crate::pihole::{ApiError, Pihole};
+use crate::wdstore::{self, Store};
 
 /// The largest request body sent to the Pi: its cap is 4096 bytes, this
 /// leaves room for the headers' share of whatever the Pi counts.
@@ -288,6 +287,8 @@ pub fn get_alerts(api: &mut Pihole, since: u64) -> Result<Qbp<AlertsPage>, ApiEr
 /// watchdog and when no alert has this id; the call cannot tell them apart,
 /// so the caller decides (it usually knows from an earlier answer whether the
 /// watchdog is there).
+// The CLI verb `qnet watchdog ack` (a later task) uses it.
+#[allow(dead_code)]
 pub fn ack(api: &mut Pihole, id: u64) -> Result<Qbp<()>, ApiError> {
     let path = format!("/api/qbp/alerts/{id}/ack");
     Ok(match api.json_opt("POST", &path, None)? {
@@ -546,9 +547,441 @@ impl Folder {
     }
 
     /// Alerts held back and not yet reported by a fold.
+    // Read by the tests only.
+    #[allow(dead_code)]
     pub fn pending(&self) -> u64 {
         self.pending
     }
+}
+
+// -- the poller ---------------------------------------------------------------
+
+/// Whether the Pi behind this login has a watchdog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// No qbp call has been answered yet (or a new session may know better).
+    Unknown,
+    Present,
+    /// A qbp call was answered 404: a real Pi-hole.
+    Absent,
+}
+
+/// Alerts the report carries (the newest changes).
+pub const REPORT_ALERTS: usize = 50;
+/// Devices the report carries (the ones seen last).
+pub const REPORT_DEVICES: usize = 128;
+
+/// A device of the Pi's inventory with what this PC knows about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportDevice {
+    pub device: Device,
+    /// On this PC's known list.
+    pub known: bool,
+    /// The label from the known list, "" when there is none.
+    pub label: String,
+}
+
+/// What the API thread tells the main thread after a watchdog cycle: the
+/// final display data, so building the state costs nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchdogReport {
+    /// `unknown`, `ok`, `absent`, `auth`, `tls` or `unreachable`.
+    pub status: &'static str,
+    /// The Pi's alert revision at the last answer.
+    pub rev: u64,
+    pub suppressed: u64,
+    /// Alerts not acknowledged, among those held in memory.
+    pub unacked: u64,
+    /// Newest change first, at most [`REPORT_ALERTS`].
+    pub alerts: Vec<Alert>,
+    /// `waiting`, `learned`, `received`, or "" (not fetched yet).
+    pub known_list: String,
+    /// Last seen first, at most [`REPORT_DEVICES`]; empty until fetched.
+    pub devices: Vec<ReportDevice>,
+    /// Entries on this PC's known list.
+    pub known_count: u64,
+    /// Unix time of the last push that sent something (0 = never).
+    pub pushed_at: u64,
+    /// Why the last push failed, "" when it did not.
+    pub push_error: String,
+    /// Unix time of the last cycle the Pi answered (0 = never).
+    pub polled_at: u64,
+}
+
+/// What one [`Poller::cycle`] produced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CycleOut {
+    /// Desktop notifications to show now, as `(title, body)`, already folded.
+    pub notifications: Vec<(String, String)>,
+    /// Whether the watchdog became present or absent during the cycle.
+    pub presence_changed: bool,
+}
+
+/// How a push attempt ended (when it did not fail the cycle).
+#[derive(Debug, PartialEq, Eq)]
+enum Pushed {
+    /// Done, or nothing was due.
+    Ok,
+    /// The Pi answered 404: there is no watchdog.
+    Absent,
+    /// Failed with an error that does not stop the cycle (it is in
+    /// `push_error` and the push stays due).
+    Failed,
+}
+
+/// The watchdog's state between cycles, for one API client: what the Pi
+/// last said, what was already pushed to it, and what needs pushing. All
+/// the logic of "one watchdog cycle" lives in [`cycle`](Poller::cycle); the
+/// thread only decides when to call it. Time is passed in, as unix seconds.
+#[derive(Debug)]
+pub struct Poller {
+    presence: Presence,
+    /// The Pi's `rev` at the last alerts answer that was recorded.
+    cursor: u64,
+    /// The alerts seen, by id, at most [`MAX_ALERTS`] (lowest `rev` dropped).
+    alerts: BTreeMap<u64, Alert>,
+    inventory: Option<Inventory>,
+    folder: Folder,
+    /// `api.logins()` after the last successful push; `None` = never pushed
+    /// with this client.
+    pushed_logins: Option<u64>,
+    /// A push was asked for (a restart, a `waiting` Pi) beyond what the
+    /// other triggers say.
+    push_due: bool,
+    /// `api.logins()` when the absence was seen: a different value is a new
+    /// session, which gets one more look.
+    absent_logins: u64,
+    pushed_at: u64,
+    push_error: String,
+    polled_at: u64,
+    status: &'static str,
+    rev: u64,
+    suppressed: u64,
+}
+
+impl Default for Poller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Poller {
+    pub fn new() -> Self {
+        Self {
+            presence: Presence::Unknown,
+            cursor: 0,
+            alerts: BTreeMap::new(),
+            inventory: None,
+            folder: Folder::new(),
+            pushed_logins: None,
+            push_due: false,
+            absent_logins: 0,
+            pushed_at: 0,
+            push_error: String::new(),
+            polled_at: 0,
+            status: "unknown",
+            rev: 0,
+            suppressed: 0,
+        }
+    }
+
+    pub fn presence(&self) -> Presence {
+        self.presence
+    }
+
+    /// The thread made a new API client: it has pushed nothing, and its
+    /// login counter starts again, so a remembered absence is void.
+    pub fn client_replaced(&mut self) {
+        self.pushed_logins = None;
+        if self.presence == Presence::Absent {
+            self.presence = Presence::Unknown;
+        }
+    }
+
+    /// A cycle failed with `e`: the status says why, the data stays.
+    pub fn fail(&mut self, e: &ApiError) {
+        self.status = e.status();
+    }
+
+    /// The Pi has no watchdog: forget what it said.
+    fn mark_absent(&mut self, api: &Pihole, now: u64) {
+        self.presence = Presence::Absent;
+        self.absent_logins = api.logins();
+        self.alerts.clear();
+        self.inventory = None;
+        self.cursor = 0;
+        self.rev = 0;
+        self.suppressed = 0;
+        self.push_error.clear();
+        self.status = "absent";
+        self.polled_at = now;
+    }
+
+    /// One watchdog cycle on `api`; see the plan's "One watchdog cycle".
+    ///
+    /// 1. When absent, nothing is asked unless a new login session began.
+    /// 2. Push what is due (acknowledged keys, then the known list).
+    /// 3. Fetch the alerts changed since the cursor. A `rev` below the
+    ///    cursor means the Pi restarted: the cursor and the alerts are reset,
+    ///    a push is made and the alerts come again from 0.
+    /// 4. Record the page in the store (acknowledged alerts, notified ones).
+    ///    If the store cannot be written (its lock stays taken) the cursor
+    ///    does not move: the next cycle gets the same alerts again and tries
+    ///    again, so a notification is late but never lost. Meanwhile no
+    ///    notification goes out, since it could not be recorded as sent.
+    /// 5. Fold the new notifications (also called with none, so a held fold
+    ///    goes out).
+    /// 6. With `with_devices`: fetch the inventory; a `waiting` Pi and a
+    ///    non-empty known list make another push at once. A failing devices
+    ///    read or push here never fails the cycle (the alerts were done).
+    ///
+    /// An `Err` means the Pi could not be talked to (or the alerts answer was
+    /// bad) and nothing was recorded; the caller reports it with
+    /// [`fail`](Self::fail).
+    pub fn cycle(
+        &mut self,
+        api: &mut Pihole,
+        store_path: &Path,
+        now: u64,
+        with_devices: bool,
+    ) -> Result<CycleOut, ApiError> {
+        let before = self.presence;
+        let notifications = self.run_cycle(api, store_path, now, with_devices)?;
+        Ok(CycleOut {
+            notifications,
+            presence_changed: self.presence != before,
+        })
+    }
+
+    fn run_cycle(
+        &mut self,
+        api: &mut Pihole,
+        store_path: &Path,
+        now: u64,
+        with_devices: bool,
+    ) -> Result<Vec<(String, String)>, ApiError> {
+        // 1.
+        if self.presence == Presence::Absent {
+            if api.logins() == self.absent_logins {
+                return Ok(Vec::new());
+            }
+            self.presence = Presence::Unknown;
+        }
+        // 2. and 3.
+        if self.push(api, store_path, now)? == Pushed::Absent {
+            return Ok(Vec::new());
+        }
+        let page = loop {
+            match get_alerts(api, self.cursor)? {
+                Qbp::Absent => {
+                    self.mark_absent(api, now);
+                    return Ok(Vec::new());
+                }
+                Qbp::Present(p) if p.rev < self.cursor => {
+                    // The Pi restarted. With the cursor at 0 this cannot
+                    // happen again, so the loop runs at most twice.
+                    self.cursor = 0;
+                    self.alerts.clear();
+                    self.inventory = None;
+                    self.push_due = true;
+                    if self.push(api, store_path, now)? == Pushed::Absent {
+                        return Ok(Vec::new());
+                    }
+                }
+                Qbp::Present(p) => break p,
+            }
+        };
+        self.presence = Presence::Present;
+        self.rev = page.rev;
+        self.suppressed = page.suppressed;
+        // 4.
+        let new = match record(store_path, &page, now) {
+            Ok(new) => {
+                self.cursor = page.rev;
+                new
+            }
+            Err(_) => Vec::new(),
+        };
+        self.merge(page.alerts);
+        // 5.
+        let notifications = self.folder.take(now, new);
+        // 6.
+        if with_devices {
+            match get_devices(api) {
+                Ok(Qbp::Present(inv)) => {
+                    let waiting = inv.known_list == "waiting";
+                    self.inventory = Some(inv);
+                    if waiting && !Store::load(store_path).known_macs().is_empty() {
+                        self.push_due = true;
+                        // Failures are in `push_error`; an absence is below.
+                        let _ = self.push(api, store_path, now);
+                    }
+                }
+                Ok(Qbp::Absent) => self.mark_absent(api, now),
+                Err(_) => {}
+            }
+        }
+        if self.presence == Presence::Present {
+            self.polled_at = now;
+            self.status = "ok";
+        }
+        Ok(notifications)
+    }
+
+    /// Step 2: push what is due. `Err` only for the failures that mean the
+    /// Pi cannot be talked to at all (auth, tls, unreachable); any other
+    /// failure is kept in `push_error` and does not stop the cycle.
+    fn push(&mut self, api: &mut Pihole, store_path: &Path, now: u64) -> Result<Pushed, ApiError> {
+        match self.try_push(api, store_path, now) {
+            Ok(Qbp::Absent) => {
+                self.mark_absent(api, now);
+                Ok(Pushed::Absent)
+            }
+            Ok(Qbp::Present(())) => Ok(Pushed::Ok),
+            Err(e) => {
+                self.push_error = e.message().to_string();
+                self.push_due = true;
+                match e {
+                    ApiError::Auth(_) | ApiError::Tls(_) | ApiError::Unreachable(_) => Err(e),
+                    ApiError::Other(_) => Ok(Pushed::Failed),
+                }
+            }
+        }
+    }
+
+    fn try_push(
+        &mut self,
+        api: &mut Pihole,
+        store_path: &Path,
+        now: u64,
+    ) -> Result<Qbp<()>, ApiError> {
+        let store = Store::load(store_path);
+        let due = self.pushed_logins != Some(api.logins()) || self.push_due || store.push_due();
+        if !due {
+            return Ok(Qbp::Present(()));
+        }
+        let mut sent = false;
+        let keys = store.acked_keys();
+        if !keys.is_empty() {
+            if restore_acked(api, &keys)? == Qbp::Absent {
+                return Ok(Qbp::Absent);
+            }
+            sent = true;
+        }
+        // An empty list is pushed only when an edit emptied it: otherwise it
+        // would make the Pi raise every device.
+        let macs = store.known_macs();
+        let send_known = !macs.is_empty() || store.push_due();
+        if send_known {
+            if put_known(api, &macs)? == Qbp::Absent {
+                return Ok(Qbp::Absent);
+            }
+            sent = true;
+        }
+        // Read after the calls: a re-login during the push is this session.
+        self.pushed_logins = Some(api.logins());
+        self.push_due = false;
+        self.push_error.clear();
+        if sent {
+            self.pushed_at = now;
+        }
+        if send_known {
+            // `store` was read before the push: an edit made while it was on
+            // the wire stays due.
+            let generation = store.known_gen;
+            if let Err(e) = wdstore::update(store_path, |s| s.mark_pushed(generation)) {
+                self.push_error = format!("the push could not be recorded: {e}");
+            }
+        }
+        Ok(Qbp::Present(()))
+    }
+
+    /// Merge a page into the alert map: by id, the lowest `rev` dropped
+    /// beyond [`MAX_ALERTS`].
+    fn merge(&mut self, alerts: Vec<Alert>) {
+        for a in alerts {
+            self.alerts.insert(a.id, a);
+        }
+        while self.alerts.len() > MAX_ALERTS {
+            let Some(lowest) = self.alerts.values().min_by_key(|a| a.rev).map(|a| a.id) else {
+                break;
+            };
+            self.alerts.remove(&lowest);
+        }
+    }
+
+    /// The display data for the main thread; `store` is this PC's list (for
+    /// the `known` flags and labels).
+    pub fn report(&self, store: &Store) -> WatchdogReport {
+        let mut alerts: Vec<Alert> = self.alerts.values().cloned().collect();
+        alerts.sort_by(|a, b| b.rev.cmp(&a.rev).then(b.id.cmp(&a.id)));
+        alerts.truncate(REPORT_ALERTS);
+        let unacked = self.alerts.values().filter(|a| !a.acked).count() as u64;
+
+        let mine: HashMap<&str, Option<&str>> = store
+            .known
+            .iter()
+            .map(|k| (k.mac.as_str(), k.label.as_deref()))
+            .collect();
+        let (known_list, mut devices) = match &self.inventory {
+            Some(inv) => (inv.known_list.clone(), inv.devices.clone()),
+            None => (String::new(), Vec::new()),
+        };
+        // The Pi sends the one seen last first; do not rely on it.
+        devices.sort_by_key(|d| std::cmp::Reverse(d.last_unix));
+        devices.truncate(REPORT_DEVICES);
+        let devices = devices
+            .into_iter()
+            .map(|d| {
+                let entry = mine.get(d.mac.as_str());
+                ReportDevice {
+                    known: entry.is_some(),
+                    label: entry.and_then(|l| *l).unwrap_or_default().to_string(),
+                    device: d,
+                }
+            })
+            .collect();
+
+        WatchdogReport {
+            status: self.status,
+            rev: self.rev,
+            suppressed: self.suppressed,
+            unacked,
+            alerts,
+            known_list,
+            devices,
+            known_count: store.known.len() as u64,
+            pushed_at: self.pushed_at,
+            push_error: self.push_error.clone(),
+            polled_at: self.polled_at,
+        }
+    }
+}
+
+/// Step 4: record a page in the store, in one locked update. Acknowledged
+/// alerts add their key to `acked`; the others that still need their
+/// notification are marked as notified and returned as `(title, body)`.
+/// Nothing is written (or locked) for an empty page.
+fn record(
+    store_path: &Path,
+    page: &AlertsPage,
+    now: u64,
+) -> std::io::Result<Vec<(String, String)>> {
+    if page.alerts.is_empty() {
+        return Ok(Vec::new());
+    }
+    wdstore::update(store_path, |s| {
+        let mut new = Vec::new();
+        for a in &page.alerts {
+            if a.acked {
+                s.add_acked(&a.key, now);
+            } else if s.should_notify(&a.key, a.first_unix) {
+                new.push(notification_for(a));
+                s.mark_notified(&a.key, a.first_unix, now);
+            }
+        }
+        new
+    })
 }
 
 #[cfg(test)]
@@ -1582,5 +2015,582 @@ mod tests {
         // An hour back: the old send times are in the future, so forgotten.
         let out = f.take(6_000, alerts_n(2));
         assert_eq!(out, alerts_n(2));
+    }
+
+    // -- the poller against a fake Pi ------------------------------------------
+
+    use crate::fakeqbp::{self, FakePi, T0};
+    use std::path::PathBuf;
+
+    /// A poller, its client and its store, against a fake Pi.
+    struct Rig {
+        pi: FakePi,
+        api: Pihole,
+        dir: tempfile::TempDir,
+        poller: Poller,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            Self::on(FakePi::start(200))
+        }
+        fn on(pi: FakePi) -> Self {
+            let api = pi.client();
+            Self {
+                pi,
+                api,
+                dir: tempfile::tempdir().unwrap(),
+                poller: Poller::new(),
+            }
+        }
+        fn path(&self) -> PathBuf {
+            self.dir.path().join("watchdog.json")
+        }
+        fn store(&self) -> Store {
+            Store::load(&self.path())
+        }
+        fn edit<R>(&self, f: impl FnOnce(&mut Store) -> R) -> R {
+            wdstore::update(&self.path(), f).unwrap()
+        }
+        fn try_cycle(&mut self, now: u64, devices: bool) -> Result<CycleOut, ApiError> {
+            let path = self.path();
+            let res = self.poller.cycle(&mut self.api, &path, now, devices);
+            // As the thread does: the fake serves one connection at a time.
+            self.api.close_idle();
+            res
+        }
+        fn cycle(&mut self, now: u64) -> CycleOut {
+            self.try_cycle(now, false).unwrap()
+        }
+        fn cycle_with_devices(&mut self, now: u64) -> CycleOut {
+            self.try_cycle(now, true).unwrap()
+        }
+        fn report(&self) -> WatchdogReport {
+            self.poller.report(&self.store())
+        }
+        fn acked_puts(&self) -> Vec<Value> {
+            self.pi.with(|s| s.acked_puts.clone())
+        }
+        fn known_puts(&self) -> Vec<Value> {
+            self.pi.with(|s| s.known_puts.clone())
+        }
+        fn since(&self) -> Vec<u64> {
+            self.pi.with(|s| s.since.clone())
+        }
+        /// 3 acknowledged keys and a known list of `n` MACs, as the CLI and
+        /// an earlier watcher would have left them.
+        fn prepare(&self, n: usize) {
+            self.edit(|s| {
+                for i in 1..=3 {
+                    s.add_acked(&fakeqbp::key(100 + i), T0);
+                }
+                for i in 1..=n {
+                    s.know(&fakeqbp::mac(i), None, T0);
+                }
+            });
+        }
+    }
+
+    fn assert_chunks(puts: &[Value], macs: &[String]) {
+        assert!(puts.len() >= 2, "{} chunks", puts.len());
+        let last = puts.len() - 1;
+        let mut all = Vec::new();
+        for (i, body) in puts.iter().enumerate() {
+            assert_eq!(body["append"], json!(i > 0), "chunk {i}: append");
+            assert_eq!(body["complete"], json!(i == last), "chunk {i}: complete");
+            assert!(body.to_string().len() <= QBP_BODY_MAX, "chunk {i} too big");
+            all.extend(
+                body["known"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.as_str().unwrap().to_string()),
+            );
+        }
+        assert_eq!(all, macs, "every MAC, once, in order");
+    }
+
+    /// Index of the first logged request that begins with `prefix`.
+    fn first_at(pi: &FakePi, prefix: &str) -> usize {
+        pi.with(|s| s.log.iter().position(|l| l.starts_with(prefix)))
+            .unwrap_or_else(|| panic!("no request {prefix}"))
+    }
+
+    #[test]
+    fn the_first_cycle_pushes_the_acks_then_the_known_list_in_chunks_then_fetches_alerts() {
+        let mut rig = Rig::new();
+        rig.prepare(250);
+        let out = rig.cycle(T0 + 1);
+        assert!(out.notifications.is_empty());
+        assert!(out.presence_changed, "unknown to present");
+        assert_eq!(rig.poller.presence(), Presence::Present);
+
+        let keys: Vec<String> = (1..=3).map(|i| fakeqbp::key(100 + i)).collect();
+        assert_eq!(rig.acked_puts(), vec![json!({ "acked": keys })]);
+        let macs: Vec<String> = (1..=250).map(fakeqbp::mac).collect();
+        assert_chunks(&rig.known_puts(), &macs);
+        assert_eq!(rig.known_puts().len(), 2);
+        assert_eq!(rig.since(), vec![0]);
+
+        // Acks first, then the list, then the alerts.
+        let acked = first_at(&rig.pi, "PUT /api/qbp/alerts/acked");
+        let known = first_at(&rig.pi, "PUT /api/qbp/devices/known");
+        let alerts = first_at(&rig.pi, "GET /api/qbp/alerts");
+        assert!(acked < known && known < alerts);
+
+        assert!(!rig.store().push_due(), "the push was recorded");
+        let r = rig.report();
+        assert_eq!(
+            (r.status, r.pushed_at, r.push_error.as_str()),
+            ("ok", T0 + 1, "")
+        );
+        assert_eq!((r.known_count, r.polled_at), (250, T0 + 1));
+
+        // Nothing is due any more: only the alerts come.
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.acked_puts().len(), 1);
+        assert_eq!(rig.known_puts().len(), 2);
+        assert_eq!(rig.since(), vec![0, 0]);
+    }
+
+    #[test]
+    fn an_empty_known_list_is_never_pushed_unless_an_edit_emptied_it() {
+        let mut rig = Rig::new();
+        // Nothing to push at all: not a request, and not a "pushed at".
+        rig.cycle(T0);
+        assert!(rig.acked_puts().is_empty() && rig.known_puts().is_empty());
+        assert_eq!(rig.report().pushed_at, 0);
+
+        // Acks only: they go, the empty list does not, also not when the
+        // Pi says it is waiting for one.
+        rig.edit(|s| s.add_acked(&fakeqbp::key(101), T0));
+        rig.poller.client_replaced();
+        rig.cycle_with_devices(T0 + 1);
+        assert_eq!(rig.acked_puts().len(), 1);
+        rig.pi.set_known_list("waiting");
+        rig.cycle_with_devices(T0 + 2);
+        assert!(rig.known_puts().is_empty(), "{:?}", rig.known_puts());
+        assert_eq!(rig.report().known_list, "waiting");
+        assert_eq!(rig.report().pushed_at, T0 + 1);
+
+        // An edit that emptied the list is a change the Pi has to hear.
+        rig.edit(|s| {
+            s.know(&fakeqbp::mac(1), None, T0);
+            s.forget(&fakeqbp::mac(1));
+        });
+        assert!(rig.store().push_due() && rig.store().known.is_empty());
+        rig.cycle(T0 + 3);
+        assert_eq!(
+            rig.known_puts(),
+            vec![json!({"known": [], "append": false, "complete": true})]
+        );
+        assert!(!rig.store().push_due());
+        rig.cycle(T0 + 4);
+        assert_eq!(rig.known_puts().len(), 1, "and only once");
+    }
+
+    #[test]
+    fn a_new_login_session_pushes_again_from_the_next_cycle() {
+        let mut rig = Rig::new();
+        rig.prepare(250);
+        rig.cycle(T0);
+        assert_eq!((rig.acked_puts().len(), rig.known_puts().len()), (1, 2));
+        assert_eq!(rig.pi.with(|s| s.logins), 1);
+
+        // The Pi forgets the session. The re-login happens inside the alerts
+        // request, after this cycle's push decision, so the push is the next
+        // cycle's.
+        rig.pi.invalidate();
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.pi.with(|s| s.logins), 2);
+        assert_eq!((rig.acked_puts().len(), rig.known_puts().len()), (1, 2));
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.acked_puts().len(), 2);
+        let puts = rig.known_puts();
+        assert_eq!(puts.len(), 4, "the whole list again, in two chunks");
+        let macs: Vec<String> = (1..=250).map(fakeqbp::mac).collect();
+        assert_chunks(&puts[2..], &macs);
+        // And then it is quiet again.
+        rig.cycle(T0 + 3);
+        assert_eq!((rig.acked_puts().len(), rig.known_puts().len()), (2, 4));
+    }
+
+    #[test]
+    fn a_pi_restart_resets_the_cursor_pushes_again_and_refetches_from_zero() {
+        let mut rig = Rig::new();
+        rig.prepare(250);
+        for i in 1..=3 {
+            rig.pi.raise("dga", "x.example", Some("192.0.2.5"), i);
+        }
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.since(), vec![0]);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.since(), vec![0, 3], "the cursor is the Pi's rev");
+        assert_eq!(rig.report().alerts.len(), 3);
+
+        // Reboot: rev and ids restart; the same key is a fresh instance.
+        rig.pi.reboot();
+        rig.pi.raise("dga", "x.example", Some("192.0.2.5"), 1);
+        let out = rig.cycle(T0 + 3);
+        assert_eq!(rig.since(), vec![0, 3, 3, 0], "asked from 3, then from 0");
+        assert_eq!(rig.acked_puts().len(), 2, "acks pushed to the new Pi");
+        let puts = rig.known_puts();
+        assert_eq!(puts.len(), 4);
+        let macs: Vec<String> = (1..=250).map(fakeqbp::mac).collect();
+        assert_chunks(&puts[2..], &macs);
+        assert_eq!(rig.pi.with(|s| s.known.len()), 250);
+        let r = rig.report();
+        assert_eq!(r.rev, 1);
+        assert_eq!(r.alerts.len(), 1, "the old map is gone: {:?}", r.alerts);
+        assert_eq!(r.alerts[0].id, 1);
+        assert_eq!(
+            out.notifications.len(),
+            1,
+            "a later first_unix for an old key is a new alert"
+        );
+        // One push for it, not one per cycle.
+        rig.cycle(T0 + 4);
+        assert_eq!(rig.acked_puts().len(), 2);
+        assert_eq!(rig.since(), vec![0, 3, 3, 0, 1]);
+    }
+
+    #[test]
+    fn a_waiting_pi_gets_the_list_when_the_devices_are_read() {
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            for i in 1..=5 {
+                s.know(&fakeqbp::mac(i), None, T0);
+            }
+        });
+        rig.cycle(T0);
+        assert_eq!(rig.known_puts().len(), 1);
+        assert_eq!(rig.pi.with(|s| s.known_list), "received");
+
+        // The Pi lost its list without a new session (say, its process was
+        // restarted behind a proxy). Without a devices read nobody knows.
+        rig.pi.set_known_list("waiting");
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.known_puts().len(), 1);
+        // Reading the devices shows it, and the push follows in that cycle.
+        rig.cycle_with_devices(T0 + 2);
+        assert_eq!(rig.known_puts().len(), 2);
+        assert_eq!(rig.pi.with(|s| s.known_list), "received");
+        assert_eq!(
+            rig.report().known_list,
+            "waiting",
+            "as read, before the push"
+        );
+        rig.cycle_with_devices(T0 + 3);
+        assert_eq!(rig.known_puts().len(), 2, "received: nothing to do");
+        assert_eq!(rig.report().known_list, "received");
+    }
+
+    #[test]
+    fn a_failing_push_is_reported_and_stays_due_while_the_alerts_still_come() {
+        let mut rig = Rig::new();
+        rig.prepare(5);
+        rig.pi.with(|s| s.fail_puts = true);
+        rig.pi.raise("beacon", "x.example", None, 1);
+        let out = rig.cycle(T0 + 1);
+        let r = rig.report();
+        assert_eq!(r.status, "ok", "the Pi answered the alerts");
+        assert!(r.push_error.contains("500"), "{}", r.push_error);
+        assert_eq!((r.pushed_at, r.alerts.len()), (0, 1));
+        assert_eq!(out.notifications.len(), 1);
+        assert!(rig.store().push_due());
+
+        rig.pi.with(|s| s.fail_puts = false);
+        rig.cycle(T0 + 2);
+        let r = rig.report();
+        assert_eq!((r.push_error.as_str(), r.pushed_at), ("", T0 + 2));
+        assert_eq!(rig.pi.with(|s| s.known.len()), 5);
+        assert!(!rig.store().push_due());
+    }
+
+    #[test]
+    fn errors_that_mean_no_contact_end_the_cycle_and_keep_the_push_due() {
+        let mut rig = Rig::new();
+        rig.prepare(5);
+        // A dead port: unreachable, before any request is answered.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        rig.api = Pihole::at(addr, [0; 32], pw()).unwrap();
+        let e = rig.try_cycle(T0, false).unwrap_err();
+        assert_eq!(e.status(), "unreachable");
+        rig.poller.fail(&e);
+        let r = rig.report();
+        assert_eq!((r.status, r.polled_at, r.pushed_at), ("unreachable", 0, 0));
+        assert!(!r.push_error.is_empty(), "the failed push is shown");
+        assert_eq!(rig.poller.presence(), Presence::Unknown);
+        // Back on a working Pi it goes through and the status recovers.
+        rig.api = rig.pi.client();
+        rig.cycle(T0 + 1);
+        let r = rig.report();
+        assert_eq!(
+            (r.status, r.push_error.as_str(), r.pushed_at),
+            ("ok", "", T0 + 1)
+        );
+    }
+
+    #[test]
+    fn a_real_pihole_is_absent_after_one_request_and_stays_so_for_the_session() {
+        let mut rig = Rig::on(FakePi::pihole_only(50));
+        let out = rig.cycle(T0);
+        assert!(out.presence_changed);
+        assert_eq!(rig.poller.presence(), Presence::Absent);
+        assert_eq!(rig.pi.qbp_requests(), 1, "just the alerts");
+        let r = rig.report();
+        assert_eq!((r.status, r.polled_at), ("absent", T0));
+        assert!(r.alerts.is_empty() && r.devices.is_empty());
+        for i in 1..=5 {
+            let out = rig.cycle_with_devices(T0 + i);
+            assert!(!out.presence_changed);
+        }
+        assert_eq!(rig.pi.qbp_requests(), 1, "no request per cycle");
+
+        // A new session (here: logged out, then used again) gets one look.
+        rig.api.logout();
+        rig.api.summary().unwrap();
+        let out = rig.cycle(T0 + 10);
+        assert!(!out.presence_changed, "absent before and after");
+        assert_eq!(rig.pi.qbp_requests(), 2);
+        rig.cycle(T0 + 11);
+        assert_eq!(rig.pi.qbp_requests(), 2);
+
+        // A new client forgets the absence as well.
+        rig.poller.client_replaced();
+        assert_eq!(rig.poller.presence(), Presence::Unknown);
+    }
+
+    #[test]
+    fn an_absence_found_by_a_push_needs_no_alerts_request() {
+        let mut rig = Rig::on(FakePi::pihole_only(50));
+        rig.prepare(5);
+        rig.cycle(T0);
+        assert_eq!(rig.poller.presence(), Presence::Absent);
+        assert_eq!(rig.pi.qbp_requests(), 1);
+        assert_eq!(rig.pi.count("PUT /api/qbp/alerts/acked"), 1);
+        assert_eq!(rig.pi.count("GET /api/qbp/alerts"), 0);
+        assert!(rig.store().push_due(), "nothing was pushed");
+    }
+
+    // -- notifications ---------------------------------------------------------
+
+    fn note_titles(out: &CycleOut) -> Vec<&str> {
+        out.notifications.iter().map(|n| n.0.as_str()).collect()
+    }
+
+    #[test]
+    fn five_new_alerts_are_three_notifications_and_a_fold_with_escaped_text() {
+        let mut rig = Rig::new();
+        rig.pi.raise("new_device", "02:00:00:00:00:07", None, 1);
+        rig.pi.raise("arp_spoof", "<b>&", Some("192.0.2.9"), 2);
+        rig.pi.raise("dga", "x.example", Some("192.0.2.5"), 3);
+        rig.pi.raise("tunnel", "y.example", None, 4);
+        rig.pi.raise("beacon", "z.example", None, 5);
+        let out = rig.cycle(T0 + 100);
+        assert_eq!(
+            out.notifications,
+            vec![
+                (
+                    "New device on the network".to_string(),
+                    "02:00:00:00:00:07".to_string()
+                ),
+                (
+                    "Router impersonation (ARP spoofing)".to_string(),
+                    "&lt;b&gt;&amp; · 192.0.2.9".to_string()
+                ),
+                (
+                    "Suspicious lookups (DGA)".to_string(),
+                    "x.example · 192.0.2.5".to_string()
+                ),
+                ("Watchdog".to_string(), "2 more alerts".to_string()),
+            ]
+        );
+        // All five are recorded, the folded ones too.
+        let st = rig.store();
+        assert_eq!(st.notified.len(), 5);
+        assert!(!st.should_notify(&fakeqbp::key(5), T0 + 50));
+    }
+
+    #[test]
+    fn acked_alerts_give_no_notification_and_their_key_is_stored() {
+        let mut rig = Rig::new();
+        let id = rig.pi.raise("dga", "x.example", None, 1);
+        rig.pi.ack(id);
+        let out = rig.cycle(T0 + 100);
+        assert!(out.notifications.is_empty(), "{:?}", out.notifications);
+        assert_eq!(rig.store().acked_keys(), vec![fakeqbp::key(1)]);
+        assert!(rig.store().notified.is_empty());
+        let r = rig.report();
+        assert_eq!((r.unacked, r.alerts.len()), (0, 1));
+        assert!(r.alerts[0].acked);
+    }
+
+    #[test]
+    fn a_repeated_alert_and_a_restarted_watcher_do_not_notify_again() {
+        let mut rig = Rig::new();
+        let a = rig.pi.raise("new_device", "02:00:00:00:00:07", None, 1);
+        rig.pi.raise("dga", "x.example", None, 2);
+        let acked = rig.pi.raise("beacon", "z.example", None, 3);
+        rig.pi.ack(acked);
+        assert_eq!(rig.cycle(T0 + 100).notifications.len(), 2);
+
+        // The same alert again: a higher rev and count, the same first_unix.
+        rig.pi.repeat(a);
+        let out = rig.cycle(T0 + 200);
+        assert!(out.notifications.is_empty());
+        let r = rig.report();
+        assert_eq!(r.alerts[0].id, a, "newest change first");
+        assert_eq!(r.alerts[0].count, 2);
+
+        // A new watcher process: a new poller and client, the same store. It
+        // reads everything from 0 and finds nothing to announce.
+        let mut api2 = rig.pi.client();
+        let mut p2 = Poller::new();
+        let out = p2.cycle(&mut api2, &rig.path(), T0 + 300, false).unwrap();
+        api2.close_idle();
+        assert!(out.notifications.is_empty(), "{:?}", out.notifications);
+        assert_eq!(p2.report(&rig.store()).alerts.len(), 3);
+        assert_eq!(rig.since().last(), Some(&0));
+
+        // But a different alert is news.
+        rig.pi.raise("tunnel", "w.example", None, 9);
+        let out = p2.cycle(&mut api2, &rig.path(), T0 + 400, false).unwrap();
+        assert_eq!(note_titles(&out), vec!["Possible DNS tunnel"]);
+    }
+
+    #[test]
+    fn a_held_fold_goes_out_on_a_later_cycle_with_nothing_new() {
+        let mut rig = Rig::new();
+        for i in 1..=5 {
+            rig.pi.raise("dga", "x.example", None, i);
+        }
+        let out = rig.cycle(T0 + 100);
+        assert_eq!(out.notifications.len(), 4, "3 and the fold of 2");
+        // 30 s later 4 more: inside the window, so all of them are held.
+        for i in 6..=9 {
+            rig.pi.raise("dga", "x.example", None, i);
+        }
+        assert!(rig.cycle(T0 + 130).notifications.is_empty());
+        assert!(rig.cycle(T0 + 159).notifications.is_empty());
+        // A cycle with nothing new at 160 opens the gate.
+        let out = rig.cycle(T0 + 160);
+        assert_eq!(
+            out.notifications,
+            vec![("Watchdog".to_string(), "4 more alerts".to_string())]
+        );
+        assert!(rig.cycle(T0 + 161).notifications.is_empty());
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_written_keeps_the_cursor_and_notifies_late() {
+        let mut rig = Rig::new();
+        rig.pi.raise("dga", "x.example", None, 1);
+        // Another process holds the store's lock for longer than the wait.
+        let lock = crate::util::try_lock(&rig.dir.path().join("watchdog.lock"))
+            .unwrap()
+            .expect("the lock was free");
+        let out = rig.cycle(T0 + 100);
+        assert!(out.notifications.is_empty(), "nothing could be recorded");
+        let r = rig.report();
+        assert_eq!(r.status, "ok");
+        assert_eq!(r.alerts.len(), 1, "still shown");
+        drop(lock);
+        // The cursor did not move, so the same alert comes again and is
+        // announced now.
+        let out = rig.cycle(T0 + 101);
+        assert_eq!(note_titles(&out), vec!["Suspicious lookups (DGA)"]);
+        assert_eq!(rig.since(), vec![0, 0]);
+        assert!(rig.cycle(T0 + 102).notifications.is_empty());
+        assert_eq!(rig.since(), vec![0, 0, 1]);
+    }
+
+    // -- the report ------------------------------------------------------------
+
+    #[test]
+    fn the_report_holds_the_newest_fifty_alerts_and_the_map_is_bounded() {
+        let mut rig = Rig::new();
+        for i in 1..=200 {
+            rig.pi.raise("dga", "x.example", None, i);
+        }
+        rig.cycle(T0 + 1);
+        for i in 201..=300 {
+            rig.pi.raise("dga", "x.example", None, i);
+        }
+        rig.cycle(T0 + 2);
+        let r = rig.report();
+        assert_eq!(r.rev, 300);
+        assert_eq!(r.unacked, 256, "at most 256 are kept, the oldest go");
+        assert_eq!(r.alerts.len(), REPORT_ALERTS);
+        assert_eq!(r.alerts[0].id, 300);
+        assert_eq!(r.alerts[49].id, 251);
+        assert!(r.alerts.windows(2).all(|w| w[0].rev > w[1].rev));
+        // An acknowledgement on the Pi shows as a change of that alert.
+        rig.pi.ack(300);
+        rig.cycle(T0 + 3);
+        let r = rig.report();
+        assert_eq!(
+            (r.alerts[0].id, r.alerts[0].acked, r.unacked),
+            (300, true, 255)
+        );
+        assert!(rig.store().acked_keys().contains(&fakeqbp::key(300)));
+    }
+
+    #[test]
+    fn the_device_list_is_last_seen_first_capped_and_merged_with_the_pcs_list() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| {
+            s.devices = (1..=200)
+                .map(|i| (fakeqbp::mac(i), format!("192.0.2.{}", i % 250 + 1)))
+                .collect();
+        });
+        rig.edit(|s| {
+            s.know(&fakeqbp::mac(190), Some("Printer"), T0);
+            s.know(&fakeqbp::mac(300), Some("Not seen"), T0);
+        });
+        rig.cycle(T0 + 1);
+        assert!(
+            rig.report().devices.is_empty(),
+            "not read without a request"
+        );
+        // The Pi got the PC's list; its own flags are what it reports.
+        rig.pi.with(|s| s.known.clear());
+        rig.cycle_with_devices(T0 + 2);
+        let r = rig.report();
+        assert_eq!(r.devices.len(), REPORT_DEVICES);
+        // The fake lists the oldest first; the last seen is mac 200.
+        assert_eq!(r.devices[0].device.mac, fakeqbp::mac(200));
+        assert!(r
+            .devices
+            .windows(2)
+            .all(|w| w[0].device.last_unix >= w[1].device.last_unix));
+        assert_eq!(r.known_count, 2);
+        let printer = r
+            .devices
+            .iter()
+            .find(|d| d.device.mac == fakeqbp::mac(190))
+            .expect("mac 190 is among the 128 last seen");
+        assert_eq!((printer.known, printer.label.as_str()), (true, "Printer"));
+        assert!(!printer.device.known, "the Pi's own view is separate");
+        assert_eq!(printer.device.ipv4, vec!["192.0.2.191".to_string()]);
+        let other = &r.devices[1];
+        assert_eq!((other.known, other.label.as_str()), (false, ""));
+        assert_eq!(r.known_list, "received");
+    }
+
+    #[test]
+    fn an_unknown_status_before_any_cycle_and_a_failure_keeps_the_data() {
+        let mut rig = Rig::new();
+        let r = rig.report();
+        assert_eq!((r.status, r.rev, r.polled_at), ("unknown", 0, 0));
+        rig.pi.raise("dga", "x.example", None, 1);
+        rig.cycle(T0 + 5);
+        rig.poller.fail(&ApiError::Tls("pin".into()));
+        let r = rig.report();
+        assert_eq!((r.status, r.polled_at, r.alerts.len()), ("tls", T0 + 5, 1));
+        rig.cycle(T0 + 6);
+        assert_eq!(rig.report().status, "ok");
     }
 }

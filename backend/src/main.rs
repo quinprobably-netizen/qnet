@@ -16,6 +16,8 @@ mod config;
 mod dnsmodel;
 mod dnswire;
 mod failover;
+#[cfg(test)]
+mod fakeqbp;
 mod https;
 mod icmp;
 mod ledger;

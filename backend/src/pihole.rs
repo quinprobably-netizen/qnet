@@ -478,8 +478,6 @@ impl Pihole {
     /// How many sessions this client has opened with a successful login. It
     /// starts at 0, `resume_session` does not count, and a re-login after a
     /// 401 does: a changed value means "this is a new session".
-    // The watchdog cycle (a later task) reads it.
-    #[allow(dead_code)]
     pub fn logins(&self) -> u64 {
         self.logins
     }

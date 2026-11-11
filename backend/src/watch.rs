@@ -6,7 +6,8 @@
 //!   * NM watcher     - NetworkManager D-Bus signals;
 //!   * prober         - raw UDP DNS probes to the Pi-hole, an upstream
 //!     check, the gateway gate, and (open only) an ICMP echo to the gateway;
-//!   * API poller     - Pi-hole HTTPS API, only while the panel is open.
+//!   * API poller     - Pi-hole HTTPS API while the panel is open, and the
+//!     watchdog's own alerts poll while it is closed (see `watchdog.rs`).
 //!
 //! The main thread owns the model and is the only one that touches DNS
 //! settings. `Watch` takes the current time as an argument everywhere, so
@@ -29,6 +30,7 @@ use crate::neigh;
 use crate::net::*;
 use crate::state::*;
 use crate::util;
+use crate::watchdog::WatchdogReport;
 
 pub use crate::threads::*;
 
@@ -104,6 +106,8 @@ pub struct Watch {
     probe_target: Option<ProbeTarget>,
     api: ApiView,
     api_cfg: Option<ApiCfg>,
+    /// The watchdog's last report; dropped when the Pi-hole changes.
+    watchdog: Option<WatchdogReport>,
     fo: Failover,
     /// The link failover was applied to; recovery goes back to this one even
     /// if the primary link has changed since.
@@ -177,6 +181,7 @@ impl Watch {
             probe_target: None,
             api: ApiView::unconfigured(),
             api_cfg: None,
+            watchdog: None,
             fo: Failover::new(),
             engaged: None,
             candidate: None,
@@ -465,6 +470,7 @@ impl Watch {
             } else {
                 ApiView::unconfigured()
             };
+            self.watchdog = None;
             if let Some(tx) = &self.api_tx {
                 let _ = tx.send(ApiCtl::Config(api_cfg.clone()));
             }
@@ -572,6 +578,10 @@ impl Watch {
             }
             Event::Api(r) => {
                 self.on_api(r);
+                self.touch();
+            }
+            Event::Watchdog(r) => {
+                self.watchdog = Some(r);
                 self.touch();
             }
             Event::Downgrade(d) => {
@@ -1070,6 +1080,7 @@ impl Watch {
                 api: &self.api,
                 failover: &self.fo,
                 scan: ScanView { running: false },
+                watchdog: self.watchdog.as_ref(),
                 error,
                 now_unix: now,
                 net_age_s: now - self.net_read_unix,
@@ -1264,7 +1275,11 @@ pub fn run_watch(be: Box<dyn NetBackend>) -> i32 {
     spawn_stdin(tx.clone());
     spawn_nm_watcher(tx.clone());
     let (probe_tx, probe_h) = spawn_prober(tx.clone(), Cadence::default(), real_probe());
-    let (api_tx, api_h) = spawn_api(tx.clone(), ApiTiming::default(), real_api_factory());
+    let deps = WatchdogDeps {
+        store_path: util::state_dir().join("watchdog.json"),
+        notify: Arc::new(desktop_notify),
+    };
+    let (api_tx, api_h) = spawn_api(tx.clone(), ApiTiming::default(), real_api_factory(), deps);
     // Keep a second sender for the final join: `shutdown` consumes the
     // watch's own copies.
     w.attach_threads(probe_tx.clone(), api_tx.clone());
@@ -2284,6 +2299,116 @@ mod tests {
         r.w.age_api_blocking(60.0);
         let line = r.w.next_emission(11_000).unwrap();
         assert!(matches!(line, Line::State(_)), "{line:?}");
+    }
+
+    // -- the watchdog -------------------------------------------------------------
+
+    fn wd_report(polled_at: u64, alerts: usize) -> crate::watchdog::WatchdogReport {
+        use crate::watchdog::{Alert, WatchdogReport};
+        WatchdogReport {
+            status: "ok",
+            rev: alerts as u64,
+            suppressed: 0,
+            unacked: alerts as u64,
+            alerts: (1..=alerts as u64)
+                .rev()
+                .map(|id| Alert {
+                    id,
+                    key: format!("a1b2c3d4000000{id:02x}"),
+                    rev: id,
+                    kind: "dga".into(),
+                    severity: "warn".into(),
+                    client: Some("192.0.2.5".into()),
+                    subject: "x.example".into(),
+                    first_unix: 1_800_000_000 + id,
+                    last_unix: 1_800_000_000 + id,
+                    count: 1,
+                    acked: false,
+                })
+                .collect(),
+            known_list: "received".into(),
+            devices: vec![],
+            known_count: 0,
+            pushed_at: 0,
+            push_error: String::new(),
+            polled_at,
+        }
+    }
+
+    #[test]
+    fn the_state_has_a_watchdog_section_unknown_until_the_first_report() {
+        let mut r = rig();
+        let st = state_of(r.w.next_emission(100).unwrap());
+        assert_eq!(st.watchdog.status, "unknown");
+        assert!(st.watchdog.alerts.is_empty());
+        // Without a Pi-hole there is nothing to be unknown about.
+        let mut r = rig_with(None, FakeNet::live_machine());
+        let st = state_of(r.w.next_emission(100).unwrap());
+        assert_eq!(st.watchdog.status, "unconfigured");
+        r.w.handle(Event::Watchdog(wd_report(5, 2)), 200);
+        assert_eq!(r.w.state(false).watchdog.status, "unconfigured");
+    }
+
+    #[test]
+    fn a_quiet_watchdog_cycle_is_a_heartbeat_while_closed_and_a_new_alert_is_a_state_line() {
+        let mut r = rig();
+        state_of(r.w.next_emission(100).unwrap());
+        // The first report changes the status from unknown to ok.
+        r.w.handle(Event::Watchdog(wd_report(1_800_000_100, 0)), 400);
+        let st = state_of(r.w.next_emission(400).unwrap());
+        assert_eq!(st.watchdog.status, "ok");
+        assert_eq!(st.watchdog.polled_at, 1_800_000_100);
+
+        // A minute later, the same: only `polledAt` moved. Not a state line,
+        // just the heartbeat that is due anyway.
+        r.w.handle(Event::Watchdog(wd_report(1_800_000_160, 0)), 60_400);
+        assert_eq!(r.w.next_emission(60_400), Some(Line::Hb { seq: 2 }));
+        r.w.handle(Event::Watchdog(wd_report(1_800_000_220, 0)), 120_400);
+        assert_eq!(r.w.next_emission(120_400), Some(Line::Hb { seq: 2 }));
+        // Inside the heartbeat interval it is not even that.
+        r.w.handle(Event::Watchdog(wd_report(1_800_000_225, 0)), 125_400);
+        assert_eq!(r.w.next_emission(125_400), None);
+
+        // A new alert is news, open or closed.
+        r.w.handle(Event::Watchdog(wd_report(1_800_000_280, 1)), 180_400);
+        let st = state_of(r.w.next_emission(180_400).unwrap());
+        assert_eq!((st.watchdog.alerts.len(), st.watchdog.unacked), (1, 1));
+        assert_eq!(st.watchdog.alerts[0].title, "Suspicious lookups (DGA)");
+        assert_eq!(
+            st.watchdog.polled_at, 1_800_000_280,
+            "the latest time is in it"
+        );
+
+        // Acknowledging it elsewhere changes `unacked`: a line again.
+        let mut acked = wd_report(1_800_000_340, 1);
+        acked.unacked = 0;
+        acked.alerts[0].acked = true;
+        r.w.handle(Event::Watchdog(acked), 240_400);
+        let st = state_of(r.w.next_emission(240_400).unwrap());
+        assert_eq!(st.watchdog.unacked, 0);
+    }
+
+    #[test]
+    fn the_watchdog_report_is_dropped_when_the_pihole_changes() {
+        let mut r = rig();
+        r.w.handle(Event::Watchdog(wd_report(1_800_000_100, 2)), 100);
+        assert_eq!(r.w.state(false).watchdog.alerts.len(), 2);
+        // The same Pi-hole read again: the report stays.
+        r.w.handle(Event::Cmd("refresh".into()), 200);
+        r.w.process_dirty(700);
+        assert_eq!(r.w.state(false).watchdog.alerts.len(), 2);
+        // Another certificate pin is another Pi-hole.
+        let other = config_text("enabled = true\nfallback = \"router\"").replace(
+            &crate::util::format_fingerprint(&[1; 32]),
+            &crate::util::format_fingerprint(&[2; 32]),
+        );
+        std::fs::write(r.dir.path().join("config.toml"), other).unwrap();
+        r.w.handle(Event::Cmd("refresh".into()), 800);
+        r.w.process_dirty(1_400);
+        let st = r.w.state(false);
+        assert_eq!(st.watchdog.status, "unknown");
+        assert!(st.watchdog.alerts.is_empty());
+        assert_eq!(st.pihole.api, "ok", "the Pi-hole is still configured");
     }
 
     #[test]

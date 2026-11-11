@@ -204,6 +204,26 @@ subtracts it from `today` and from each `history` bucket.
     "detected": "",
     "probes": [{ "t": 1794035000.1, "ok": true, "ms": 3.1, "blocked": true }]
   },
+  "watchdog": {
+    "status": "unknown|ok|absent|auth|tls|unreachable|unconfigured",
+    "rev": 41,
+    "suppressed": 0,
+    "unacked": 1,
+    "alerts": [
+      { "id": 7, "key": "a1b2c3d400000007", "kind": "new_device", "severity": "info|warn|high",
+        "title": "New device on the network", "client": null, "subject": "02:00:00:00:00:07",
+        "firstUnix": 1794000000, "lastUnix": 1794000050, "count": 1, "acked": false }
+    ],
+    "knownList": "waiting|learned|received|",
+    "devices": [
+      { "mac": "02:00:00:00:00:07", "ipv4": ["192.0.2.7"], "hostname": "", "firstUnix": 1794000000,
+        "lastUnix": 1794000050, "knownOnPi": false, "known": true, "label": "Printer" }
+    ],
+    "knownCount": 12,
+    "pushedAt": 1794000001,
+    "pushError": "",
+    "polledAt": 1794000005
+  },
   "error": ""
 }
 ```
