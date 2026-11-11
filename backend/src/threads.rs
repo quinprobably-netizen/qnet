@@ -767,13 +767,19 @@ pub fn classify_nm_signal(path: &str) -> NmKind {
     }
 }
 
+/// The `notify-send` arguments for a notification. The `--` ends the options,
+/// so a title that starts with `-` is text, never an option.
+fn notify_args<'a>(title: &'a str, body: &'a str) -> [&'a str; 5] {
+    ["-a", "qnet", "--", title, body]
+}
+
 /// `notify-send` in the background; failures are ignored.
 pub fn desktop_notify(title: &str, body: &str) {
     let (t, b) = (title.to_string(), body.to_string());
     thread::spawn(move || {
         let _ = crate::proc::run(
             "notify-send",
-            &["-a", "qnet", &t, &b],
+            &notify_args(&t, &b),
             None,
             Duration::from_secs(5),
             1024,
@@ -785,6 +791,18 @@ pub fn desktop_notify(title: &str, body: &str) {
 mod tests {
     use super::*;
     use crate::https::testutil::{ok_json, serve, TestServer};
+
+    #[test]
+    fn notify_send_gets_a_double_dash_before_the_title() {
+        assert_eq!(
+            notify_args("Title", "Body"),
+            ["-a", "qnet", "--", "Title", "Body"]
+        );
+        // Text that looks like options stays after the `--`.
+        let args = notify_args("--help", "-a evil");
+        assert_eq!(args[2], "--");
+        assert_eq!(&args[3..], ["--help", "-a evil"]);
+    }
     use std::net::{Ipv4Addr, UdpSocket};
     use std::sync::Mutex;
     use zeroize::Zeroizing;

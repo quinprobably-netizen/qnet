@@ -30,6 +30,8 @@ mod state;
 mod threads;
 mod util;
 mod watch;
+mod watchdog;
+mod wdstore;
 
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::process::ExitCode;

@@ -307,6 +307,7 @@ pub struct Pihole {
     password: PasswordFn,
     addr: IpAddr,
     sid_file: Option<std::path::PathBuf>,
+    logins: u64,
 }
 
 impl Pihole {
@@ -321,6 +322,7 @@ impl Pihole {
             password,
             addr: addr.ip(),
             sid_file: None,
+            logins: 0,
         })
     }
 
@@ -425,6 +427,7 @@ impl Pihole {
                 match (valid, sid) {
                     (true, Some(sid)) if sid_is_sane(sid) => {
                         self.sid = Some(sid.to_string());
+                        self.logins += 1;
                         self.save_sid();
                         Ok(())
                     }
@@ -472,14 +475,24 @@ impl Pihole {
         Ok((r.status, v))
     }
 
-    /// Authenticated JSON request. Logs in if there is no session, and once
-    /// more after a 401.
-    pub fn json(
+    /// How many sessions this client has opened with a successful login. It
+    /// starts at 0, `resume_session` does not count, and a re-login after a
+    /// 401 does: a changed value means "this is a new session".
+    // The watchdog cycle (a later task) reads it.
+    #[allow(dead_code)]
+    pub fn logins(&self) -> u64 {
+        self.logins
+    }
+
+    /// Send an authenticated request: log in if there is no session, and
+    /// once more after a 401. Returns the status and body of the final
+    /// answer, whatever the status is.
+    fn send_authed(
         &mut self,
         method: &str,
         path: &str,
         body: Option<&Value>,
-    ) -> Result<Value, ApiError> {
+    ) -> Result<(u16, Value), ApiError> {
         if self.sid.is_none() {
             self.login()?;
         }
@@ -491,12 +504,45 @@ impl Pihole {
             self.login()?;
             (status, v) = self.send(method, path, body)?;
         }
+        Ok((status, v))
+    }
+
+    /// The body of a 2xx answer, or the error for any other status.
+    fn ok_body(status: u16, v: Value) -> Result<Value, ApiError> {
         match status {
             200..=299 => Ok(v),
             401 | 403 => Err(ApiError::Auth(error_message(&v))),
             429 => Err(ApiError::Other("Pi-hole is rate limiting requests".into())),
             s => Err(ApiError::Other(format!("HTTP {s}: {}", error_message(&v)))),
         }
+    }
+
+    /// Authenticated JSON request. Logs in if there is no session, and once
+    /// more after a 401.
+    pub fn json(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, ApiError> {
+        let (status, v) = self.send_authed(method, path, body)?;
+        Self::ok_body(status, v)
+    }
+
+    /// Like [`json`](Self::json), but HTTP 404 is `Ok(None)`: the endpoint
+    /// does not exist (or, for an id in the path, the thing it names does
+    /// not). Every other status behaves exactly as in `json`.
+    pub fn json_opt(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Option<Value>, ApiError> {
+        let (status, v) = self.send_authed(method, path, body)?;
+        if status == 404 {
+            return Ok(None);
+        }
+        Self::ok_body(status, v).map(Some)
     }
 
     pub fn summary(&mut self) -> Result<Summary, ApiError> {
@@ -1181,5 +1227,205 @@ mod tests {
         let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap();
         let u = p.upstreams().unwrap();
         assert_eq!(u.answered_by.cache, 7);
+    }
+
+    // -- json_opt and the login counter -------------------------------------
+
+    const NOT_FOUND_404: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}";
+    const UNAUTHORIZED_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}";
+
+    #[test]
+    fn json_opt_answers_none_for_404_and_some_for_2xx() {
+        let srv = serve(16, |_, req| {
+            let first = req.lines().next().unwrap();
+            if first.starts_with("POST /api/auth") {
+                Some(ok_json(LOGIN_OK))
+            } else if first.starts_with("GET /api/here ") {
+                Some(ok_json(r#"{"x":1}"#))
+            } else if first.starts_with("GET /api/gone ") {
+                Some(NOT_FOUND_404.to_vec())
+            } else if first.starts_with("PUT /api/gone ") {
+                assert!(req.ends_with(r#"{"a":1}"#), "{req}");
+                Some(NOT_FOUND_404.to_vec())
+            } else {
+                Some(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec())
+            }
+        });
+        let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap();
+        assert_eq!(
+            p.json_opt("GET", "/api/here", None).unwrap(),
+            Some(json!({"x": 1}))
+        );
+        assert_eq!(p.json_opt("GET", "/api/gone", None).unwrap(), None);
+        assert_eq!(
+            p.json_opt("PUT", "/api/gone", Some(&json!({"a": 1})))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn json_still_treats_404_as_an_error() {
+        let srv = serve(16, |_, req| {
+            if req.starts_with("POST /api/auth") {
+                Some(ok_json(LOGIN_OK))
+            } else {
+                Some(NOT_FOUND_404.to_vec())
+            }
+        });
+        let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap();
+        let e = p.json("GET", "/api/gone", None).unwrap_err();
+        assert!(
+            matches!(e, ApiError::Other(ref m) if m.starts_with("HTTP 404")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn json_opt_keeps_the_other_statuses_as_errors() {
+        let srv = serve(16, |_, req| {
+            let first = req.lines().next().unwrap();
+            if first.starts_with("POST /api/auth") {
+                Some(ok_json(LOGIN_OK))
+            } else if first.starts_with("GET /api/limited ") {
+                Some(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\n\r\n{}".to_vec())
+            } else if first.starts_with("GET /api/forbidden ") {
+                Some(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}".to_vec())
+            } else if first.starts_with("GET /api/broken ") {
+                Some(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\n\r\n{}".to_vec())
+            } else {
+                Some(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec())
+            }
+        });
+        let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap();
+        assert!(matches!(
+            p.json_opt("GET", "/api/limited", None),
+            Err(ApiError::Other(_))
+        ));
+        assert!(matches!(
+            p.json_opt("GET", "/api/forbidden", None),
+            Err(ApiError::Auth(_))
+        ));
+        assert!(matches!(
+            p.json_opt("GET", "/api/broken", None),
+            Err(ApiError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn json_opt_relogs_in_once_after_a_401_and_then_answers() {
+        let logins = Arc::new(AtomicUsize::new(0));
+        let l2 = logins.clone();
+        let srv = serve(16, move |_, req| {
+            let first = req.lines().next().unwrap();
+            if first.starts_with("POST /api/auth") {
+                let n = l2.fetch_add(1, Ordering::SeqCst);
+                Some(ok_json(
+                    &LOGIN_OK.replace("SID-1", &format!("SID-{}", n + 1)),
+                ))
+            } else if first.starts_with("GET /api/qbp/x ") {
+                if req.contains("X-FTL-SID: SID-1") {
+                    Some(UNAUTHORIZED_401.to_vec())
+                } else {
+                    assert!(req.contains("X-FTL-SID: SID-2"), "{req}");
+                    Some(NOT_FOUND_404.to_vec())
+                }
+            } else {
+                Some(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec())
+            }
+        });
+        let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap();
+        assert_eq!(p.json_opt("GET", "/api/qbp/x", None).unwrap(), None);
+        assert_eq!(logins.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn json_opt_with_a_persistent_401_is_an_auth_error() {
+        let srv = serve(16, |_, req| {
+            if req.starts_with("POST /api/auth") {
+                Some(ok_json(LOGIN_OK))
+            } else {
+                Some(UNAUTHORIZED_401.to_vec())
+            }
+        });
+        let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap();
+        assert!(matches!(
+            p.json_opt("GET", "/api/qbp/x", None),
+            Err(ApiError::Auth(_))
+        ));
+    }
+
+    #[test]
+    fn json_opt_does_not_call_the_password_when_there_is_no_network_login() {
+        let mut p = Pihole::at(
+            "127.0.0.1:9".parse().unwrap(),
+            [0; 32],
+            Box::new(|| Err(ApiError::Auth("no app password in the keyring".into()))),
+        )
+        .unwrap();
+        assert_eq!(
+            p.json_opt("GET", "/api/qbp/x", None).unwrap_err().status(),
+            "auth"
+        );
+        assert_eq!(p.logins(), 0);
+    }
+
+    #[test]
+    fn logins_counts_each_new_session_and_not_a_resumed_one() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let expire = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let expire2 = expire.clone();
+        let srv = serve(16, move |_, req| {
+            let first = req.lines().next().unwrap();
+            if first.starts_with("POST /api/auth") {
+                let k = n2.fetch_add(1, Ordering::SeqCst);
+                Some(ok_json(
+                    &LOGIN_OK.replace("SID-1", &format!("SID-{}", k + 1)),
+                ))
+            } else if first.starts_with("GET /api/auth") {
+                Some(ok_json(
+                    r#"{"session":{"valid":true,"sid":"SAVED-SID","validity":1700}}"#,
+                ))
+            } else if first.starts_with("GET /api/dns/blocking") {
+                if expire2.swap(false, Ordering::SeqCst) {
+                    Some(UNAUTHORIZED_401.to_vec())
+                } else {
+                    Some(ok_json(r#"{"blocking":"enabled","timer":null}"#))
+                }
+            } else {
+                Some(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec())
+            }
+        });
+        let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("x")).unwrap();
+        assert_eq!(p.logins(), 0, "starts at zero");
+        p.blocking().unwrap();
+        assert_eq!(p.logins(), 1, "the first login");
+        expire.store(true, Ordering::SeqCst);
+        p.blocking().unwrap();
+        assert_eq!(p.logins(), 2, "a 401 forced a second login");
+        p.blocking().unwrap();
+        assert_eq!(p.logins(), 2, "a kept session does not count again");
+        p.logout();
+        p.blocking().unwrap();
+        assert_eq!(p.logins(), 3, "a fresh session after a logout");
+
+        // A resumed session is not a login.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sid(dir.path(), "127.0.0.1", "SAVED-SID", 0o600);
+        let mut q = Pihole::at(srv.addr, srv.fingerprint, pw("x"))
+            .unwrap()
+            .with_sid_file(path);
+        assert!(q.resume_session());
+        assert_eq!(q.logins(), 0);
+        std::mem::forget(q);
+    }
+
+    #[test]
+    fn a_rejected_login_does_not_count() {
+        let srv = serve(16, |_, _| Some(UNAUTHORIZED_401.to_vec()));
+        let mut p = Pihole::at(srv.addr, srv.fingerprint, pw("bad")).unwrap();
+        assert!(p.login_with("bad").is_err());
+        assert_eq!(p.logins(), 0);
     }
 }
