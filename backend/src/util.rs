@@ -4,7 +4,10 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Seconds since the Unix epoch, fractional.
 pub fn unix_now() -> f64 {
@@ -135,29 +138,111 @@ pub struct FileLock {
     _file: fs::File,
 }
 
-/// Try to take the lock without waiting. `Ok(None)` means someone else holds
-/// it.
-pub fn try_lock(path: &Path) -> io::Result<Option<FileLock>> {
-    use std::os::fd::AsRawFd;
+/// Open (creating it, mode 0600, and its private directory) the file a lock
+/// is taken on.
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
     if let Some(dir) = path.parent() {
         ensure_private_dir(dir)?;
     }
-    let file = fs::OpenOptions::new()
+    fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
-        .open(path)?;
-    // SAFETY: flock on a descriptor we own; no memory is passed.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(Some(FileLock { _file: file }));
-    }
-    let err = io::Error::last_os_error();
-    if err.kind() == io::ErrorKind::WouldBlock {
-        Ok(None)
+        .open(path)
+}
+
+/// `flock(LOCK_EX)` on `file`, with `LOCK_NB` when `wait` is false. `Ok(false)`
+/// means the lock is busy (only without waiting).
+fn flock_ex(file: &fs::File, wait: bool) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let op = if wait {
+        libc::LOCK_EX
     } else {
-        Err(err)
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    loop {
+        // SAFETY: flock on a descriptor we own; no memory is passed.
+        if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock if !wait => return Ok(false),
+            _ => return Err(err),
+        }
+    }
+}
+
+/// Try to take the lock without waiting. `Ok(None)` means someone else holds
+/// it.
+pub fn try_lock(path: &Path) -> io::Result<Option<FileLock>> {
+    let file = open_lock_file(path)?;
+    Ok(flock_ex(&file, false)?.then_some(FileLock { _file: file }))
+}
+
+/// Helpers of [`lock_wait`] whose caller gave up and that are still blocked
+/// in `flock`. Each is a parked thread, so there is a ceiling: past it a new
+/// wait fails at once instead of piling one more thread on a lock that
+/// nobody releases.
+static ABANDONED: AtomicUsize = AtomicUsize::new(0);
+const ABANDONED_MAX: usize = 16;
+
+const WAITING: u8 = 0;
+const DELIVERED: u8 = 1;
+const GAVE_UP: u8 = 2;
+
+/// Take the lock, waiting at most `timeout`; `Ok(None)` means it stayed
+/// taken.
+///
+/// This is a real blocking `flock(LOCK_EX)`, so the kernel queues the waiters
+/// and a process that takes the lock again straight after releasing it cannot
+/// starve one that already waits (polling [`try_lock`] could). The blocking
+/// call runs on a helper thread and the caller waits for it with a timeout.
+/// A helper that outlives a timed-out caller drops the lock the moment it
+/// gets it, so a lock that comes late is never held by nobody.
+pub fn lock_wait(path: &Path, timeout: Duration) -> io::Result<Option<FileLock>> {
+    if ABANDONED.load(Ordering::Relaxed) >= ABANDONED_MAX {
+        return Ok(None);
+    }
+    let file = open_lock_file(path)?;
+    let state = Arc::new(AtomicU8::new(WAITING));
+    let (tx, rx) = mpsc::channel::<io::Result<FileLock>>();
+    let helper_state = state.clone();
+    thread::Builder::new()
+        .name("qnet-lock-wait".into())
+        .spawn(move || {
+            let got = flock_ex(&file, true).map(|_| FileLock { _file: file });
+            if helper_state
+                .compare_exchange(WAITING, DELIVERED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = tx.send(got);
+            } else {
+                // The caller left: letting `got` drop lets go of the lock.
+                ABANDONED.fetch_sub(1, Ordering::Relaxed);
+            }
+        })?;
+    match rx.recv_timeout(timeout) {
+        Ok(got) => got.map(Some),
+        Err(_) => {
+            // Counted before the state changes, so the helper's decrement
+            // never comes first.
+            ABANDONED.fetch_add(1, Ordering::Relaxed);
+            if state
+                .compare_exchange(WAITING, GAVE_UP, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                Ok(None)
+            } else {
+                // The helper got there just now: the answer is on its way.
+                ABANDONED.fetch_sub(1, Ordering::Relaxed);
+                rx.recv()
+                    .map_err(|_| io::Error::other("the lock helper vanished"))?
+                    .map(Some)
+            }
+        }
     }
 }
 
@@ -333,6 +418,78 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn lock_wait_takes_a_free_lock_and_waits_for_a_held_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("qnet").join("x.lock");
+        let first = lock_wait(&p, Duration::from_secs(1))
+            .unwrap()
+            .expect("free");
+        assert!(try_lock(&p).unwrap().is_none(), "held");
+        let t0 = std::time::Instant::now();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(first);
+        });
+        let second = lock_wait(&p, Duration::from_secs(5)).unwrap();
+        assert!(second.is_some(), "got it once it was released");
+        assert!(t0.elapsed() >= Duration::from_millis(150));
+        releaser.join().unwrap();
+        assert!(try_lock(&p).unwrap().is_none(), "the new holder has it");
+    }
+
+    #[test]
+    fn lock_wait_times_out_and_the_late_lock_is_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("qnet").join("x.lock");
+        let held = try_lock(&p).unwrap().expect("free");
+        let t0 = std::time::Instant::now();
+        assert!(lock_wait(&p, Duration::from_millis(150)).unwrap().is_none());
+        let waited = t0.elapsed();
+        assert!(
+            waited >= Duration::from_millis(140) && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
+        // The abandoned helper gets the lock when it is released, and drops
+        // it: nobody is left holding it.
+        drop(held);
+        let end = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(l) = try_lock(&p).unwrap() {
+                drop(l);
+                break;
+            }
+            assert!(std::time::Instant::now() < end, "the late lock was kept");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_waiter_is_not_starved_by_a_holder_that_takes_the_lock_again_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("qnet").join("x.lock");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (p2, stop2) = (p.clone(), stop.clone());
+        // A greedy holder: release, and take it again with no pause.
+        let greedy = thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                let l = lock_wait(&p2, Duration::from_secs(5))
+                    .unwrap()
+                    .expect("lock");
+                thread::sleep(Duration::from_millis(2));
+                drop(l);
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+        for _ in 0..20 {
+            let got = lock_wait(&p, Duration::from_secs(2)).unwrap();
+            assert!(got.is_some(), "starved");
+            thread::sleep(Duration::from_millis(2));
+        }
+        stop.store(true, Ordering::Relaxed);
+        greedy.join().unwrap();
     }
 
     #[test]

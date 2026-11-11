@@ -670,6 +670,18 @@ pub struct Poller {
     /// `api.logins()` when the absence was seen: a different value is a new
     /// session, which gets one more look.
     absent_logins: u64,
+    /// `api.logins()` when the last alerts page was taken in; `None` = no
+    /// page yet from this client. A different value later means a new
+    /// session, so the Pi may have rebooted since: see
+    /// [`restart`](Self::restart).
+    alerts_logins: Option<u64>,
+    /// `"<address>|<pin>"` of the Pi-hole this poller talks to: what the
+    /// store's `absent_for` is compared with. `None` = no verdict is kept.
+    verdict_key: Option<String>,
+    /// The store may still say "absent" for this Pi-hole (it did when the
+    /// poller started, or this poller wrote it): the first time the watchdog
+    /// is seen present, that is cleared.
+    verdict_stale: bool,
     pushed_at: u64,
     push_error: String,
     polled_at: u64,
@@ -695,6 +707,9 @@ impl Poller {
             pushed_logins: None,
             push_due: false,
             absent_logins: 0,
+            alerts_logins: None,
+            verdict_key: None,
+            verdict_stale: false,
             pushed_at: 0,
             push_error: String::new(),
             polled_at: 0,
@@ -708,10 +723,25 @@ impl Poller {
         self.presence
     }
 
+    /// Keep the "no watchdog here" verdict in the store under `key` (see
+    /// [`Store::absent_for`]): written when the Pi-hole turns out to have no
+    /// watchdog, cleared when one is seen.
+    pub fn with_verdict_key(mut self, key: String) -> Self {
+        self.verdict_key = Some(key);
+        self.verdict_stale = true;
+        self
+    }
+
     /// The thread made a new API client: it has pushed nothing, and its
-    /// login counter starts again, so a remembered absence is void.
+    /// login counter starts again, so a remembered absence is void, and so
+    /// is what was learned from the Pi before: it may have rebooted while
+    /// there was no client, so the next answer is taken from 0.
     pub fn client_replaced(&mut self) {
         self.pushed_logins = None;
+        self.alerts_logins = None;
+        self.cursor = 0;
+        self.alerts.clear();
+        self.inventory = None;
         if self.presence == Presence::Absent {
             self.presence = Presence::Unknown;
         }
@@ -722,10 +752,17 @@ impl Poller {
         self.status = e.status();
     }
 
-    /// The Pi has no watchdog: forget what it said.
-    fn mark_absent(&mut self, api: &Pihole, now: u64) {
+    /// The Pi has no watchdog: forget what it said, and keep the verdict in
+    /// the store so a closed qnet does not ask again after a restart.
+    fn mark_absent(&mut self, api: &Pihole, store_path: &Path, now: u64) {
         self.presence = Presence::Absent;
         self.absent_logins = api.logins();
+        if let Some(key) = self.verdict_key.clone() {
+            // Best effort: without it a closed qnet asks once per start.
+            let _ = wdstore::update(store_path, |s| s.absent_for = Some(key));
+            self.verdict_stale = true;
+        }
+        self.alerts_logins = None;
         self.alerts.clear();
         self.inventory = None;
         self.cursor = 0;
@@ -740,9 +777,11 @@ impl Poller {
     ///
     /// 1. When absent, nothing is asked unless a new login session began.
     /// 2. Push what is due (acknowledged keys, then the known list).
-    /// 3. Fetch the alerts changed since the cursor. A `rev` below the
-    ///    cursor means the Pi restarted: the cursor and the alerts are reset,
-    ///    a push is made and the alerts come again from 0.
+    /// 3. Fetch the alerts changed since the cursor. If the Pi may have
+    ///    restarted (a new login session since the last page, a `rev` below
+    ///    the cursor, or an `id` the map holds under another key) the cursor,
+    ///    the alerts and the devices are reset, a push is made and the alerts
+    ///    come again from 0 (once per cycle at most).
     /// 4. Record the page in the store (acknowledged alerts, notified ones).
     ///    If the store cannot be written (its lock stays taken) the cursor
     ///    does not move: the next cycle gets the same alerts again and tries
@@ -790,26 +829,33 @@ impl Poller {
         if self.push(api, store_path, now)? == Pushed::Absent {
             return Ok(Vec::new());
         }
+        let mut restarted = false;
         let page = loop {
             match get_alerts(api, self.cursor)? {
                 Qbp::Absent => {
-                    self.mark_absent(api, now);
+                    self.mark_absent(api, store_path, now);
                     return Ok(Vec::new());
                 }
-                Qbp::Present(p) if p.rev < self.cursor => {
-                    // The Pi restarted. With the cursor at 0 this cannot
-                    // happen again, so the loop runs at most twice.
-                    self.cursor = 0;
-                    self.alerts.clear();
-                    self.inventory = None;
-                    self.push_due = true;
+                Qbp::Present(p) => {
+                    // Once per cycle: after the restart the cursor is 0, so
+                    // nothing here can fail the checks for want of history.
+                    let restart = if restarted {
+                        None
+                    } else {
+                        self.restart_reason(api, &p)
+                    };
+                    let Some(force_push) = restart else {
+                        break p;
+                    };
+                    restarted = true;
+                    self.restart(force_push);
                     if self.push(api, store_path, now)? == Pushed::Absent {
                         return Ok(Vec::new());
                     }
                 }
-                Qbp::Present(p) => break p,
             }
         };
+        self.alerts_logins = Some(api.logins());
         self.presence = Presence::Present;
         self.rev = page.rev;
         self.suppressed = page.suppressed;
@@ -817,6 +863,7 @@ impl Poller {
         let new = match record(store_path, &page, now) {
             Ok(new) => {
                 self.cursor = page.rev;
+                self.clear_verdict(store_path);
                 new
             }
             Err(_) => Vec::new(),
@@ -836,7 +883,7 @@ impl Poller {
                         let _ = self.push(api, store_path, now);
                     }
                 }
-                Ok(Qbp::Absent) => self.mark_absent(api, now),
+                Ok(Qbp::Absent) => self.mark_absent(api, store_path, now),
                 Err(_) => {}
             }
         }
@@ -847,13 +894,58 @@ impl Poller {
         Ok(notifications)
     }
 
+    /// A watchdog was seen: the store must not say "absent" for this Pi-hole
+    /// any more (a closed qnet would never poll it). Tried again on every
+    /// cycle until the store took it.
+    fn clear_verdict(&mut self, store_path: &Path) {
+        if self.verdict_stale && self.verdict_key.is_some() {
+            let cleared = wdstore::update(store_path, |s| s.absent_for = None);
+            self.verdict_stale = cleared.is_err();
+        }
+    }
+
+    /// Whether `page` (asked for with the current cursor) shows that the Pi
+    /// is not the one the cursor and the alert map came from, so they cannot
+    /// be trusted. `Some(force_push)`: a restart is due, and `force_push`
+    /// says the lists must be pushed again whatever the session counter says.
+    ///
+    /// - A new login session since the last page (`logins()` changed, also
+    ///   when the stats poll was the one to log in again): the Pi may have
+    ///   rebooted, and a reboot that has already made as many changes as the
+    ///   cursor looks like no restart at all by its `rev`. The session
+    ///   counter makes the push due by itself.
+    /// - `rev` below the cursor: it went backwards.
+    /// - An alert whose `id` the map holds under another key: ids restart at
+    ///   a reboot, so this is a different alert.
+    fn restart_reason(&self, api: &Pihole, page: &AlertsPage) -> Option<bool> {
+        if self.alerts_logins.is_some_and(|l| l != api.logins()) {
+            return Some(false);
+        }
+        let collides = page
+            .alerts
+            .iter()
+            .any(|a| self.alerts.get(&a.id).is_some_and(|old| old.key != a.key));
+        (page.rev < self.cursor || collides).then_some(true)
+    }
+
+    /// The Pi restarted (or may have): forget its alerts and devices and
+    /// start from revision 0. `force_push` marks the lists due as well.
+    fn restart(&mut self, force_push: bool) {
+        self.cursor = 0;
+        self.alerts.clear();
+        self.inventory = None;
+        if force_push {
+            self.push_due = true;
+        }
+    }
+
     /// Step 2: push what is due. `Err` only for the failures that mean the
     /// Pi cannot be talked to at all (auth, tls, unreachable); any other
     /// failure is kept in `push_error` and does not stop the cycle.
     fn push(&mut self, api: &mut Pihole, store_path: &Path, now: u64) -> Result<Pushed, ApiError> {
         match self.try_push(api, store_path, now) {
             Ok(Qbp::Absent) => {
-                self.mark_absent(api, now);
+                self.mark_absent(api, store_path, now);
                 Ok(Pushed::Absent)
             }
             Ok(Qbp::Present(())) => Ok(Pushed::Ok),
@@ -2194,7 +2286,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_login_session_pushes_again_from_the_next_cycle() {
+    fn a_new_login_session_restarts_the_cycle_and_pushes_in_the_same_cycle() {
         let mut rig = Rig::new();
         rig.prepare(250);
         rig.cycle(T0);
@@ -2202,21 +2294,154 @@ mod tests {
         assert_eq!(rig.pi.with(|s| s.logins), 1);
 
         // The Pi forgets the session. The re-login happens inside the alerts
-        // request, after this cycle's push decision, so the push is the next
-        // cycle's.
+        // request: a new session means the Pi may have rebooted, so the
+        // cycle takes its restart path (push, then the alerts from 0 again)
+        // right away.
         rig.pi.invalidate();
         rig.cycle(T0 + 1);
         assert_eq!(rig.pi.with(|s| s.logins), 2);
-        assert_eq!((rig.acked_puts().len(), rig.known_puts().len()), (1, 2));
-        rig.cycle(T0 + 2);
         assert_eq!(rig.acked_puts().len(), 2);
         let puts = rig.known_puts();
         assert_eq!(puts.len(), 4, "the whole list again, in two chunks");
         let macs: Vec<String> = (1..=250).map(fakeqbp::mac).collect();
         assert_chunks(&puts[2..], &macs);
+        assert_eq!(rig.since(), vec![0, 0, 0], "asked again from 0");
         // And then it is quiet again.
-        rig.cycle(T0 + 3);
+        rig.cycle(T0 + 2);
         assert_eq!((rig.acked_puts().len(), rig.known_puts().len()), (2, 4));
+        assert_eq!(rig.since(), vec![0, 0, 0, 0]);
+    }
+
+    /// 3 alerts seen (cursor 3), then the Pi reboots and has already raised 5
+    /// by the time it is asked again. The first of the five repeats an old
+    /// key (a later instance of it).
+    fn reboot_with_five(rig: &mut Rig) -> CycleOut {
+        rig.prepare(250);
+        for i in 1..=3 {
+            rig.pi.raise("dga", "old.example", Some("192.0.2.5"), i);
+        }
+        assert_eq!(rig.cycle(T0 + 1).notifications.len(), 3);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.since(), vec![0, 3]);
+        rig.pi.reboot();
+        for (i, k) in [1, 12, 13, 14, 15].into_iter().enumerate() {
+            rig.pi
+                .raise("beacon", &format!("new{i}.example"), Some("192.0.2.6"), k);
+        }
+        rig.cycle(T0 + 200)
+    }
+
+    fn check_the_five_after_a_reboot(rig: &Rig, out: &CycleOut) {
+        // All five are new alerts: 3 shown, the other 2 folded.
+        assert_eq!(out.notifications.len(), 4, "{:?}", out.notifications);
+        assert_eq!(
+            out.notifications[3],
+            ("Watchdog".to_string(), "2 more alerts".to_string())
+        );
+        let store = rig.store();
+        for k in [1, 12, 13, 14, 15] {
+            let n = store.notified.iter().find(|n| n.key == fakeqbp::key(k));
+            assert!(
+                n.is_some_and(|n| n.first_unix > T0 + 100),
+                "key {k} was announced as a new-boot alert: {n:?}"
+            );
+        }
+        // The map holds the new boot's alerts only (ids 1 to 5, new subjects).
+        let r = rig.report();
+        assert_eq!(r.rev, 5);
+        let mut ids: Vec<u64> = r.alerts.iter().map(|a| a.id).collect();
+        ids.sort();
+        assert_eq!(ids, [1, 2, 3, 4, 5], "{:?}", r.alerts);
+        assert!(
+            r.alerts.iter().all(|a| a.kind == "beacon"),
+            "no alert of the old boot is left: {:?}",
+            r.alerts
+        );
+        assert_eq!(r.unacked, 5);
+        // The new Pi has the acks and the list again.
+        assert_eq!(rig.acked_puts().len(), 2);
+        let puts = rig.known_puts();
+        assert_eq!(puts.len(), 4);
+        let macs: Vec<String> = (1..=250).map(fakeqbp::mac).collect();
+        assert_chunks(&puts[2..], &macs);
+        assert_eq!(rig.pi.with(|s| s.known.len()), 250);
+    }
+
+    #[test]
+    fn a_reboot_that_already_made_as_many_changes_as_the_cursor_is_noticed_by_its_session() {
+        let mut rig = Rig::new();
+        let out = reboot_with_five(&mut rig);
+        // rev 5 is not below the cursor 3, so only the new session shows it:
+        // asked from 3 first (that request logged in again), then from 0.
+        assert_eq!(rig.since(), vec![0, 3, 3, 0]);
+        check_the_five_after_a_reboot(&rig, &out);
+        // One restart, not one per cycle.
+        rig.cycle(T0 + 201);
+        assert_eq!(rig.since(), vec![0, 3, 3, 0, 5]);
+        assert_eq!(rig.acked_puts().len(), 2);
+        assert_eq!(rig.known_puts().len(), 4);
+    }
+
+    #[test]
+    fn a_session_that_the_stats_poll_logged_in_again_still_restarts_without_a_second_push() {
+        let mut rig = Rig::new();
+        rig.prepare(5);
+        for i in 1..=3 {
+            rig.pi.raise("dga", "old.example", Some("192.0.2.5"), i);
+        }
+        rig.cycle(T0 + 1);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.since(), vec![0, 3]);
+        assert_eq!((rig.acked_puts().len(), rig.known_puts().len()), (1, 1));
+        rig.pi.reboot();
+        for k in 11..=15 {
+            rig.pi.raise("beacon", "new.example", None, k);
+        }
+        // In an open panel the stats poll goes first and logs in again.
+        rig.api.summary().unwrap();
+        rig.api.close_idle();
+        assert_eq!(rig.pi.with(|s| s.logins), 2);
+        rig.cycle(T0 + 200);
+        assert_eq!(rig.since(), vec![0, 3, 3, 0], "from 3, then from 0");
+        // The push was due at the start of the cycle (new session) and is not
+        // repeated by the restart.
+        assert_eq!((rig.acked_puts().len(), rig.known_puts().len()), (2, 2));
+        let ids: Vec<u64> = rig.report().alerts.iter().map(|a| a.id).collect();
+        assert_eq!(ids.len(), 5);
+        assert!(rig.report().alerts.iter().all(|a| a.kind == "beacon"));
+    }
+
+    #[test]
+    fn an_id_the_map_holds_under_another_key_is_a_restart_even_with_the_same_session() {
+        let mut rig = Rig::new();
+        rig.prepare(5);
+        rig.pi.raise("dga", "old.example", None, 1);
+        rig.pi.raise("dga", "old.example", None, 2);
+        rig.pi.repeat(1);
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.report().alerts.len(), 2);
+        assert_eq!((rig.acked_puts().len(), rig.known_puts().len()), (1, 1));
+        // A reboot the session survived; the new boot made as many changes
+        // as the cursor (3) and more, with ids 1 and 2 again.
+        rig.pi.reboot_keeping_session();
+        rig.pi.raise("beacon", "new.example", None, 21);
+        rig.pi.raise("beacon", "new.example", None, 22);
+        for _ in 0..3 {
+            rig.pi.repeat(1);
+        }
+        let out = rig.cycle(T0 + 200);
+        assert_eq!(rig.pi.with(|s| s.logins), 1, "no new session");
+        assert_eq!(rig.since(), vec![0, 3, 0]);
+        // Both new alerts (key 22 was not in the page asked from 3) notify,
+        // and the old ones are gone from the map.
+        assert_eq!(out.notifications.len(), 2, "{:?}", out.notifications);
+        let r = rig.report();
+        let mut keys: Vec<String> = r.alerts.iter().map(|a| a.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, [fakeqbp::key(21), fakeqbp::key(22)]);
+        // The lists went to the rebooted Pi.
+        assert_eq!((rig.acked_puts().len(), rig.known_puts().len()), (2, 2));
+        assert_eq!(rig.pi.with(|s| s.known.len()), 5);
     }
 
     #[test]
@@ -2377,6 +2602,57 @@ mod tests {
         assert_eq!(rig.pi.count("PUT /api/qbp/alerts/acked"), 1);
         assert_eq!(rig.pi.count("GET /api/qbp/alerts"), 0);
         assert!(rig.store().push_due(), "nothing was pushed");
+    }
+
+    #[test]
+    fn the_absent_verdict_is_saved_when_absent_and_cleared_when_a_watchdog_is_seen() {
+        // A poller with a key saves the verdict ...
+        let mut rig = Rig::on(FakePi::pihole_only(50));
+        rig.poller = Poller::new().with_verdict_key("192.0.2.9|ab".into());
+        rig.cycle(T0);
+        assert_eq!(rig.poller.presence(), Presence::Absent);
+        assert_eq!(rig.store().absent_for.as_deref(), Some("192.0.2.9|ab"));
+        // ... also when a push is what found the absence.
+        let mut rig = Rig::on(FakePi::pihole_only(50));
+        rig.poller = Poller::new().with_verdict_key("k".into());
+        rig.prepare(5);
+        rig.cycle(T0);
+        assert_eq!(rig.store().absent_for.as_deref(), Some("k"));
+
+        // A poller without one leaves the store alone: no file at all.
+        let mut rig = Rig::on(FakePi::pihole_only(50));
+        rig.cycle(T0);
+        assert_eq!(rig.poller.presence(), Presence::Absent);
+        assert!(!rig.path().exists());
+
+        // A Pi with a watchdog clears a verdict that was saved earlier (by
+        // the same address before it was replaced), once it answers.
+        let mut rig = Rig::new();
+        rig.edit(|s| s.absent_for = Some("k".into()));
+        rig.poller = Poller::new().with_verdict_key("k".into());
+        rig.cycle(T0);
+        assert_eq!(rig.poller.presence(), Presence::Present);
+        assert_eq!(rig.store().absent_for, None);
+        // The rest of the store is as it was.
+        rig.prepare(3);
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.store().known.len(), 3);
+        assert_eq!(rig.store().absent_for, None);
+    }
+
+    #[test]
+    fn a_failed_clear_of_the_verdict_is_tried_again_on_the_next_cycle() {
+        let mut rig = Rig::new();
+        rig.edit(|s| s.absent_for = Some("k".into()));
+        rig.poller = Poller::new().with_verdict_key("k".into());
+        // The store cannot be taken for the moment: hold its lock.
+        let lock_path = rig.dir.path().join("watchdog.lock");
+        let held = crate::util::try_lock(&lock_path).unwrap().expect("free");
+        rig.cycle(T0);
+        assert_eq!(rig.store().absent_for.as_deref(), Some("k"), "still saved");
+        drop(held);
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.store().absent_for, None, "cleared by the next cycle");
     }
 
     // -- notifications ---------------------------------------------------------

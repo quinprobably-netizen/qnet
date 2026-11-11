@@ -33,7 +33,9 @@ then calls the watchdog **absent** and behaves exactly as before.
   known-list chunking, and the one-cycle poll logic used by the API thread.
 - `wdstore.rs` (new): the PC-side store `~/.local/state/qnet/watchdog.json`
   (0600, `util::atomic_write`, read-modify-write under a blocking-with-timeout
-  `flock` on `watchdog.lock`, since the CLI and the watcher both write it):
+  `flock` on `watchdog.lock`, since the CLI and the watcher both write it;
+  a file that cannot be read or parsed is renamed `watchdog.json.bad-<unix
+  secs>` before a change is written, never replaced):
   - `acked`: `[{key, at}]`, at most 1024, oldest dropped;
   - `known`: `[{mac, label?, firstSeen}]`, at most 1024, MAC normalised to
     lower-case colon form, label cleaned (no control chars, ≤ 64 chars);
@@ -41,7 +43,9 @@ then calls the watchdog **absent** and behaves exactly as before.
     `knownGen` by whoever pushes it successfully;
   - `notified`: `{key: first_unix}`, at most 1024 (oldest dropped): which alert
     instances already got a desktop notification, so a shell restart does not
-    repeat them.
+    repeat them;
+  - `absentFor`: `"<addr>|<pin>"` of a Pi-hole found to have no watchdog; a
+    closed qnet makes no request while it matches the configured one.
 - `threads.rs`: the API thread runs the watchdog cycle; `Event::Watchdog(WatchdogReport)`
   carries the result to the main thread. Injected deps (`WatchdogDeps`: store
   path, notifier) so tests never touch the real state dir or `notify-send`.
@@ -61,7 +65,15 @@ panel is **closed**:
   session, as today);
 - an auth failure (missing secret, locked keyring) parks the closed poll until
   the next `Open`/`Config`, so a locked keyring is never asked every minute;
-- other failures retry on the existing backoffs (tls 30 s, else 60 s).
+- other failures retry after the closed period (60 s; tls 30 s) once the
+  Pi-hole has answered; before that (presence `unknown`) the delay doubles
+  with each failure in a row, 60 s up to 30 min, and starts again after a
+  success, `Open` or `Config`;
+- the absent verdict is saved in the store (`absentFor`) when the poller goes
+  absent and cleared when it sees a watchdog: while it matches the configured
+  address and pin, a closed qnet schedules no poll at all (no client, no
+  keyring, no request), also after a restart. Open polls still look once per
+  session.
 
 ### Cadence
 
@@ -76,9 +88,9 @@ panel is **closed**:
 
 1. **Push if due** (acks first, then the known list):
    - due when this client has never pushed, its `logins()` changed since the
-     last push (a new session: the Pi may have rebooted), the alerts `rev`
-     went backwards, `known_list` was seen as `waiting`, or
-     `knownGen != pushedKnownGen`;
+     last push (a new session: the Pi may have rebooted; pushed in the same
+     cycle), the cycle restarted (below), `known_list` was seen as `waiting`,
+     or `knownGen != pushedKnownGen`;
    - acks: `PUT alerts/acked` in bodies ≤ 4000 bytes (skip when none);
    - known: chunked `PUT devices/known` (first `append:false`, last
      `complete:true`, each body ≤ 4000 bytes) only when the PC list is
@@ -86,9 +98,13 @@ panel is **closed**:
      emptied it). An empty list is otherwise never pushed: it would make the
      Pi raise every device; without a list the Pi learns silently.
    - a failed push stays due; success records `pushedKnownGen`.
-2. `GET alerts?since=<cursor>` (0 at start). `rev < cursor` means the Pi
-   restarted: reset cursor and the in-memory alert map, mark the push due, do
-   it, and fetch again from 0 (at most once per cycle).
+2. `GET alerts?since=<cursor>` (0 at start). The Pi may have restarted when
+   `logins()` changed since the last page (a new session; a reboot that made
+   as many changes as the cursor shows in no `rev`), when `rev < cursor`, or
+   when an alert's `id` is in the map under another `key`: reset the cursor,
+   the in-memory alert map and the inventory, push (if the session counter
+   has not made it due already, it is marked due), and fetch again from 0 (at
+   most once per cycle). A new client counts as a new session.
 3. Merge into the in-memory map (by id, at most 256, newest kept). Alerts the
    Pi reports `acked` add their key to the store's `acked` (acks made on the
    Pi's own panel survive its reboot too).
@@ -138,7 +154,7 @@ everything is empty and `status` says why.
 | `qnet watchdog alerts` | `{"ok":true,"rev","suppressed","alerts":[…]}` (all alerts, `since` 0) |
 | `qnet watchdog ack <id>` | looks the id up for its key, `POST …/ack`, records the key: `{"ok":true,"id","key"}`; `not-found` |
 | `qnet watchdog devices` | `{"ok":true,"knownList","devices":[{mac,ipv4,hostname,firstUnix,lastUnix,knownOnPi,known,label}],"knownOffline":[{mac,label,firstSeen}]}` |
-| `qnet watchdog know <mac> [label]` | edits the PC list, then pushes it: `{"ok":true,"mac","known":n,"pushed":bool,"pushError"?}` |
+| `qnet watchdog know <mac> [label]` | edits the PC list, then pushes it: `{"ok":true,"mac","known":n,"seeded"?:n,"pushed":bool,"pushError"?}`; on an empty PC list and a Pi that is `learned` or `received`, the Pi's `known` devices are put on the list first (`seeded`) so the push does not replace a list the Pi made itself |
 | `qnet watchdog forget <mac>` | as `know`; `not-found` if not on the list |
 | `qnet watchdog know-all` | adds every device the Pi has seen: `{"ok":true,"added":n,"known":n,"pushed":bool}` |
 

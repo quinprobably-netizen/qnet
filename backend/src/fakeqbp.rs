@@ -396,6 +396,16 @@ impl FakePi {
     /// A reboot: rev and ids restart, the alerts and the known list are gone
     /// (the list is `waiting` again), and so is every session.
     pub fn reboot(&self) {
+        self.reboot_inner(false);
+    }
+
+    /// A reboot that the login session survives (a Pi that kept its
+    /// sessions): the client sees no 401, so only the alerts can tell.
+    pub fn reboot_keeping_session(&self) {
+        self.reboot_inner(true);
+    }
+
+    fn reboot_inner(&self, keep_session: bool) {
         self.with(|s| {
             s.rev = 0;
             s.next_id = 1;
@@ -403,7 +413,9 @@ impl FakePi {
             s.known.clear();
             s.staged.clear();
             s.known_list = "waiting";
-            s.sid = None;
+            if !keep_session {
+                s.sid = None;
+            }
             s.clock += 100;
         })
     }

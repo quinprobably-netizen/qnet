@@ -5,12 +5,14 @@
 //!
 //! The watcher and the CLI both write it, so every change goes through
 //! [`update`], a read-modify-write under an exclusive lock on
-//! `watchdog.lock` next to the file. Every function takes the path, so tests
-//! use temporary directories and never the real state directory.
+//! `watchdog.lock` next to the file. A file that cannot be read or parsed is
+//! never overwritten: [`update`] moves it aside first. Every function takes
+//! the path, so tests use temporary directories and never the real state
+//! directory.
 
 use std::io;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +25,6 @@ pub const LABEL_MAX: usize = 64;
 
 /// How long [`update`] waits for the lock before giving up.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
-const LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// An alert (by key) that was acknowledged, and when (unix seconds).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +66,12 @@ pub struct Store {
     /// The `known_gen` that was last pushed to the Pi successfully.
     pub pushed_known_gen: u64,
     pub notified: Vec<Notified>,
+    /// `"<address>|<pin hex>"` of the Pi-hole that turned out to have no
+    /// watchdog (a real Pi-hole): while the configured one is that one, a
+    /// closed qnet makes no watchdog request at all. Cleared when a watchdog
+    /// is seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absent_for: Option<String>,
 }
 
 impl Default for Store {
@@ -76,6 +83,7 @@ impl Default for Store {
             known_gen: 0,
             pushed_known_gen: 0,
             notified: Vec::new(),
+            absent_for: None,
         }
     }
 }
@@ -104,8 +112,10 @@ fn trim_oldest<T>(list: &mut Vec<T>, at: impl Fn(&T) -> u64) {
 }
 
 impl Store {
-    /// The store at `path`; a missing or unreadable file is the default
-    /// (empty) store.
+    /// The store at `path`, for reading only: a missing or unreadable file is
+    /// the default (empty) store. Never write what this returns back; changes
+    /// go through [`update`], which keeps an unreadable file instead of
+    /// replacing it.
     pub fn load(path: &Path) -> Store {
         std::fs::read_to_string(path)
             .ok()
@@ -254,32 +264,69 @@ impl Store {
     }
 }
 
-/// Take the lock on `<dir of path>/watchdog.lock`, waiting up to two seconds.
+/// Take the lock on `<dir of path>/watchdog.lock`, waiting up to two seconds
+/// (a blocking, queued `flock`: see [`crate::util::lock_wait`]).
 fn lock_for(path: &Path) -> io::Result<crate::util::FileLock> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let lock_path = dir.join("watchdog.lock");
-    let deadline = Instant::now() + LOCK_WAIT;
-    loop {
-        if let Some(lock) = crate::util::try_lock(&lock_path)? {
-            return Ok(lock);
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the watchdog store is locked by another qnet",
-            ));
-        }
-        std::thread::sleep(LOCK_POLL);
+    crate::util::lock_wait(&dir.join("watchdog.lock"), LOCK_WAIT)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the watchdog store is locked by another qnet",
+        )
+    })
+}
+
+/// Move a file that cannot be used to `<name>.bad-<unix secs>` beside it (a
+/// `-2`, `-3`, … is added rather than replace an earlier one), mode 0600, and
+/// return where it went. Only the path is reported: never what is inside.
+fn set_aside(path: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "watchdog.json".to_string());
+    let secs = crate::util::unix_secs();
+    let mut target = path.with_file_name(format!("{name}.bad-{secs}"));
+    let mut n = 1;
+    while target.symlink_metadata().is_ok() {
+        n += 1;
+        target = path.with_file_name(format!("{name}.bad-{secs}-{n}"));
+    }
+    std::fs::rename(path, &target)?;
+    // Best effort: the file was private already, unless somebody edited it.
+    let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
+    eprintln!(
+        "qnet: the watchdog store could not be read; kept as {}",
+        target.display()
+    );
+    Ok(target)
+}
+
+/// The store for a read-modify-write. No file is the default store; a file
+/// that cannot be read or parsed is moved aside (so the user's known list
+/// and acks are not lost to the next save) and the default store starts
+/// afresh. If it cannot be moved aside the error is returned and nothing is
+/// overwritten.
+fn load_for_update(path: &Path) -> io::Result<Store> {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(store) => Ok(store),
+            Err(_) => set_aside(path).map(|_| Store::default()),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Store::default()),
+        Err(_) => set_aside(path).map(|_| Store::default()),
     }
 }
 
 /// Read-modify-write the store at `path` under its lock: load it, run `f`,
 /// write it back only when `f` changed it, release the lock. Fails with
 /// `TimedOut` when the lock stays taken for two seconds, or with whatever the
-/// write fails with.
+/// write fails with. A file that is there but cannot be read or parsed is
+/// renamed to `<name>.bad-<unix secs>` first and `f` sees an empty store; it
+/// is never silently replaced.
 pub fn update<R>(path: &Path, f: impl FnOnce(&mut Store) -> R) -> io::Result<R> {
     let _lock = lock_for(path)?;
-    let mut store = Store::load(path);
+    let mut store = load_for_update(path)?;
     let before = serde_json::to_vec(&store).map_err(io::Error::other)?;
     let result = f(&mut store);
     let after = serde_json::to_vec(&store).map_err(io::Error::other)?;
@@ -293,6 +340,7 @@ pub fn update<R>(path: &Path, f: impl FnOnce(&mut Store) -> R) -> io::Result<R> 
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
     fn key(i: usize) -> String {
         format!("{i:016x}")
@@ -576,6 +624,129 @@ mod tests {
         // A failed add (duplicate) is not a change either.
         update(&p, |s| s.add_acked(&key(1), 99)).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), squashed);
+    }
+
+    /// The `.bad-*` files beside `p`, with their contents.
+    fn bad_files(p: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| {
+                let e = e.unwrap();
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.contains(".bad-")
+                    .then(|| (name, std::fs::read(e.path()).unwrap()))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn update_keeps_a_corrupt_file_aside_instead_of_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("qnet").join("watchdog.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        // The labelled list the user would lose, damaged by a bad edit.
+        let original = br#"{"version":1,"known":[{"mac":"02:00:00:00:00:01","label":"Printer"#;
+        std::fs::write(&p, original).unwrap();
+
+        let seen_empty = update(&p, |s| {
+            let empty = *s == Store::default();
+            s.add_acked(&key(7), 7);
+            empty
+        })
+        .unwrap();
+        assert!(seen_empty, "the change starts from an empty store");
+        let s = Store::load(&p);
+        assert_eq!(s.acked_keys(), [key(7)], "only the change");
+        assert!(s.known.is_empty());
+        assert_eq!(mode(&p), 0o600);
+
+        let bad = bad_files(&p);
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(bad[0].0.starts_with("watchdog.json.bad-"), "{}", bad[0].0);
+        assert_eq!(bad[0].1, original, "the original bytes");
+        assert_eq!(
+            mode(&p.parent().unwrap().join(&bad[0].0)),
+            0o600,
+            "still private"
+        );
+
+        // A healthy file is not touched again.
+        update(&p, |s| s.add_acked(&key(8), 8)).unwrap();
+        assert_eq!(bad_files(&p).len(), 1);
+        assert_eq!(Store::load(&p).acked.len(), 2);
+    }
+
+    #[test]
+    fn a_file_of_the_wrong_shape_or_not_text_is_kept_aside_too() {
+        for junk in [&b"[1,2,3]"[..], b"null", b"", b"\xff\xfe\x00 not utf-8"] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("watchdog.json");
+            std::fs::write(&p, junk).unwrap();
+            update(&p, |s| s.know(&mac(1), None, 5)).unwrap();
+            let bad = bad_files(&p);
+            assert_eq!(bad.len(), 1, "{junk:?}");
+            assert_eq!(bad[0].1, junk);
+            assert_eq!(Store::load(&p).known_macs(), [mac(1)]);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_path_is_kept_aside_and_a_missing_one_is_just_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("qnet").join("watchdog.json");
+        // Missing: the default store, and no `.bad-*`.
+        update(&p, |s| s.add_acked(&key(1), 1)).unwrap();
+        assert!(bad_files(&p).is_empty());
+        // A directory where the file should be: reading it fails with
+        // something other than "not found".
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
+        std::fs::write(p.join("inside"), "x").unwrap();
+        update(&p, |s| s.add_acked(&key(2), 2)).unwrap();
+        assert_eq!(Store::load(&p).acked_keys(), [key(2)]);
+        let moved: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".bad-"))
+            .collect();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+    }
+
+    #[test]
+    fn two_corruptions_in_the_same_second_do_not_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        for i in 0..3u8 {
+            std::fs::write(&p, [b'{', i]).unwrap();
+            update(&p, |s| s.add_acked(&key(i as usize + 1), 1)).unwrap();
+        }
+        let bad = bad_files(&p);
+        assert_eq!(bad.len(), 3, "{bad:?}");
+        let mut bodies: Vec<_> = bad.into_iter().map(|b| b.1).collect();
+        bodies.sort();
+        assert_eq!(bodies, [vec![b'{', 0], vec![b'{', 1], vec![b'{', 2]]);
+    }
+
+    #[test]
+    fn the_absent_verdict_is_saved_only_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        let mut s = Store::default();
+        s.save(&p).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(v.get("absentFor").is_none());
+        s.absent_for = Some("192.0.2.9|ab".into());
+        s.save(&p).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["absentFor"], "192.0.2.9|ab");
+        assert_eq!(Store::load(&p), s);
+        // An older file without the field reads as no verdict.
+        std::fs::write(&p, r#"{"version":1,"knownGen":2}"#).unwrap();
+        assert_eq!(Store::load(&p).absent_for, None);
     }
 
     #[test]

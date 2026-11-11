@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use crate::actions::{ActionErr, ActionResult};
 use crate::pihole::Pihole;
 use crate::state::{WatchdogAlertOut, WatchdogDeviceOut};
-use crate::watchdog::{self, normalize_mac, Qbp};
+use crate::watchdog::{self, normalize_mac, Inventory, Qbp};
 use crate::wdstore::{self, clean_label, Store};
 
 const USAGE: &str = "usage: qnet watchdog alerts | devices | know-all | ack <id> | \
@@ -254,10 +254,38 @@ pub fn devices(api: &mut Pihole, store_path: &Path) -> ActionResult {
 
 // -- the known list -----------------------------------------------------------
 
+/// Seed an empty PC list with what the Pi already treats as known, so the
+/// first edit does not replace a list the Pi made itself: it raises a
+/// `new_device` alert for every device it has seen that is not on the list it
+/// is given. Only when this PC has no list (and no unpushed edit that
+/// emptied it on purpose) and the Pi has one (`learned` on its own or
+/// `received` from somewhere); a `waiting` Pi has none to lose. The entries
+/// have no label and the time the Pi first saw the device. Returns how many
+/// were added.
+fn seed_from_pi(s: &mut Store, inv: &Inventory, now: u64) -> u64 {
+    if !s.known.is_empty()
+        || s.push_due()
+        || !matches!(inv.known_list.as_str(), "learned" | "received")
+    {
+        return 0;
+    }
+    let mut seeded = 0;
+    for d in inv.devices.iter().filter(|d| d.known) {
+        let first_seen = if d.first_unix > 0 { d.first_unix } else { now };
+        if s.know(&d.mac, None, first_seen) {
+            seeded += 1;
+        }
+    }
+    seeded
+}
+
 /// `watchdog know <mac> [label]`: put the device on this PC's list (or change
 /// its label; without a label an existing one stays), then push the list.
 /// `first_seen` of a new entry is when the Pi first saw the device, or `now`
-/// when it does not say (or cannot be asked).
+/// when it does not say (or cannot be asked). If this PC has no list yet but
+/// the Pi has one (see [`seed_from_pi`]), the Pi's known devices are put on
+/// the list first, so the push adds one device to that list instead of
+/// replacing it; `seeded` in the answer says how many.
 pub fn know(
     api: &mut Pihole,
     store_path: &Path,
@@ -267,17 +295,18 @@ pub fn know(
 ) -> ActionResult {
     let mac =
         normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
-    let first_seen = match watchdog::get_devices(api) {
-        Ok(Qbp::Present(inv)) => inv
-            .devices
-            .iter()
-            .find(|d| d.mac == mac)
-            .map(|d| d.first_unix)
-            .filter(|&t| t > 0)
-            .unwrap_or(now),
-        _ => now,
+    let inv = match watchdog::get_devices(api) {
+        Ok(Qbp::Present(inv)) => Some(inv),
+        _ => None,
     };
+    let first_seen = inv
+        .as_ref()
+        .and_then(|inv| inv.devices.iter().find(|d| d.mac == mac))
+        .map(|d| d.first_unix)
+        .filter(|&t| t > 0)
+        .unwrap_or(now);
     let edit = wdstore::update(store_path, |s| {
+        let seeded = inv.as_ref().map_or(0, |inv| seed_from_pi(s, inv, now));
         let was_known = s.is_known(&mac);
         let changed = s.know(&mac, label, first_seen);
         if !changed && !was_known {
@@ -288,10 +317,10 @@ pub fn know(
             .iter()
             .find(|k| k.mac == mac)
             .and_then(|k| k.label.clone());
-        Some((Snapshot::of(s), label))
+        Some((Snapshot::of(s), label, seeded))
     })
     .map_err(store_err)?;
-    let Some((snap, label)) = edit else {
+    let Some((snap, label, seeded)) = edit else {
         return Err(ActionErr::new(
             "full",
             format!(
@@ -303,6 +332,9 @@ pub fn know(
     let mut out = json!({ "ok": true, "mac": mac, "known": snap.macs.len() });
     if let Some(l) = label {
         out["label"] = json!(l);
+    }
+    if seeded > 0 {
+        out["seeded"] = json!(seeded);
     }
     push(api, store_path, &snap).add_to(&mut out);
     Ok(out)
@@ -672,6 +704,117 @@ mod tests {
             vec![json!({"known": [mac(2)], "append": false, "complete": true})]
         );
         assert_eq!(rig.pi_known(), vec![mac(2)]);
+    }
+
+    /// A Pi with `n` devices, the first `known` of them on a list of its own.
+    fn pi_with_list(rig: &Rig, list: &'static str, n: usize, known: usize) {
+        pi_devices(rig, n);
+        rig.pi.with(|s| s.known = (1..=known).map(mac).collect());
+        rig.pi.set_known_list(list);
+    }
+
+    #[test]
+    fn the_first_know_on_an_empty_list_seeds_it_from_a_list_the_pi_learned() {
+        // The Pi raises an alert for every device that is not on the list it
+        // is given, so replacing its 30 with 1 would flood.
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "learned", 31, 30);
+        let v = rig.know(&mac(31), Some("Tablet")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(31), "label": "Tablet", "known": 31,
+                   "seeded": 30, "pushed": true})
+        );
+        let sent: Vec<String> = (1..=31).map(mac).collect();
+        assert_eq!(
+            rig.known_puts(),
+            vec![json!({"known": sent, "append": false, "complete": true})]
+        );
+        assert_eq!(rig.pi_known(), sent);
+        let store = rig.store();
+        assert_eq!(store.known_macs(), sent);
+        assert!(!store.push_due());
+        // Seeded entries: the Pi's first-seen time, no label. The new one
+        // has its label.
+        assert!(store.known[..30]
+            .iter()
+            .all(|k| k.label.is_none() && k.first_seen == T0));
+        assert_eq!(store.known[30].label.as_deref(), Some("Tablet"));
+
+        // The list is there now: the next edit seeds nothing.
+        let v = rig.know(&mac(5), Some("Printer")).unwrap();
+        assert_eq!(v["known"], 31);
+        assert!(v.get("seeded").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_list_the_pi_received_is_seeded_from_too_and_a_waiting_pi_has_nothing_to_lose() {
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "received", 6, 4);
+        let v = rig.know(&mac(6), None).unwrap();
+        assert_eq!(
+            (v["known"].clone(), v["seeded"].clone()),
+            (json!(5), json!(4))
+        );
+        assert_eq!(
+            rig.pi_known(),
+            (1..=4).chain([6]).map(mac).collect::<Vec<_>>()
+        );
+
+        // `waiting`: it has no list, nothing is seeded (its devices say
+        // `known: false` anyway, but the state alone settles it).
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "waiting", 6, 4);
+        let v = rig.know(&mac(6), None).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(6), "known": 1, "pushed": true})
+        );
+    }
+
+    #[test]
+    fn nothing_is_seeded_over_a_list_that_is_there_or_one_that_was_emptied_on_purpose() {
+        // A list on this PC: it is the master.
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "learned", 10, 8);
+        rig.edit(|s| s.know(&mac(9), None, 1));
+        let v = rig.know(&mac(10), None).unwrap();
+        assert_eq!(v["known"], 2);
+        assert!(v.get("seeded").is_none());
+        assert_eq!(rig.pi_known(), [mac(9), mac(10)]);
+
+        // An edit that emptied the list and is not pushed yet: the user
+        // meant it, the Pi's old list is not brought back.
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "received", 10, 8);
+        rig.edit(|s| {
+            s.know(&mac(1), None, 1);
+            s.forget(&mac(1));
+        });
+        assert!(rig.store().push_due() && rig.store().known.is_empty());
+        let v = rig.know(&mac(10), None).unwrap();
+        assert_eq!(v["known"], 1);
+        assert!(v.get("seeded").is_none());
+    }
+
+    #[test]
+    fn without_an_answer_from_devices_know_behaves_as_before() {
+        // A Pi that fails the devices read (and the push).
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "learned", 10, 8);
+        rig.pi.with(|s| s.fail_qbp = true);
+        let v = rig.know(&mac(10), None).unwrap();
+        assert_eq!(
+            v["known"], 1,
+            "just the one: it cannot know what to seed from"
+        );
+        assert!(v.get("seeded").is_none());
+        assert_eq!(v["pushed"], false);
+        // A real Pi-hole.
+        let mut rig = Rig::on(FakePi::pihole_only(20));
+        let v = rig.know(&mac(10), None).unwrap();
+        assert_eq!(v["known"], 1);
+        assert!(v.get("seeded").is_none());
     }
 
     #[test]
