@@ -31,6 +31,7 @@ mod neigh;
 mod net;
 mod nm;
 mod pihole;
+mod pinhash;
 mod proc;
 mod rstate;
 mod setup;
