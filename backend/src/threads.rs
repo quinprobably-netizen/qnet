@@ -2415,7 +2415,9 @@ mod tests {
         assert_eq!(pi.count("GET /api/stats"), 0);
         assert_eq!(pi.count("GET /api/dns"), 0);
         assert_eq!(pi.count("GET /api/history"), 0);
-        assert_eq!(pi.count("GET /api/qbp/devices"), 0);
+        // The Pi's devices are read for none of the panel's sake, only once, to
+        // push the lists of the session on the revision that it has.
+        assert_eq!(pi.count("GET /api/qbp/devices"), 1);
         assert_eq!(
             pi.count("PUT /api/qbp/alerts/acked"),
             1,

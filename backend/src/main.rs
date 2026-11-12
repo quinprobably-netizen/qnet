@@ -11,9 +11,11 @@
 //!   qnet watchdog alerts|devices|know-all
 //!   qnet watchdog ack <id>         acknowledge a watchdog alert on the Pi
 //!   qnet watchdog know <mac> [label...]|forget <mac>   known-device list
-//!   qnet watchdog exempt <mac> [label...]|unexempt <mac>   exempt-device list
-//!   qnet watchdog exempt-default on|off   every device skips ad blocking but the blocked
+//!   qnet watchdog exempt <mac> [label...]|unexempt <mac>   ADS PASS list
+//!                                  (aliases: ads-pass, ads-block)
+//!   qnet watchdog exempt-default on|off   every device has ADS PASS but the blocked
 //!   qnet watchdog block <mac> [label...]|unblock <mac>|block-this   block list
+//!   qnet watchdog pin set|clear    the Pi front panel's PIN (digits on stdin)
 //!
 //! One-shot verbs print one JSON line and exit 0 (`ok`) or 1.
 
@@ -54,8 +56,9 @@ use actions::{ActionErr, ActionResult, Ctx};
 const USAGE: &str = "usage: qnet watch | state | dns pihole|auto [--force] | dns pin <uuid> [--force] | \
 pihole pause [secs]|resume|setup <addr> | wifi connect <ap-path>|down|scan|forget <uuid>|radio on|off | portal | \
 watchdog alerts|devices|know-all | watchdog ack <id> | watchdog know <mac> [label...] | watchdog forget <mac> | \
-watchdog exempt <mac> [label...] | watchdog unexempt <mac> | watchdog exempt-default on|off | \
-watchdog block <mac> [label...] | watchdog unblock <mac> | watchdog block-this";
+watchdog exempt|ads-pass <mac> [label...] | watchdog unexempt|ads-block <mac> | \
+watchdog exempt-default on|off | watchdog block <mac> [label...] | watchdog unblock <mac> | \
+watchdog block-this | watchdog pin set|clear";
 
 fn usage() -> ActionErr {
     ActionErr::new("usage", USAGE)
@@ -110,6 +113,15 @@ fn read_secret_line(prompt: &str) -> Result<Zeroizing<String>, String> {
     let kept = line.trim_end_matches(['\n', '\r']).len();
     line.truncate(kept);
     Ok(line)
+}
+
+/// The hash line of the four digits that were read, or why they are no PIN.
+/// What is wrong is told without a word of what was typed.
+fn pin_hash_of(pin: &str) -> Result<pinhash::PinHash, ActionErr> {
+    if !pinhash::valid_pin(pin) {
+        return Err(ActionErr::new("invalid", "a PIN is four digits"));
+    }
+    pinhash::hash(pin).map_err(|e| ActionErr::new("io", e))
 }
 
 struct Terminal;
@@ -353,6 +365,16 @@ fn run_oneshot(cmd: Cmd) -> ActionResult {
         // progress finishes (or is undone) and sessions are logged out.
         Cmd::PiholePause { secs } => with_pihole(|api| actions::pihole_pause(api, secs)),
         Cmd::PiholeResume => with_pihole(|api| actions::pihole_resume(api)),
+        // The PIN's four digits come from stdin (on a terminal, without echo),
+        // never from the command line, and live only until they are hashed.
+        Cmd::Watchdog(wdcli::WdCmd::PinSet) => {
+            util::harden_process();
+            let pin =
+                read_secret_line("Panel PIN (4 digits): ").map_err(|e| ActionErr::new("io", e))?;
+            let hash = pin_hash_of(&pin)?;
+            drop(pin);
+            with_pihole(|api| wdcli::pin_set(api, &util::state_dir().join("watchdog.json"), hash))
+        }
         Cmd::Watchdog(w) => with_pihole(|api| {
             wdcli::run(
                 api,
@@ -687,6 +709,44 @@ mod tests {
             p(&["watchdog", "block-this"]),
             Ok(Cmd::Watchdog(WdCmd::BlockThis))
         );
+    }
+
+    #[test]
+    fn the_ads_pass_words_and_the_pin_verbs_parse() {
+        assert_eq!(p(&["watchdog", "ads-pass", M]), Ok(exempt(M, None)));
+        assert_eq!(
+            p(&["watchdog", "ads-pass", M, "Smart", "TV"]),
+            Ok(exempt(M, Some("Smart TV")))
+        );
+        assert_eq!(
+            p(&["watchdog", "ads-block", M]),
+            Ok(Cmd::Watchdog(WdCmd::Unexempt { mac: M.into() }))
+        );
+        assert_eq!(
+            p(&["watchdog", "pin", "set"]),
+            Ok(Cmd::Watchdog(WdCmd::PinSet))
+        );
+        assert_eq!(
+            p(&["watchdog", "pin", "clear"]),
+            Ok(Cmd::Watchdog(WdCmd::PinClear))
+        );
+        // The digits are never an argument: such a command line is a usage
+        // error, and the error does not repeat it.
+        let e = p(&["watchdog", "pin", "set", "1234"]).unwrap_err();
+        assert_eq!(e.code, "usage");
+        assert!(!e.detail.contains("1234"));
+    }
+
+    #[test]
+    fn a_pin_is_hashed_only_if_it_is_four_digits_and_the_error_never_repeats_it() {
+        let hash = pin_hash_of("0123").unwrap();
+        assert!(hash.as_str().starts_with("$pbkdf2-sha256$i=10000$"));
+        for bad in ["", "123", "12345", "12a4", "hunter22", " 123", "1234 "] {
+            let e = pin_hash_of(bad).unwrap_err();
+            assert_eq!(e.code, "invalid");
+            assert_eq!(e.detail, "a PIN is four digits");
+            assert!(bad.is_empty() || !e.detail.contains(bad));
+        }
     }
 
     #[test]

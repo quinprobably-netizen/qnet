@@ -1,12 +1,25 @@
 //! Support for the qberrypi watchdog: the `/api/qbp/` calls behind the
 //! Pi-hole login, the tolerant parsers for their answers, notification text
-//! (titles, markup escaping, burst folding) and the chunking of the two
-//! lists that are pushed in chunks to the Pi (acknowledged alerts, known
-//! devices). The exempt list (devices that skip ad blocking) is pushed with
-//! it, in one body of at most 64 addresses, and so is the exempt-by-default
-//! policy (the mode plus the block list of devices that stay blocked); a Pi
-//! that answers 404 for either (an older one) is simply not sent it again in
-//! that session.
+//! (titles, markup escaping, burst folding) and the chunking of the lists
+//! that are pushed in chunks to the Pi (acknowledged alerts, known devices,
+//! device labels). The ADS PASS list (the devices that are exempt from ad
+//! blocking) is pushed with it, in one body of at most 64 addresses, and so
+//! is the exempt-by-default policy (the mode plus the block list of devices
+//! that stay blocked); a Pi that answers 404 for either (an older one) is
+//! simply not sent it again in that session. So are the names that this PC
+//! gives its devices (`PUT devices/labels`) and the panel's PIN hash (`PUT
+//! panel`).
+//!
+//! The Pi's device inventory has a revision, `rev`, that moves with every
+//! change of the pushed lists, the labels and the gates, also those that the
+//! front panel makes. The Pi's front panel can change the pushed ADS PASS list
+//! (in the list mode) and the pushed block list (in the exempt-by-default
+//! mode), and what the panel did is newer than what this PC pushed: before
+//! it pushes a list the watcher reads the inventory, and when the Pi's lists
+//! differ from this PC's and nothing says the Pi started again or that an edit
+//! of this PC is waiting, it adopts the Pi's (see [`Poller`]). Every push of
+//! the two lists carries the `rev` that was read as `if_rev`, so that a push
+//! that the panel overtook is a 409, which is read again and decided again.
 //!
 //! A real Pi-hole answers 404 on every `/api/qbp/` path. The calls here turn
 //! that into [`Qbp::Absent`], so the caller can treat the watchdog as not
@@ -18,7 +31,8 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::pihole::{ApiError, Pihole};
+use crate::pihole::{ApiError, Checked, Pihole};
+use crate::pinhash::PinHash;
 use crate::wdstore::{self, Store};
 
 /// The largest request body sent to the Pi: its cap is 4096 bytes, this
@@ -37,6 +51,12 @@ pub const MAX_BLOCK_MACS: usize = 512;
 pub const EXEMPT_MAX: usize = wdstore::MAX_EXEMPT;
 /// The most block-list addresses `PUT devices/policy` takes (the Pi's cap).
 pub const BLOCK_MAX: usize = wdstore::MAX_BLOCK;
+/// Longest label of the Pi's kept, in bytes (it takes 24 characters).
+pub const LABEL_MAX: usize = 24;
+/// The most labels the Pi takes, in all and in one body.
+pub const LABELS_MAX: usize = 64;
+/// The longest label the Pi takes, in characters.
+pub const PI_LABEL_MAX: usize = 24;
 /// IPv4 addresses kept per device.
 pub const MAX_IPV4: usize = 4;
 /// Longest subject kept, in bytes.
@@ -105,10 +125,27 @@ pub struct Device {
     /// Whether the Pi keeps it fully blocked, as a device on its block list
     /// (false when it does not say).
     pub blocked: bool,
+    /// What this PC calls it, as the Pi was told (`labels` of `PUT
+    /// devices/labels`): `None` for a device without a name and for a Pi from
+    /// before the front panel.
+    pub label: Option<String>,
+    /// How many seconds the device's gate (the panel's ADS PASS for a while)
+    /// stays open; `None` while it is shut (and for an older Pi).
+    pub gate_left_secs: Option<u64>,
+    /// The Pi's configuration decides the device, so that no edit changes it
+    /// (false when it does not say).
+    pub fixed: bool,
+    /// The device is the router, or claims the router's or the Pi's address:
+    /// never ADS PASS (false when it does not say).
+    pub always: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inventory {
+    /// The revision of the Pi's device lists, labels and gates; `None` when
+    /// the Pi does not say (from before the front panel): then nothing can be
+    /// adopted from it and no push is made conditional.
+    pub rev: Option<u64>,
     /// `waiting`, `learned`, `received`, or "" for anything else.
     pub known_list: String,
     /// As the Pi sent them (last seen first).
@@ -124,6 +161,13 @@ pub struct Inventory {
     /// address once, at most [`MAX_BLOCK_MACS`]; empty when the Pi does not
     /// say.
     pub block_macs: Vec<String>,
+    /// The ADS PASS list that was pushed to the Pi, as the front panel has
+    /// edited it since, without the Pi's configuration's: lower-case colon
+    /// form, each address once. `None` when the Pi does not say.
+    pub exempt_pushed: Option<Vec<String>>,
+    /// The block list that was pushed to the Pi, as the front panel has edited
+    /// it since, without the configuration's. `None` when the Pi does not say.
+    pub block_pushed: Option<Vec<String>>,
 }
 
 // -- validation helpers -------------------------------------------------------
@@ -268,6 +312,12 @@ fn parse_device(v: &Value) -> Option<Device> {
         known: v.get("known").and_then(Value::as_bool).unwrap_or(false),
         exempt: v.get("exempt").and_then(Value::as_bool).unwrap_or(false),
         blocked: v.get("blocked").and_then(Value::as_bool).unwrap_or(false),
+        label: text(v, "label")
+            .map(|l| clean_text(l, LABEL_MAX))
+            .filter(|l| !l.is_empty()),
+        gate_left_secs: v.get("gate_left_secs").and_then(whole).filter(|&s| s > 0),
+        fixed: v.get("fixed").and_then(Value::as_bool).unwrap_or(false),
+        always: v.get("always").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
@@ -290,12 +340,23 @@ fn parse_macs(v: &Value, key: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// Like [`parse_macs`], but `None` when the answer has no list under `key`:
+/// the Pi does not say, which is not the same as an empty list.
+fn parse_macs_opt(v: &Value, key: &str, max: usize) -> Option<Vec<String>> {
+    v.get(key)
+        .is_some_and(Value::is_array)
+        .then(|| parse_macs(v, key, max))
+}
+
 /// Validate a `GET devices` answer. `None` when `devices` is missing or not a
 /// list. Entries without a valid MAC are dropped; at most [`MAX_DEVICES`]
 /// are kept (the Pi sends the one seen last first, so those are kept). The
 /// exempt fields (`exempt` on a device, `exempt_macs` on top) and the
 /// policy's (`blocked` on a device, `exempt_default` and `block_macs` on top)
-/// are optional: an older Pi has none of them.
+/// are optional: an older Pi has none of them. So are the front panel's: `rev`
+/// and the pushed lists `exempt_pushed` and `block_pushed` on top, and `label`,
+/// `gate_left_secs`, `fixed` and `always` on a device (the Pi's `own_mac` and a
+/// device's `label_rank` are not read: nothing here acts on them).
 pub fn parse_devices(v: &Value) -> Option<Inventory> {
     let items = v.get("devices")?.as_array()?;
     let mut devices: Vec<Device> = items.iter().filter_map(parse_device).collect();
@@ -304,6 +365,7 @@ pub fn parse_devices(v: &Value) -> Option<Inventory> {
         .filter(|s| matches!(*s, "waiting" | "learned" | "received"))
         .unwrap_or_default();
     Some(Inventory {
+        rev: v.get("rev").and_then(whole),
         known_list: known_list.to_string(),
         devices,
         exempt_macs: parse_macs(v, "exempt_macs", MAX_EXEMPT_MACS),
@@ -312,6 +374,8 @@ pub fn parse_devices(v: &Value) -> Option<Inventory> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         block_macs: parse_macs(v, "block_macs", MAX_BLOCK_MACS),
+        exempt_pushed: parse_macs_opt(v, "exempt_pushed", MAX_EXEMPT_MACS),
+        block_pushed: parse_macs_opt(v, "block_pushed", MAX_BLOCK_MACS),
     })
 }
 
@@ -404,63 +468,205 @@ pub fn put_known(api: &mut Pihole, macs: &[String]) -> Result<Qbp<u64>, ApiError
     Ok(Qbp::Present(known))
 }
 
-/// `PUT /api/qbp/devices/exempt`: replace the Pi's pushed exempt list with
-/// `macs`: one body `{"exempt":[…]}`, no chunking. Entries that are not
-/// hardware addresses are skipped, the rest are sent in lower-case colon form,
-/// each once, and no more than [`EXEMPT_MAX`] (the Pi refuses a longer list
-/// with a 400; the store never holds more). An empty list is sent as it is: it
-/// clears the Pi's list, so the caller decides whether it wants that.
-/// Returns the size of the Pi's pushed list. `Absent` is the Pi saying 404
-/// for the route: it has no exempt support (when the watchdog itself is
-/// there, which the caller knows from its other calls). A 400 or any other
-/// failure is an error.
-pub fn put_exempt(api: &mut Pihole, macs: &[String]) -> Result<Qbp<u64>, ApiError> {
+/// How a push of the ADS PASS list or of the policy ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListPut {
+    /// The Pi took it: the size of its list now, and its revision after the
+    /// change (`None` from a Pi that does not say).
+    Done { count: u64, rev: Option<u64> },
+    /// 409: the push was made on a revision that is not the Pi's any more,
+    /// and nothing changed. `rev` is the one it has now, if it says.
+    Stale { rev: Option<u64> },
+    /// 404: the Pi has no such route.
+    Absent,
+}
+
+/// Each address once, in lower-case colon form, in the order given, at most
+/// `max`; what is not an address is skipped.
+fn clean_macs(macs: &[String], max: usize) -> Vec<String> {
     let mut list: Vec<String> = Vec::new();
     for m in macs.iter().filter_map(|m| normalize_mac(m)) {
         if !list.contains(&m) {
             list.push(m);
         }
     }
-    list.truncate(EXEMPT_MAX);
-    let body = json!({ "exempt": list });
-    Ok(
-        match api.json_opt("PUT", "/api/qbp/devices/exempt", Some(&body))? {
-            None => Qbp::Absent,
-            Some(v) => Qbp::Present(num(&v, "exempt", 0)),
+    list.truncate(max);
+    list
+}
+
+/// A list push's answer: its size under `field`, and the revision.
+fn list_put(checked: Checked, field: &str) -> ListPut {
+    match checked {
+        Checked::NotFound => ListPut::Absent,
+        Checked::Conflict(v) => ListPut::Stale {
+            rev: v.get("rev").and_then(whole),
         },
-    )
+        Checked::Ok(v) => ListPut::Done {
+            count: num(&v, field, 0),
+            rev: v.get("rev").and_then(whole),
+        },
+    }
+}
+
+/// `PUT /api/qbp/devices/exempt`: replace the Pi's pushed ADS PASS list with
+/// `macs`: one body `{"exempt":[…]}`, no chunking, and `"if_rev"` when
+/// `if_rev` is given: the Pi then changes nothing, and answers 409, unless
+/// that is its revision now. Entries that are not hardware addresses are
+/// skipped, the rest are sent in lower-case colon form, each once, and no more
+/// than [`EXEMPT_MAX`] (the Pi refuses a longer list with a 400; the store
+/// never holds more). An empty list is sent as it is: it clears the Pi's list,
+/// so the caller decides whether it wants that. `Absent` is the Pi saying 404
+/// for the route: it has no ADS PASS support (when the watchdog itself is
+/// there, which the caller knows from its other calls). A 400 or any other
+/// failure is an error.
+pub fn put_exempt(
+    api: &mut Pihole,
+    macs: &[String],
+    if_rev: Option<u64>,
+) -> Result<ListPut, ApiError> {
+    let mut body = json!({ "exempt": clean_macs(macs, EXEMPT_MAX) });
+    if let Some(rev) = if_rev {
+        body["if_rev"] = json!(rev);
+    }
+    Ok(list_put(
+        api.json_checked("PUT", "/api/qbp/devices/exempt", Some(&body))?,
+        "exempt",
+    ))
 }
 
 /// `PUT /api/qbp/devices/policy`: replace the Pi's exempt-by-default policy:
 /// one body `{"exempt_default":<bool>,"block":[…]}` (both keys, always), no
-/// chunking. The block entries that are not hardware addresses are skipped,
-/// the rest are sent in lower-case colon form, each once, and no more than
-/// [`BLOCK_MAX`] (the Pi refuses a longer list with a 400; the store never
-/// holds more). The default policy (`false`, `[]`) is sent as it is: it
-/// clears what the Pi holds, so the caller decides whether it wants that.
-/// Returns the size of the Pi's block list. `Absent` is the Pi saying 404 for
-/// the route: it has no such policy (when the watchdog itself is there, which
-/// the caller knows from its other calls). A 400 or any other failure is an
-/// error.
+/// chunking, with `"if_rev"` as for [`put_exempt`]. The block entries that
+/// are not hardware addresses are skipped, the rest are sent in lower-case
+/// colon form, each once, and no more than [`BLOCK_MAX`] (the Pi refuses a
+/// longer list with a 400; the store never holds more). The default policy
+/// (`false`, `[]`) is sent as it is: it clears what the Pi holds, so the
+/// caller decides whether it wants that. The count is the size of the Pi's
+/// block list. `Absent` is the Pi saying 404 for the route: it has no such
+/// policy (when the watchdog itself is there, which the caller knows from its
+/// other calls). A 400 or any other failure is an error.
 pub fn put_policy(
     api: &mut Pihole,
     exempt_default: bool,
     block: &[String],
-) -> Result<Qbp<u64>, ApiError> {
-    let mut list: Vec<String> = Vec::new();
-    for m in block.iter().filter_map(|m| normalize_mac(m)) {
-        if !list.contains(&m) {
-            list.push(m);
+    if_rev: Option<u64>,
+) -> Result<ListPut, ApiError> {
+    let mut body = json!({
+        "exempt_default": exempt_default,
+        "block": clean_macs(block, BLOCK_MAX),
+    });
+    if let Some(rev) = if_rev {
+        body["if_rev"] = json!(rev);
+    }
+    Ok(list_put(
+        api.json_checked("PUT", "/api/qbp/devices/policy", Some(&body))?,
+        "block",
+    ))
+}
+
+/// `PUT /api/qbp/devices/labels`: tell the Pi what this PC calls its devices,
+/// `(mac, label)` pairs in this PC's order, which the front panel keeps.
+/// They go in chunks ([`label_chunks`]) as the known list does; the labels
+/// take effect on the last. An empty list is sent as one empty body, which
+/// clears the Pi's labels. Returns the number of labels the Pi holds after
+/// the last chunk; `Absent` as soon as one answer is 404 (a Pi from before
+/// the front panel). Use [`labels_for_pi`] to make the pairs.
+pub fn put_labels(api: &mut Pihole, labels: &[(String, String)]) -> Result<Qbp<u64>, ApiError> {
+    let mut kept = 0u64;
+    for body in label_chunks(labels, QBP_BODY_MAX) {
+        match api.json_opt("PUT", "/api/qbp/devices/labels", Some(&body))? {
+            None => return Ok(Qbp::Absent),
+            Some(v) => kept = num(&v, "labels", 0),
         }
     }
-    list.truncate(BLOCK_MAX);
-    let body = json!({ "exempt_default": exempt_default, "block": list });
-    Ok(
-        match api.json_opt("PUT", "/api/qbp/devices/policy", Some(&body))? {
-            None => Qbp::Absent,
-            Some(v) => Qbp::Present(num(&v, "block", 0)),
-        },
-    )
+    Ok(Qbp::Present(kept))
+}
+
+/// `PUT /api/qbp/panel`: the hash of the panel's PIN for the running boot, as
+/// `{"pin_hash": "<line>"}`, or `{"pin_hash": null}` to take the PIN off.
+/// `Absent` is a 404 (a Pi from before the PIN). The hash is never in an error
+/// or a log line made here.
+pub fn put_panel(api: &mut Pihole, pin_hash: Option<&PinHash>) -> Result<Qbp<()>, ApiError> {
+    let body = json!({ "pin_hash": pin_hash.map(PinHash::as_str) });
+    Ok(match api.json_opt("PUT", "/api/qbp/panel", Some(&body))? {
+        None => Qbp::Absent,
+        Some(_) => Qbp::Present(()),
+    })
+}
+
+/// What this PC calls its devices, as the Pi takes them: `(mac, label)` in this
+/// PC's order, the known list first, then the ADS PASS list and the block list
+/// for the devices that are on no earlier one. A device's first label counts
+/// (an entry without one claims nothing). The Pi's labels are 1 to 24 printable
+/// ASCII characters, so a character outside that range becomes `?`, a label
+/// that is cut at 24 characters ends there without trailing blanks, and one
+/// with no letter or digit left is left out; an address that no device can have
+/// (all zeros, or with the multicast bit) is left out too, because one such
+/// pair would make the Pi refuse the whole body. At most [`LABELS_MAX`].
+pub fn labels_for_pi(store: &Store) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in store.known.iter().chain(&store.exempt).chain(&store.block) {
+        if out.len() >= LABELS_MAX {
+            break;
+        }
+        if out.iter().any(|(m, _)| *m == entry.mac) || !can_be_a_device(&entry.mac) {
+            continue;
+        }
+        let Some(label) = entry.label.as_deref().and_then(ascii_label) else {
+            continue;
+        };
+        out.push((entry.mac.clone(), label));
+    }
+    out
+}
+
+/// Whether a hardware address (any accepted spelling) can be one device's: not
+/// all zeros, and not a broadcast or multicast address (the low bit of its
+/// first byte is clear), as the Pi decides it.
+fn can_be_a_device(mac: &str) -> bool {
+    let Some(mac) = normalize_mac(mac) else {
+        return false;
+    };
+    let first = u8::from_str_radix(&mac[..2], 16).unwrap_or(1);
+    mac != "00:00:00:00:00:00" && first & 1 == 0
+}
+
+/// The label in the Pi's alphabet and length, or `None` when nothing of it is
+/// a letter or a digit.
+fn ascii_label(label: &str) -> Option<String> {
+    let ascii: String = label
+        .chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
+        .take(PI_LABEL_MAX)
+        .collect();
+    let ascii = ascii.trim().to_string();
+    ascii
+        .bytes()
+        .any(|b| b.is_ascii_alphanumeric())
+        .then_some(ascii)
+}
+
+/// A list after the Pi's front panel and this PC have both changed it: the Pi's
+/// `current` list, with what this PC did to `from` (the list it read from the Pi
+/// before it edited) done to it. What this PC added is in, what it took off is
+/// out, and everything else `current` has stays: the panel's edit is not lost,
+/// and neither is this PC's. The order is `want`'s (what this PC meant to
+/// push), then what only `current` has, in its order.
+pub fn rebase(from: &[String], want: &[String], current: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in want {
+        // Added here, or kept and not taken off by the panel.
+        if (!from.contains(m) || current.contains(m)) && !out.contains(m) {
+            out.push(m.clone());
+        }
+    }
+    for m in current {
+        let taken_off_here = from.contains(m) && !want.contains(m);
+        if !taken_off_here && !out.contains(m) {
+            out.push(m.clone());
+        }
+    }
+    out
 }
 
 // -- chunking -----------------------------------------------------------------
@@ -474,12 +680,12 @@ fn body_len(v: &Value) -> usize {
 /// serialized forms joined by commas) is at most `room` bytes. A run always
 /// holds at least one item, so a `room` too small for one item still makes
 /// progress (and that run is over the room).
-fn pack(items: &[String], room: usize) -> Vec<&[String]> {
+fn pack<T: serde::Serialize>(items: &[T], room: usize) -> Vec<&[T]> {
     let mut runs = Vec::new();
     let mut start = 0;
     let mut used = 0usize;
     for (i, item) in items.iter().enumerate() {
-        let cost = serde_json::to_vec(item).map_or(item.len() + 2, |b| b.len());
+        let cost = serde_json::to_vec(item).map_or(room, |b| b.len());
         let add = if i == start { cost } else { cost + 1 };
         if i > start && used + add > room {
             runs.push(&items[start..i]);
@@ -515,6 +721,30 @@ pub fn known_chunks(macs: &[String], max_body: usize) -> Vec<Value> {
     runs.into_iter()
         .enumerate()
         .map(|(i, run)| known_body(run, i > 0, i == last))
+        .collect()
+}
+
+fn labels_body(labels: &[(String, String)], append: bool, complete: bool) -> Value {
+    json!({ "labels": labels, "append": append, "complete": complete })
+}
+
+/// The bodies of `PUT devices/labels` for `labels` (`[mac, label]` pairs), each
+/// at most `max_body` bytes when serialized, the pairs in their given order and
+/// at most [`LABELS_MAX`] of them in all, as [`known_chunks`] makes them: the
+/// first has `append: false`, every one but the last `complete: false`, the
+/// last `complete: true`. An empty list gives exactly one body with `"labels":
+/// []`.
+pub fn label_chunks(labels: &[(String, String)], max_body: usize) -> Vec<Value> {
+    let labels = &labels[..labels.len().min(LABELS_MAX)];
+    let overhead = body_len(&labels_body(&[], false, false));
+    let runs = pack(labels, max_body.saturating_sub(overhead));
+    if runs.is_empty() {
+        return vec![labels_body(&[], false, true)];
+    }
+    let last = runs.len() - 1;
+    runs.into_iter()
+        .enumerate()
+        .map(|(i, run)| labels_body(run, i > 0, i == last))
         .collect()
 }
 
@@ -776,18 +1006,42 @@ enum Pushed {
     Failed,
 }
 
-/// The small lists that are pushed after the known list and the acks, each
-/// with a call and a bookkeeping of its own (see [`SideState`]).
+/// The pushes that go after the known list and the acks, each with a call and
+/// a bookkeeping of its own (see [`SideState`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
-    /// The exempt list: `PUT devices/exempt`.
+    /// The ADS PASS list: `PUT devices/exempt`.
     Exempt,
     /// The exempt-by-default policy (the mode and the block list): `PUT
     /// devices/policy`.
     Policy,
+    /// What this PC calls its devices: `PUT devices/labels`.
+    Labels,
+    /// The panel's PIN hash: `PUT panel`.
+    Panel,
 }
 
-/// What the poller remembers about pushing one [`Side`]. The two ride on the
+impl Side {
+    const ALL: [Side; 4] = [Side::Exempt, Side::Policy, Side::Labels, Side::Panel];
+    /// The two lists that the front panel edits as well.
+    const LISTS: [Side; 2] = [Side::Exempt, Side::Policy];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// How a failure of this push is named in `push_error`.
+    fn name(self) -> &'static str {
+        match self {
+            Side::Exempt => "ADS PASS list",
+            Side::Policy => "device policy",
+            Side::Labels => "device labels",
+            Side::Panel => "panel PIN",
+        }
+    }
+}
+
+/// What the poller remembers about pushing one [`Side`]. They ride on the
 /// known list's triggers (a new login session, a Pi restart, a `waiting` Pi,
 /// an edit of their own), but are tracked apart from it and from each other,
 /// so that one failing never holds up another.
@@ -806,6 +1060,46 @@ struct SideState {
     absent_logins: Option<u64>,
     /// Why the last push failed, "" when it did not.
     error: String,
+    /// For the two lists that the front panel edits: the Pi has started
+    /// again since this PC last pushed (its restart was seen, or its
+    /// revision went backwards, or it still waits for the known list that
+    /// this PC pushed), so what it holds says nothing of what the panel did
+    /// and this PC's list is the one to push. Kept until the push is done.
+    restarted: bool,
+}
+
+/// The Pi's device inventory as a push sees it: read once before the lists
+/// are pushed, and kept up to date with the revision that each push answers.
+#[derive(Debug)]
+enum View {
+    /// Nothing was read: no list of the Pi's was to be pushed.
+    Unread,
+    Read(Inventory),
+    /// The read failed with this (an error that does not mean the Pi cannot
+    /// be talked to): the lists wait, as they cannot be pushed on a revision.
+    Failed(String),
+}
+
+/// How one [`Side`]'s push ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Sent {
+    /// The Pi was sent what this PC has.
+    Pushed,
+    /// The Pi's list was newer (the front panel edited it) and this PC took it
+    /// over: nothing was sent.
+    Adopted,
+    /// The Pi answered 404: it has no such route.
+    Absent,
+    Failed(String),
+}
+
+/// How many times a push that the front panel overtook (a 409) is read and
+/// decided again before it is given up until the next cycle.
+const PUSH_TRIES: usize = 3;
+
+/// Whether two lists of addresses name the same devices, whatever their order.
+fn same_set(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().all(|m| b.contains(m))
 }
 
 /// The watchdog's state between cycles, for one API client: what the Pi
@@ -835,10 +1129,15 @@ pub struct Poller {
     /// session, so the Pi may have rebooted since: see
     /// [`restart`](Self::restart).
     alerts_logins: Option<u64>,
-    /// The exempt list's pushes.
-    exempt: SideState,
-    /// The exempt-by-default policy's pushes.
-    policy: SideState,
+    /// The ADS PASS list's, the policy's, the labels' and the PIN's pushes,
+    /// by [`Side::index`].
+    sides: [SideState; 4],
+    /// The Pi's device `rev` as it was last read or answered: a revision that
+    /// is lower later is a Pi that started again.
+    dev_rev: Option<u64>,
+    /// The labels that were last pushed (by this poller): the labels are due
+    /// again when the store's differ.
+    labels_pushed: Option<Vec<(String, String)>>,
     /// `"<address>|<pin>"` of the Pi-hole this poller talks to: what the
     /// store's `absent_for` is compared with. `None` = no verdict is kept.
     verdict_key: Option<String>,
@@ -872,8 +1171,9 @@ impl Poller {
             push_due: false,
             absent_logins: 0,
             alerts_logins: None,
-            exempt: SideState::default(),
-            policy: SideState::default(),
+            sides: Default::default(),
+            dev_rev: None,
+            labels_pushed: None,
             verdict_key: None,
             verdict_stale: false,
             pushed_at: 0,
@@ -904,10 +1204,11 @@ impl Poller {
     /// there was no client, so the next answer is taken from 0.
     pub fn client_replaced(&mut self) {
         self.pushed_logins = None;
-        for side in [&mut self.exempt, &mut self.policy] {
+        for side in &mut self.sides {
             side.pushed_logins = None;
             side.absent_logins = None;
         }
+        self.labels_pushed = None;
         self.alerts_logins = None;
         self.cursor = 0;
         self.alerts.clear();
@@ -939,10 +1240,11 @@ impl Poller {
         self.rev = 0;
         self.suppressed = 0;
         self.push_error.clear();
-        for side in [&mut self.exempt, &mut self.policy] {
+        for side in &mut self.sides {
             side.error.clear();
             side.absent_logins = None;
         }
+        self.dev_rev = None;
         self.status = "absent";
         self.polled_at = now;
     }
@@ -951,8 +1253,11 @@ impl Poller {
     ///
     /// 1. When absent, nothing is asked unless a new login session began.
     /// 2. Push what is due (acknowledged keys, then the known list, then the
-    ///    exempt list and the exempt-by-default policy, whose trouble never
-    ///    fails the cycle).
+    ///    ADS PASS list, the exempt-by-default policy, the labels and the
+    ///    panel's PIN, whose trouble never fails the cycle). Before the two
+    ///    lists are pushed the Pi's inventory is read: what its front panel
+    ///    did to them is adopted instead of overwritten (see
+    ///    [`try_push`](Self::try_push)).
     /// 3. Fetch the alerts changed since the cursor. If the Pi may have
     ///    restarted (a new login session since the last page, a `rev` below
     ///    the cursor, or an `id` the map holds under another key) the cursor,
@@ -965,9 +1270,11 @@ impl Poller {
     ///    notification goes out, since it could not be recorded as sent.
     /// 5. Fold the new notifications (also called with none, so a held fold
     ///    goes out).
-    /// 6. With `with_devices`: fetch the inventory; a `waiting` Pi and a
-    ///    non-empty known list make another push at once. A failing devices
-    ///    read or push here never fails the cycle (the alerts were done).
+    /// 6. With `with_devices`: fetch the inventory; the front panel's edits of
+    ///    the two lists are adopted, a Pi that started again is noticed, and a
+    ///    `waiting` Pi and a non-empty known list make another push at once.
+    ///    A failing devices read or push here never fails the cycle (the
+    ///    alerts were done).
     ///
     /// An `Err` means the Pi could not be talked to (or the alerts answer was
     /// bad) and nothing was recorded; the caller reports it with
@@ -1051,12 +1358,13 @@ impl Poller {
         if with_devices {
             match get_devices(api) {
                 Ok(Qbp::Present(inv)) => {
-                    let waiting = inv.known_list == "waiting";
+                    let waiting = inv.known_list == "waiting"
+                        && !Store::load(store_path).known_macs().is_empty();
+                    let went_back = self.adopt_seen(&inv, store_path, now);
                     self.inventory = Some(inv);
-                    if waiting && !Store::load(store_path).known_macs().is_empty() {
+                    if waiting || went_back {
                         self.push_due = true;
-                        self.exempt.due = true;
-                        self.policy.due = true;
+                        self.mark_restarted();
                         // Failures are in `push_error`; an absence is below.
                         let _ = self.push(api, store_path, now);
                     }
@@ -1112,14 +1420,25 @@ impl Poller {
         self.cursor = 0;
         self.alerts.clear();
         self.inventory = None;
-        // It may be newer software now: ask again for the exempt list and
-        // the policy.
-        self.exempt.absent_logins = None;
-        self.policy.absent_logins = None;
+        // It may be newer software now: ask again for the ADS PASS list, the
+        // policy, the labels and the PIN.
+        for side in &mut self.sides {
+            side.absent_logins = None;
+        }
         if force_push {
             self.push_due = true;
-            self.exempt.due = true;
-            self.policy.due = true;
+            self.mark_restarted();
+        }
+    }
+
+    /// The Pi has started again: everything that it holds in memory is gone,
+    /// and this PC's lists are the ones to push, whatever the Pi says.
+    fn mark_restarted(&mut self) {
+        for side in &mut self.sides {
+            side.due = true;
+        }
+        for side in Side::LISTS {
+            self.sides[side.index()].restarted = true;
         }
     }
 
@@ -1144,6 +1463,53 @@ impl Poller {
         }
     }
 
+    /// Whether the Pi's device inventory is to be read before the lists go:
+    /// when the ADS PASS list or the policy is to be pushed.
+    fn lists_wanted(&self, store: &Store, logins: u64) -> bool {
+        Side::LISTS
+            .iter()
+            .any(|&side| self.wants(side, store, logins))
+    }
+
+    /// Whether `side` is to be pushed now: in a new login session (with the
+    /// known list's), after a restart or a `waiting` Pi (the same flags that
+    /// make the lists due), after an edit of it, and after a failed attempt;
+    /// and not while a 404 of this session says the Pi has no such route.
+    ///
+    /// An empty list (the default policy, no labels) is wanted too, not only
+    /// after an edit: this PC's list is the master, so a Pi that still holds
+    /// exemptions, a policy or names from a store that was lost or reset must
+    /// hear that there are none. Only once the watchdog has been seen, so that
+    /// a real Pi-hole is never asked for it; until then it is asked again at
+    /// the next cycle. The PIN is the exception: with none set here and no
+    /// edit waiting nothing is sent, so that a PIN the Pi has of its own is
+    /// never taken off by a PC that was never given one.
+    fn wants(&self, side: Side, store: &Store, logins: u64) -> bool {
+        let track = &self.sides[side.index()];
+        if track.absent_logins == Some(logins) {
+            return false;
+        }
+        let (edit_due, default) = match side {
+            Side::Exempt => (store.exempt_push_due(), store.exempt.is_empty()),
+            Side::Policy => (store.policy_push_due(), store.policy_is_default()),
+            Side::Labels => {
+                let labels = labels_for_pi(store);
+                (
+                    self.labels_pushed
+                        .as_ref()
+                        .is_some_and(|sent| *sent != labels),
+                    labels.is_empty(),
+                )
+            }
+            Side::Panel => (store.pin_push_due(), store.pin_hash.is_none()),
+        };
+        if !(track.pushed_logins != Some(logins) || track.due || edit_due) {
+            return false;
+        }
+        let seen = self.presence == Presence::Present;
+        !(default && !edit_due && (!seen || side == Side::Panel))
+    }
+
     fn try_push(
         &mut self,
         api: &mut Pihole,
@@ -1152,26 +1518,42 @@ impl Poller {
     ) -> Result<Qbp<()>, ApiError> {
         let store = Store::load(store_path);
         let due = self.pushed_logins != Some(api.logins()) || self.push_due || store.push_due();
+        // The Pi's inventory, before anything is pushed (so that a Pi that
+        // still waits for its known list shows it): what its front panel did
+        // to the two lists is in it, and its revision is what their pushes are
+        // made conditional on. Only when one of the lists is to be pushed.
+        let mut view = View::Unread;
+        if self.lists_wanted(&store, api.logins()) {
+            view = match self.read_inventory(api, &store) {
+                Ok(Qbp::Present(inv)) => View::Read(inv),
+                Ok(Qbp::Absent) => return Ok(Qbp::Absent),
+                Err(e @ (ApiError::Auth(_) | ApiError::Tls(_) | ApiError::Unreachable(_))) => {
+                    return Err(e)
+                }
+                Err(e) => View::Failed(format!("the Pi's lists could not be read first: {e}")),
+            };
+        }
         let lists = if due {
             self.push_lists(api, store_path, &store, now)
         } else {
             Ok(Qbp::Present(()))
         };
-        // The exempt list and the policy go after the other lists, but not
-        // behind them, and not behind each other: a known list or acks that
-        // keep failing (the Pi answered, with an error) must not keep the
-        // exempt devices ad-blocked, or the blocked ones unblocked, and the
-        // exempt list's failure must not hold up the policy. They are left
+        // The ADS PASS list, the policy, the labels and the PIN go after the
+        // other lists, but not behind them, and not behind each other: a known
+        // list or acks that keep failing (the Pi answered, with an error) must
+        // not keep the exempt devices ad-blocked, or the blocked ones
+        // unblocked, and one's failure must not hold up another. They are left
         // out only when there is nothing to talk to: no watchdog (a real
         // Pi-hole, which answered 404 to the lists) or a Pi that cannot be
-        // reached at all (the same failure, slowly, a second time). Their
-        // own trouble never fails the cycle: see `push_side`.
+        // reached at all (the same failure, slowly, a second time). Their own
+        // trouble never fails the cycle: see `push_side`.
         match &lists {
             Ok(Qbp::Absent)
             | Err(ApiError::Auth(_) | ApiError::Tls(_) | ApiError::Unreachable(_)) => {}
             _ => {
-                self.push_side(Side::Exempt, api, store_path, &store, now);
-                self.push_side(Side::Policy, api, store_path, &store, now);
+                for side in Side::ALL {
+                    self.push_side(side, api, store_path, &store, &mut view, now);
+                }
             }
         }
         lists
@@ -1222,94 +1604,272 @@ impl Poller {
         Ok(Qbp::Present(()))
     }
 
-    fn side(&mut self, side: Side) -> &mut SideState {
-        match side {
-            Side::Exempt => &mut self.exempt,
-            Side::Policy => &mut self.policy,
-        }
-    }
-
-    /// The exempt list or the policy, when it is due: in a new login session
-    /// (with the known list's), after a restart or a `waiting` Pi (the same
-    /// flags that make the lists due), after an edit of it, and after a
-    /// failed attempt. It never fails the push and never stops the cycle:
-    /// whatever it runs into is kept in the side's `error` and it stays due
-    /// (on the same schedule as a failed known list), and a 404 (a Pi without
-    /// support for the route) is a verdict for the session, not an error. (A
-    /// real Pi-hole has answered 404 to the lists above, as a rule, and to the
-    /// alerts at the latest.) Unlike the known list, an empty list (the
-    /// default policy) is sent too: see the comment where it is decided.
+    /// `side`, when it is wanted (see [`wants`](Self::wants)). It never fails
+    /// the push and never stops the cycle: whatever it runs into is kept in the
+    /// side's `error` and it stays due (on the same schedule as a failed known
+    /// list), and a 404 (a Pi without support for the route) is a verdict for
+    /// the session, not an error. (A real Pi-hole has answered 404 to the
+    /// lists above, as a rule, and to the alerts at the latest.)
     fn push_side(
         &mut self,
         side: Side,
         api: &mut Pihole,
         store_path: &Path,
         store: &Store,
+        view: &mut View,
         now: u64,
     ) {
-        let (edit_due, default) = match side {
-            Side::Exempt => (store.exempt_push_due(), store.exempt.is_empty()),
-            Side::Policy => (store.policy_push_due(), store.policy_is_default()),
-        };
-        let seen = self.presence == Presence::Present;
-        let track = self.side(side);
-        if track.absent_logins == Some(api.logins()) {
-            return;
-        }
-        let due = track.pushed_logins != Some(api.logins()) || track.due || edit_due;
-        if !due {
-            return;
-        }
-        // An empty list is pushed too, not only after an edit: this PC's
-        // list is the master, so a Pi that still holds exemptions (or a
-        // policy) from a store that was lost or reset must hear that there
-        // are none. Only once the watchdog has been seen, so that a real
-        // Pi-hole is never asked for it; until then it is asked again at the
-        // next cycle.
-        if default && !edit_due && !seen {
+        if !self.wants(side, store, api.logins()) {
             return;
         }
         let sent = match side {
-            Side::Exempt => put_exempt(api, &store.exempt_macs()),
-            Side::Policy => put_policy(api, store.exempt_default, &store.block_macs()),
+            Side::Exempt | Side::Policy => self.send_list(side, api, store_path, store, view, now),
+            Side::Labels => self.send_labels(api, store),
+            Side::Panel => self.send_panel(api, store_path, store),
         };
-        let track = self.side(side);
+        let track = &mut self.sides[side.index()];
         match sent {
-            Ok(Qbp::Present(_)) => {}
-            Ok(Qbp::Absent) => {
+            Sent::Absent => {
                 track.absent_logins = Some(api.logins());
                 track.pushed_logins = Some(api.logins());
                 track.due = false;
                 track.error.clear();
                 return;
             }
-            Err(e) => {
-                track.error = e.message().to_string();
+            Sent::Failed(why) => {
+                track.error = why;
                 track.due = true;
                 return;
             }
+            Sent::Pushed | Sent::Adopted => {}
         }
         // Read after the call: a re-login during the push is this session.
         track.pushed_logins = Some(api.logins());
         track.due = false;
         track.error.clear();
-        self.pushed_at = now;
-        if edit_due {
-            // `store` was read before the push: an edit made while it was on
-            // the wire stays due.
-            let recorded = match side {
-                Side::Exempt => {
-                    let generation = store.exempt_gen;
-                    wdstore::update(store_path, |s| s.mark_exempt_pushed(generation))
+        track.restarted = false;
+        if sent == Sent::Pushed {
+            self.pushed_at = now;
+        }
+    }
+
+    /// The Pi's inventory, read for a push: what it says of its revision and
+    /// of how it was started is noted (see [`note_read`](Self::note_read)).
+    fn read_inventory(
+        &mut self,
+        api: &mut Pihole,
+        store: &Store,
+    ) -> Result<Qbp<Inventory>, ApiError> {
+        let got = get_devices(api)?;
+        if let Qbp::Present(inv) = &got {
+            self.note_read(inv, store);
+        }
+        Ok(got)
+    }
+
+    /// The ADS PASS list or the policy: read what the Pi has, adopt it when
+    /// the front panel changed it, push this PC's when not. The decision is
+    /// [`should_adopt`](Self::should_adopt); a push carries the revision that
+    /// was read as `if_rev`, and a 409 (the panel overtook it) reads the
+    /// inventory again and decides again, up to [`PUSH_TRIES`] times.
+    fn send_list(
+        &mut self,
+        side: Side,
+        api: &mut Pihole,
+        store_path: &Path,
+        store: &Store,
+        view: &mut View,
+        now: u64,
+    ) -> Sent {
+        let mut store = store.clone();
+        // Not read before (the session began while the other lists were being
+        // pushed): never push a list on a revision that was not read.
+        if matches!(view, View::Unread) {
+            match self.read_inventory(api, &store) {
+                Ok(Qbp::Present(inv)) => *view = View::Read(inv),
+                Ok(Qbp::Absent) => return Sent::Absent,
+                Err(e) => {
+                    return Sent::Failed(format!("the Pi's lists could not be read first: {e}"))
                 }
-                Side::Policy => {
-                    let generation = store.policy_gen;
-                    wdstore::update(store_path, |s| s.mark_policy_pushed(generation))
-                }
-            };
-            if let Err(e) = recorded {
-                self.side(side).error = format!("the push could not be recorded: {e}");
             }
+        }
+        for attempt in 1..=PUSH_TRIES {
+            let inv = match view {
+                View::Read(inv) => Some(&*inv),
+                View::Failed(why) => return Sent::Failed(why.clone()),
+                View::Unread => None,
+            };
+            let rev = inv.and_then(|inv| inv.rev);
+            let on_pi = inv.and_then(|inv| match side {
+                Side::Policy => inv.block_pushed.as_ref(),
+                _ => inv.exempt_pushed.as_ref(),
+            });
+            if let (Some(rev), Some(on_pi)) = (rev, on_pi) {
+                if self.should_adopt(side, &store, on_pi, rev) {
+                    let on_pi = on_pi.clone();
+                    let mode_differs =
+                        inv.is_some_and(|inv| inv.exempt_default) != store.exempt_default;
+                    let adopted = wdstore::update(store_path, |s| match side {
+                        Side::Policy => s.adopt_block(&on_pi, now),
+                        _ => s.adopt_exempt(&on_pi, now),
+                    });
+                    if let Err(e) = adopted {
+                        return Sent::Failed(format!("the Pi's list could not be adopted: {e}"));
+                    }
+                    // The mode is this PC's to say: a policy whose mode the Pi
+                    // does not have still goes, on the list that was adopted.
+                    if side != Side::Policy || !mode_differs {
+                        return Sent::Adopted;
+                    }
+                    store = Store::load(store_path);
+                }
+            }
+            let sent = match side {
+                Side::Policy => put_policy(api, store.exempt_default, &store.block_macs(), rev),
+                _ => put_exempt(api, &store.exempt_macs(), rev),
+            };
+            match sent {
+                Err(e) => return Sent::Failed(e.message().to_string()),
+                Ok(ListPut::Absent) => return Sent::Absent,
+                Ok(ListPut::Done { rev: after, .. }) => {
+                    if let Some(after) = after {
+                        self.dev_rev = Some(after);
+                        if let View::Read(inv) = view {
+                            inv.rev = Some(after);
+                        }
+                    }
+                    // `store` was read before the push: an edit made while it
+                    // was on the wire stays due.
+                    let recorded = match side {
+                        Side::Policy if store.policy_push_due() => {
+                            let generation = store.policy_gen;
+                            Some(wdstore::update(store_path, |s| {
+                                s.mark_policy_pushed(generation)
+                            }))
+                        }
+                        Side::Exempt if store.exempt_push_due() => {
+                            let generation = store.exempt_gen;
+                            Some(wdstore::update(store_path, |s| {
+                                s.mark_exempt_pushed(generation)
+                            }))
+                        }
+                        _ => None,
+                    };
+                    return match recorded {
+                        Some(Err(e)) => {
+                            Sent::Failed(format!("the push could not be recorded: {e}"))
+                        }
+                        _ => Sent::Pushed,
+                    };
+                }
+                Ok(ListPut::Stale { .. }) => {
+                    if attempt == PUSH_TRIES {
+                        break;
+                    }
+                    // The panel overtook the push: read what it did, decide
+                    // again.
+                    match self.read_inventory(api, &store) {
+                        Ok(Qbp::Present(inv)) => *view = View::Read(inv),
+                        Ok(Qbp::Absent) => return Sent::Absent,
+                        Err(e) => return Sent::Failed(e.message().to_string()),
+                    }
+                    store = Store::load(store_path);
+                }
+            }
+        }
+        Sent::Failed("the Pi's lists kept changing while they were pushed".to_string())
+    }
+
+    /// Whether the Pi's pushed list `on_pi` (at revision `rev`) is to be taken
+    /// over instead of this PC's: when the two differ, the Pi's was last
+    /// changed after this PC pushed (revision above 0: something changed it
+    /// since the Pi started), and nothing says this PC's is the newer: the Pi
+    /// has not just started again and an edit of this PC is not waiting. The
+    /// front panel's edit is newer than the push that this PC made before.
+    fn should_adopt(&self, side: Side, store: &Store, on_pi: &[String], rev: u64) -> bool {
+        let (mine, edit_due) = match side {
+            Side::Policy => (store.block_macs(), store.policy_push_due()),
+            _ => (store.exempt_macs(), store.exempt_push_due()),
+        };
+        rev > 0 && !self.sides[side.index()].restarted && !edit_due && !same_set(&mine, on_pi)
+    }
+
+    /// What this PC has read of the Pi's inventory, in a push: a revision that
+    /// is lower than the last one means the Pi started again, and so does a Pi
+    /// that still waits for a known list that this PC has (it was never pushed
+    /// to this Pi since it started). Either way the lists to push are this
+    /// PC's. Returns whether it started again.
+    fn note_read(&mut self, inv: &Inventory, store: &Store) -> bool {
+        let Some(rev) = inv.rev else {
+            return false;
+        };
+        let went_back = self.dev_rev.is_some_and(|seen| rev < seen);
+        let waiting = inv.known_list == "waiting" && !store.known.is_empty();
+        self.dev_rev = Some(rev);
+        if went_back || waiting {
+            for side in Side::LISTS {
+                self.sides[side.index()].restarted = true;
+            }
+        }
+        went_back
+    }
+
+    /// A devices answer that came for the panel (not for a push): the front
+    /// panel's edits of the two lists are adopted now, so that this PC's store
+    /// (and what its commands start from) says what the Pi does. Not when the
+    /// Pi started again, which this notices too, by a revision that went
+    /// backwards; the answer says whether it did, and the caller then makes
+    /// everything due.
+    fn adopt_seen(&mut self, inv: &Inventory, store_path: &Path, now: u64) -> bool {
+        let store = Store::load(store_path);
+        let went_back = self.note_read(inv, &store);
+        let Some(rev) = inv.rev else {
+            return went_back;
+        };
+        for side in Side::LISTS {
+            let on_pi = match side {
+                Side::Policy => inv.block_pushed.as_ref(),
+                _ => inv.exempt_pushed.as_ref(),
+            };
+            let Some(on_pi) = on_pi else {
+                continue;
+            };
+            if self.should_adopt(side, &store, on_pi, rev) {
+                // A failure to write is tried again at the next read.
+                let _ = wdstore::update(store_path, |s| match side {
+                    Side::Policy => s.adopt_block(on_pi, now),
+                    _ => s.adopt_exempt(on_pi, now),
+                });
+            }
+        }
+        went_back
+    }
+
+    fn send_labels(&mut self, api: &mut Pihole, store: &Store) -> Sent {
+        let labels = labels_for_pi(store);
+        match put_labels(api, &labels) {
+            Ok(Qbp::Present(_)) => {
+                self.labels_pushed = Some(labels);
+                Sent::Pushed
+            }
+            Ok(Qbp::Absent) => Sent::Absent,
+            Err(e) => Sent::Failed(e.message().to_string()),
+        }
+    }
+
+    fn send_panel(&mut self, api: &mut Pihole, store_path: &Path, store: &Store) -> Sent {
+        match put_panel(api, store.pin_hash.as_ref()) {
+            Ok(Qbp::Present(())) => {
+                if store.pin_push_due() {
+                    let generation = store.pin_gen;
+                    if let Err(e) = wdstore::update(store_path, |s| s.mark_pin_pushed(generation)) {
+                        return Sent::Failed(format!("the push could not be recorded: {e}"));
+                    }
+                }
+                Sent::Pushed
+            }
+            Ok(Qbp::Absent) => Sent::Absent,
+            Err(e) => Sent::Failed(e.message().to_string()),
         }
     }
 
@@ -1328,18 +1888,19 @@ impl Poller {
     }
 
     /// Why the last push failed: the known list's or acks' reason, else the
-    /// exempt list's, else the policy's (each marked as such), "" when none
-    /// did.
+    /// first of the ADS PASS list, the policy, the labels and the PIN that did
+    /// (each marked as such), "" when none did.
     fn push_error(&self) -> String {
         if !self.push_error.is_empty() {
-            self.push_error.clone()
-        } else if !self.exempt.error.is_empty() {
-            format!("exempt list: {}", self.exempt.error)
-        } else if !self.policy.error.is_empty() {
-            format!("device policy: {}", self.policy.error)
-        } else {
-            String::new()
+            return self.push_error.clone();
         }
+        Side::ALL
+            .iter()
+            .find_map(|side| {
+                let why = &self.sides[side.index()].error;
+                (!why.is_empty()).then(|| format!("{}: {why}", side.name()))
+            })
+            .unwrap_or_default()
     }
 
     /// The display data for the main thread; `store` is this PC's list (for
@@ -1635,6 +2196,10 @@ mod tests {
                 known: true,
                 exempt: false,
                 blocked: false,
+                label: None,
+                gate_left_secs: None,
+                fixed: false,
+                always: false,
             }
         );
         assert_eq!(inv.devices[1].mac, "02:00:00:00:00:ab", "normalised");
@@ -1646,6 +2211,86 @@ mod tests {
         assert!(inv.devices.iter().all(|d| !d.blocked));
         assert!(!inv.exempt_default);
         assert!(inv.block_macs.is_empty());
+        // Nor the front panel's: no revision, no pushed lists, and the
+        // devices have no label, gate or flags.
+        assert_eq!(
+            (inv.rev, &inv.exempt_pushed, &inv.block_pushed),
+            (None, &None, &None)
+        );
+    }
+
+    #[test]
+    fn the_front_panel_fields_of_a_devices_answer_parse() {
+        let v = json!({"rev": 12, "known_list": "received", "own_mac": "02:00:00:00:00:fe",
+            "exempt_macs": ["02:00:00:00:00:09", "02:00:00:00:00:01"],
+            "exempt_pushed": ["02:00:00:00:00:01", "02-00-00-00-00-02", "garbage"],
+            "exempt_default": true,
+            "block_macs": ["02:00:00:00:00:03"],
+            "block_pushed": [],
+            "devices": [
+            {"mac": "02:00:00:00:00:01", "ipv4": ["192.0.2.1"], "hostname": "",
+             "first_unix": 10, "last_unix": 20, "known": true, "exempt": true,
+             "blocked": false, "label": "Desk PC", "label_rank": 0,
+             "gate_left_secs": 240, "fixed": true, "always": false},
+            {"mac": "02:00:00:00:00:02", "ipv4": [], "hostname": "",
+             "first_unix": 1, "last_unix": 2, "known": false, "label": null,
+             "gate_left_secs": null, "fixed": false, "always": true},
+            {"mac": "02:00:00:00:00:03", "ipv4": [], "hostname": "",
+             "first_unix": 1, "last_unix": 2, "known": false, "label": "\u{7}\u{1b}[31mx",
+             "gate_left_secs": 0},
+        ]});
+        let inv = parse_devices(&v).unwrap();
+        assert_eq!(inv.rev, Some(12));
+        assert_eq!(
+            inv.exempt_pushed,
+            Some(vec![
+                "02:00:00:00:00:01".to_string(),
+                "02:00:00:00:00:02".to_string()
+            ])
+        );
+        assert_eq!(
+            inv.block_pushed,
+            Some(Vec::new()),
+            "an empty list is a list"
+        );
+        // The effective lists are what they were.
+        assert_eq!(inv.exempt_macs.len(), 2);
+        assert_eq!(inv.block_macs, ["02:00:00:00:00:03"]);
+        let d = &inv.devices;
+        assert_eq!(d[0].label.as_deref(), Some("Desk PC"));
+        assert_eq!(
+            (d[0].gate_left_secs, d[0].fixed, d[0].always),
+            (Some(240), true, false)
+        );
+        assert_eq!(d[1].label, None);
+        assert_eq!(
+            (d[1].gate_left_secs, d[1].fixed, d[1].always),
+            (None, false, true)
+        );
+        // A control character is cleaned away; a gate of 0 seconds is no gate.
+        assert_eq!(d[2].label.as_deref(), Some("[31mx"));
+        assert_eq!(d[2].gate_left_secs, None);
+    }
+
+    #[test]
+    fn odd_front_panel_fields_are_read_tolerantly() {
+        let v = json!({"rev": "7", "exempt_pushed": "x", "block_pushed": {"a": 1},
+            "devices": [{"mac": "02:00:00:00:00:01", "label": 5, "gate_left_secs": "9",
+                         "fixed": "yes", "always": 1}]});
+        let inv = parse_devices(&v).unwrap();
+        assert_eq!(
+            (inv.rev, inv.exempt_pushed, inv.block_pushed),
+            (None, None, None)
+        );
+        let d = &inv.devices[0];
+        assert_eq!(
+            (d.label.as_deref(), d.gate_left_secs, d.fixed, d.always),
+            (None, None, false, false)
+        );
+        // A revision that is a whole number in float form is accepted, as the
+        // other numbers are.
+        let v = json!({"rev": 3.0, "devices": []});
+        assert_eq!(parse_devices(&v).unwrap().rev, Some(3));
     }
 
     #[test]
@@ -1914,6 +2559,11 @@ mod tests {
 
     type Log = Arc<Mutex<Vec<String>>>;
 
+    /// A list push the Pi took, from a Pi that sends no revision.
+    fn done(count: u64) -> ListPut {
+        ListPut::Done { count, rev: None }
+    }
+
     fn pw() -> PasswordFn {
         Box::new(|| Ok(Zeroizing::new("pw".to_string())))
     }
@@ -2018,8 +2668,14 @@ mod tests {
         assert_eq!(restore_acked(&mut api, &keys(2)).unwrap(), Qbp::Absent);
         assert_eq!(get_devices(&mut api).unwrap(), Qbp::Absent);
         assert_eq!(put_known(&mut api, &macs(2)).unwrap(), Qbp::Absent);
-        assert_eq!(put_exempt(&mut api, &macs(2)).unwrap(), Qbp::Absent);
-        assert_eq!(put_policy(&mut api, true, &macs(2)).unwrap(), Qbp::Absent);
+        assert_eq!(
+            put_exempt(&mut api, &macs(2), None).unwrap(),
+            ListPut::Absent
+        );
+        assert_eq!(
+            put_policy(&mut api, true, &macs(2), None).unwrap(),
+            ListPut::Absent
+        );
         assert_eq!(
             qbp_lines(&log),
             [
@@ -2090,10 +2746,10 @@ mod tests {
         assert_eq!(ack(&mut api, 1).unwrap(), Qbp::Present(()));
         assert_eq!(restore_acked(&mut api, &keys(1)).unwrap(), Qbp::Present(0));
         assert_eq!(put_known(&mut api, &macs(1)).unwrap(), Qbp::Present(0));
-        assert_eq!(put_exempt(&mut api, &macs(1)).unwrap(), Qbp::Present(0));
+        assert_eq!(put_exempt(&mut api, &macs(1), None).unwrap(), done(0));
         assert_eq!(
-            put_policy(&mut api, false, &macs(1)).unwrap(),
-            Qbp::Present(0)
+            put_policy(&mut api, false, &macs(1), None).unwrap(),
+            done(0)
         );
     }
 
@@ -2140,8 +2796,299 @@ mod tests {
         assert!(get_alerts(&mut api, 0).is_err());
         assert!(ack(&mut api, 1).is_err());
         assert!(put_known(&mut api, &macs(1)).is_err());
-        assert!(put_exempt(&mut api, &macs(1)).is_err());
-        assert!(put_policy(&mut api, true, &macs(1)).is_err());
+        assert!(put_exempt(&mut api, &macs(1), None).is_err());
+        assert!(put_policy(&mut api, true, &macs(1), None).is_err());
+    }
+
+    // -- conditional pushes, labels, the PIN -------------------------------------
+
+    #[test]
+    fn a_push_carries_its_if_rev_only_when_it_has_one() {
+        let pi = FakePi::start(20);
+        pi.with(|s| s.dev_rev = 6);
+        let mut api = pi.client();
+        assert_eq!(
+            put_exempt(&mut api, &macs(2), Some(6)).unwrap(),
+            ListPut::Done {
+                count: 2,
+                rev: Some(7)
+            }
+        );
+        assert_eq!(
+            put_policy(&mut api, true, &macs(1), Some(7)).unwrap(),
+            ListPut::Done {
+                count: 1,
+                rev: Some(8)
+            }
+        );
+        put_exempt(&mut api, &macs(2), None).unwrap();
+        let bodies = pi.with(|s| s.exempt_puts.clone());
+        assert_eq!(
+            bodies,
+            [
+                json!({"exempt": [mac(1), mac(2)], "if_rev": 6}),
+                json!({"exempt": [mac(1), mac(2)]}),
+            ]
+        );
+        assert_eq!(
+            pi.with(|s| s.policy_puts.clone()),
+            [json!({"exempt_default": true, "block": [mac(1)], "if_rev": 7})]
+        );
+        // A push that changes nothing does not move the revision.
+        assert_eq!(
+            put_exempt(&mut api, &macs(2), Some(8)).unwrap(),
+            ListPut::Done {
+                count: 2,
+                rev: Some(8)
+            }
+        );
+    }
+
+    #[test]
+    fn a_409_is_a_stale_push_with_the_revision_the_pi_has() {
+        let pi = FakePi::start(20);
+        pi.with(|s| s.dev_rev = 9);
+        let mut api = pi.client();
+        assert_eq!(
+            put_exempt(&mut api, &macs(2), Some(4)).unwrap(),
+            ListPut::Stale { rev: Some(9) }
+        );
+        assert_eq!(
+            put_policy(&mut api, true, &macs(2), Some(4)).unwrap(),
+            ListPut::Stale { rev: Some(9) }
+        );
+        assert_eq!(
+            pi.with(|s| (s.exempt.len(), s.policy_block.len(), s.exempt_default)),
+            (0, 0, false)
+        );
+        // Not an error, and not a failure of the connection: the next call works.
+        assert_eq!(
+            put_exempt(&mut api, &macs(2), Some(9)).unwrap(),
+            ListPut::Done {
+                count: 2,
+                rev: Some(10)
+            }
+        );
+    }
+
+    #[test]
+    fn the_new_routes_answer_absent_on_a_pi_from_before_the_front_panel() {
+        let pi = FakePi::without_panel(20);
+        let mut api = pi.client();
+        assert_eq!(
+            put_labels(&mut api, &[(mac(1), "Desk".into())]).unwrap(),
+            Qbp::Absent
+        );
+        let hash = crate::pinhash::hash_with_salt("1234", [1; 16]).unwrap();
+        assert_eq!(put_panel(&mut api, Some(&hash)).unwrap(), Qbp::Absent);
+        // The old pushes work as they did, and answer no revision.
+        assert_eq!(put_exempt(&mut api, &macs(1), None).unwrap(), done(1));
+    }
+
+    #[test]
+    fn labels_go_in_this_pcs_order_in_chunks_that_fit_a_body() {
+        let pi = FakePi::start(40);
+        let mut api = pi.client();
+        // 24 quotes each, which JSON writes as 48 bytes: 64 pairs do not fit one body.
+        let labels: Vec<(String, String)> = (1..=64).map(|i| (mac(i), "\"".repeat(24))).collect();
+        let chunks = label_chunks(&labels, QBP_BODY_MAX);
+        assert!(
+            chunks.len() >= 2,
+            "{} chunks of 64 escaped labels",
+            chunks.len()
+        );
+        let last = chunks.len() - 1;
+        let mut all = Vec::new();
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(c["append"], json!(i > 0));
+            assert_eq!(c["complete"], json!(i == last));
+            assert!(body_len(c) <= QBP_BODY_MAX);
+            for pair in c["labels"].as_array().unwrap() {
+                all.push((
+                    pair[0].as_str().unwrap().to_string(),
+                    pair[1].as_str().unwrap().to_string(),
+                ));
+            }
+        }
+        assert_eq!(all, labels, "every pair, once, in order");
+        // Through the Pi: they take effect on the last chunk, in that order.
+        assert_eq!(put_labels(&mut api, &labels).unwrap(), Qbp::Present(64));
+        assert_eq!(pi.with(|s| s.labels.clone()), labels);
+        assert_eq!(pi.with(|s| s.label_puts.len()), chunks.len());
+    }
+
+    #[test]
+    fn a_few_labels_are_one_complete_body_and_none_clear_the_pis() {
+        let few: Vec<(String, String)> = vec![(mac(1), "TV".into()), (mac(2), "Desk PC".into())];
+        assert_eq!(
+            label_chunks(&few, QBP_BODY_MAX),
+            [
+                json!({"labels": [[mac(1), "TV"], [mac(2), "Desk PC"]], "append": false, "complete": true})
+            ]
+        );
+        assert_eq!(
+            label_chunks(&[], QBP_BODY_MAX),
+            [json!({"labels": [], "append": false, "complete": true})]
+        );
+        let pi = FakePi::start(20);
+        let mut api = pi.client();
+        put_labels(&mut api, &few).unwrap();
+        assert_eq!(pi.with(|s| s.labels.len()), 2);
+        assert_eq!(put_labels(&mut api, &[]).unwrap(), Qbp::Present(0));
+        assert!(pi.with(|s| s.labels.is_empty()));
+        // Never more than the Pi takes, even when asked.
+        let many: Vec<(String, String)> = (1..=70).map(|i| (mac(i), "x".into())).collect();
+        let sent: usize = label_chunks(&many, QBP_BODY_MAX)
+            .iter()
+            .map(|c| c["labels"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(sent, LABELS_MAX);
+    }
+
+    #[test]
+    fn the_pin_hash_goes_as_the_line_or_as_null() {
+        let pi = FakePi::start(20);
+        let mut api = pi.client();
+        let hash = crate::pinhash::hash_with_salt("1234", [1; 16]).unwrap();
+        assert_eq!(put_panel(&mut api, Some(&hash)).unwrap(), Qbp::Present(()));
+        assert_eq!(
+            pi.with(|s| s.pin_hash.clone()).as_deref(),
+            Some(hash.as_str())
+        );
+        assert_eq!(put_panel(&mut api, None).unwrap(), Qbp::Present(()));
+        assert_eq!(pi.with(|s| s.pin_hash.clone()), None);
+        assert_eq!(
+            pi.with(|s| s.panel_puts.clone()),
+            [
+                json!({"pin_hash": hash.as_str()}),
+                json!({"pin_hash": null})
+            ],
+            "exactly these bodies"
+        );
+    }
+
+    fn store_with(f: impl FnOnce(&mut Store)) -> Store {
+        let mut s = Store::default();
+        f(&mut s);
+        s
+    }
+
+    #[test]
+    fn the_labels_for_the_pi_follow_this_pcs_lists_in_order() {
+        let s = store_with(|s| {
+            s.know(&mac(3), Some("Printer"), 1);
+            s.know(&mac(1), None, 1);
+            s.know(&mac(2), Some("TV"), 1);
+            // On the exempt and block lists only (after a `forget`): after the known ones.
+            s.add_exempt(&mac(5), Some("Cam"), 1);
+            s.add_block(&mac(4), Some("Guest"), 1);
+            // A MAC that is on two lists with two labels counts once, by the first.
+            s.add_exempt(&mac(2), Some("Old TV"), 1);
+            // An entry without a label does not claim the MAC from one that has it.
+            s.add_exempt(&mac(1), None, 1);
+            s.add_block(&mac(1), Some("Laptop"), 1);
+        });
+        assert_eq!(
+            labels_for_pi(&s),
+            [
+                (mac(3), "Printer".to_string()),
+                (mac(2), "TV".to_string()),
+                (mac(5), "Cam".to_string()),
+                (mac(4), "Guest".to_string()),
+                (mac(1), "Laptop".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_label_is_made_to_fit_the_pis_alphabet_and_length() {
+        assert_eq!(ascii_label("Desk PC").as_deref(), Some("Desk PC"));
+        assert_eq!(ascii_label("Caf\u{e9} PC").as_deref(), Some("Caf? PC"));
+        assert_eq!(
+            ascii_label("A very long name for a small device").as_deref(),
+            Some("A very long name for a s")
+        );
+        // A cut that ends on a blank ends before it.
+        assert_eq!(
+            ascii_label("A very long name for ab cd").as_deref(),
+            Some("A very long name for ab")
+        );
+        // Nothing of it left to read: no label rather than "??".
+        assert_eq!(ascii_label("\u{65e5}\u{672c}"), None);
+        assert_eq!(ascii_label("  -  "), None);
+        assert_eq!(ascii_label(""), None);
+        for l in [
+            "Desk PC",
+            "Caf\u{e9}",
+            "x".repeat(60).as_str(),
+            "\u{1f4fa} TV",
+        ] {
+            let t = ascii_label(l).unwrap();
+            assert!((1..=24).contains(&t.len()) && t.bytes().all(|b| (0x20..=0x7e).contains(&b)));
+        }
+    }
+
+    #[test]
+    fn a_pair_the_pi_would_refuse_is_left_out_so_that_it_does_not_refuse_them_all() {
+        let s = store_with(|s| {
+            s.know("01:00:5e:00:00:fb", Some("Multicast"), 1);
+            s.know("00:00:00:00:00:00", Some("Zero"), 1);
+            s.know(&mac(1), Some("\u{65e5}\u{672c}"), 1);
+            s.know(&mac(2), Some("Fine"), 1);
+        });
+        assert_eq!(labels_for_pi(&s), [(mac(2), "Fine".to_string())]);
+    }
+
+    #[test]
+    fn no_more_labels_than_the_pi_takes_are_made() {
+        let s = store_with(|s| {
+            for i in 1..=100 {
+                s.know(&mac(i), Some("x"), 1);
+            }
+        });
+        let labels = labels_for_pi(&s);
+        assert_eq!(labels.len(), LABELS_MAX);
+        assert_eq!(labels[0].0, mac(1), "the first ones, in this PC's order");
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_rebase_puts_this_pcs_edit_on_what_the_panel_left() {
+        // This PC read [a, b], added c and took b off; the panel then added d
+        // and took a off. Both edits stand: c and d are on, a and b are off.
+        assert_eq!(
+            rebase(&v(&["a", "b"]), &v(&["a", "c"]), &v(&["b", "d"])),
+            v(&["c", "d"]).as_slice()
+        );
+        // The panel changed nothing: this PC's list is what it meant.
+        assert_eq!(
+            rebase(&v(&["a"]), &v(&["a", "b"]), &v(&["a"])),
+            v(&["a", "b"])
+        );
+        // This PC changed nothing (the same list): the panel's is taken whole.
+        assert_eq!(
+            rebase(&v(&["a", "b"]), &v(&["a", "b"]), &v(&["b", "c"])),
+            v(&["b", "c"])
+        );
+        // Both added the same one, or both took the same one off.
+        assert_eq!(
+            rebase(&v(&["a"]), &v(&["a", "b"]), &v(&["a", "b"])),
+            v(&["a", "b"])
+        );
+        assert_eq!(rebase(&v(&["a", "b"]), &v(&["a"]), &v(&["a"])), v(&["a"]));
+        // Its order is this PC's, then the panel's additions.
+        assert_eq!(
+            rebase(&v(&["x"]), &v(&["x", "z", "y"]), &v(&["x", "w"])),
+            v(&["x", "z", "y", "w"])
+        );
+        // A device that this PC adds that the panel took off stays added: the
+        // newer is the typed command (the panel never had it).
+        assert_eq!(rebase(&v(&[]), &v(&["a"]), &v(&[])), v(&["a"]));
+        // Empty everywhere.
+        assert!(rebase(&[], &[], &[]).is_empty());
     }
 
     // -- chunking -------------------------------------------------------------
@@ -2341,7 +3288,7 @@ mod tests {
         let log: Log = Arc::default();
         let srv = watchdog_pi(log.clone());
         let mut api = client(&srv);
-        assert_eq!(put_exempt(&mut api, &macs(3)).unwrap(), Qbp::Present(3));
+        assert_eq!(put_exempt(&mut api, &macs(3), None).unwrap(), done(3));
         assert_eq!(
             puts(&log, "/api/qbp/devices/exempt"),
             [json!({"exempt": [mac(1), mac(2), mac(3)]})],
@@ -2360,7 +3307,7 @@ mod tests {
             "02:00:00:00:00:bb".to_string(),
             "02:00:00:00:00:AA".to_string(),
         ];
-        assert_eq!(put_exempt(&mut api, &list).unwrap(), Qbp::Present(2));
+        assert_eq!(put_exempt(&mut api, &list, None).unwrap(), done(2));
         assert_eq!(
             puts(&log, "/api/qbp/devices/exempt"),
             [json!({"exempt": ["02:00:00:00:00:aa", "02:00:00:00:00:bb"]})]
@@ -2372,7 +3319,7 @@ mod tests {
         let log: Log = Arc::default();
         let srv = watchdog_pi(log.clone());
         let mut api = client(&srv);
-        assert_eq!(put_exempt(&mut api, &[]).unwrap(), Qbp::Present(0));
+        assert_eq!(put_exempt(&mut api, &[], None).unwrap(), done(0));
         assert_eq!(
             puts(&log, "/api/qbp/devices/exempt"),
             [json!({"exempt": []})]
@@ -2385,7 +3332,7 @@ mod tests {
         let srv = watchdog_pi(log.clone());
         let mut api = client(&srv);
         let input = macs(100);
-        put_exempt(&mut api, &input).unwrap();
+        put_exempt(&mut api, &input, None).unwrap();
         let sent = puts(&log, "/api/qbp/devices/exempt");
         assert_eq!(sent.len(), 1, "one body, no chunking");
         assert_eq!(sent[0], json!({"exempt": &input[..64]}), "the first 64");
@@ -2397,7 +3344,10 @@ mod tests {
         let log: Log = Arc::default();
         let srv = real_pihole(log.clone());
         let mut api = client(&srv);
-        assert_eq!(put_exempt(&mut api, &macs(1)).unwrap(), Qbp::Absent);
+        assert_eq!(
+            put_exempt(&mut api, &macs(1), None).unwrap(),
+            ListPut::Absent
+        );
         assert_eq!(puts(&log, "/api/qbp/devices/exempt").len(), 1);
 
         // 400: the body was refused. An error, not an absence.
@@ -2410,7 +3360,7 @@ mod tests {
         });
         let mut api = client(&srv);
         assert!(matches!(
-            put_exempt(&mut api, &macs(1)),
+            put_exempt(&mut api, &macs(1), None),
             Err(ApiError::Other(m)) if m.contains("400")
         ));
     }
@@ -2420,13 +3370,10 @@ mod tests {
         let log: Log = Arc::default();
         let srv = watchdog_pi(log.clone());
         let mut api = client(&srv);
+        assert_eq!(put_policy(&mut api, true, &macs(3), None).unwrap(), done(3));
         assert_eq!(
-            put_policy(&mut api, true, &macs(3)).unwrap(),
-            Qbp::Present(3)
-        );
-        assert_eq!(
-            put_policy(&mut api, false, &macs(1)).unwrap(),
-            Qbp::Present(1)
+            put_policy(&mut api, false, &macs(1), None).unwrap(),
+            done(1)
         );
         assert_eq!(
             puts(&log, "/api/qbp/devices/policy"),
@@ -2449,7 +3396,7 @@ mod tests {
             "02:00:00:00:00:bb".to_string(),
             "02:00:00:00:00:AA".to_string(),
         ];
-        assert_eq!(put_policy(&mut api, true, &list).unwrap(), Qbp::Present(2));
+        assert_eq!(put_policy(&mut api, true, &list, None).unwrap(), done(2));
         assert_eq!(
             puts(&log, "/api/qbp/devices/policy"),
             [json!({"exempt_default": true,
@@ -2462,7 +3409,7 @@ mod tests {
         let log: Log = Arc::default();
         let srv = watchdog_pi(log.clone());
         let mut api = client(&srv);
-        assert_eq!(put_policy(&mut api, false, &[]).unwrap(), Qbp::Present(0));
+        assert_eq!(put_policy(&mut api, false, &[], None).unwrap(), done(0));
         assert_eq!(
             puts(&log, "/api/qbp/devices/policy"),
             [json!({"exempt_default": false, "block": []})],
@@ -2476,7 +3423,7 @@ mod tests {
         let srv = watchdog_pi(log.clone());
         let mut api = client(&srv);
         let input = macs(100);
-        put_policy(&mut api, true, &input).unwrap();
+        put_policy(&mut api, true, &input, None).unwrap();
         let sent = puts(&log, "/api/qbp/devices/policy");
         assert_eq!(sent.len(), 1, "one body, no chunking");
         assert_eq!(
@@ -2492,7 +3439,10 @@ mod tests {
         let log: Log = Arc::default();
         let srv = real_pihole(log.clone());
         let mut api = client(&srv);
-        assert_eq!(put_policy(&mut api, true, &macs(1)).unwrap(), Qbp::Absent);
+        assert_eq!(
+            put_policy(&mut api, true, &macs(1), None).unwrap(),
+            ListPut::Absent
+        );
         assert_eq!(puts(&log, "/api/qbp/devices/policy").len(), 1);
 
         // 400: the body was refused. An error, not an absence.
@@ -2505,7 +3455,7 @@ mod tests {
         });
         let mut api = client(&srv);
         assert!(matches!(
-            put_policy(&mut api, true, &macs(1)),
+            put_policy(&mut api, true, &macs(1), None),
             Err(ApiError::Other(m)) if m.contains("400")
         ));
     }
@@ -2848,6 +3798,12 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A push body without its `if_rev`.
+    fn without_if_rev(mut body: Value) -> Value {
+        body.as_object_mut().unwrap().remove("if_rev");
+        body
     }
 
     fn assert_chunks(puts: &[Value], macs: &[String]) {
@@ -3321,7 +4277,15 @@ mod tests {
     // -- the exempt list -------------------------------------------------------
 
     impl Rig {
+        /// The bodies of the ADS PASS pushes, without their `if_rev` (which is
+        /// the Pi's revision at the time: see [`Rig::exempt_puts_raw`]).
         fn exempt_puts(&self) -> Vec<Value> {
+            self.exempt_puts_raw()
+                .into_iter()
+                .map(without_if_rev)
+                .collect()
+        }
+        fn exempt_puts_raw(&self) -> Vec<Value> {
             self.pi.with(|s| s.exempt_puts.clone())
         }
         /// A known list of `known` MACs of which the first `exempt` are
@@ -3416,9 +4380,10 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_store_does_not_leave_old_exemptions_on_the_pi() {
-        // The Pi was given exemptions by an earlier store. This PC's store is
-        // new (lost, reset): its session push clears what is stale.
+    fn a_pi_that_nothing_was_pushed_to_since_it_started_gets_this_pcs_list_even_if_empty() {
+        // The Pi's revision is 0: nothing changed its lists since it started, so
+        // there is no edit of the panel to adopt, and this PC's list (here the
+        // empty one of a new store) is the master, at every new session.
         let mut rig = Rig::new();
         rig.pi
             .with(|s| s.exempt = vec![fakeqbp::mac(1), fakeqbp::mac(2)]);
@@ -3426,12 +4391,37 @@ mod tests {
         rig.cycle(T0);
         rig.cycle(T0 + 1);
         assert!(rig.pi.with(|s| s.exempt.is_empty()), "cleared");
-        // The same whenever a new session begins: the list this PC holds is
-        // the master.
+        assert!(rig.store().exempt.is_empty());
         rig.pi.with(|s| s.exempt = vec![fakeqbp::mac(3)]);
+        rig.pi.with(|s| s.dev_rev = 0);
         rig.pi.invalidate();
         rig.cycle(T0 + 2);
         assert!(rig.pi.with(|s| s.exempt.is_empty()));
+    }
+
+    #[test]
+    fn a_lost_store_takes_back_the_lists_the_pi_still_has() {
+        // This PC's store is new (lost, reset), and the Pi holds a list that an
+        // earlier store pushed (its revision has moved since it started): what
+        // the Pi has is newer than nothing, so it is adopted, not cleared.
+        let mut rig = Rig::new();
+        rig.pi.with(|s| {
+            s.exempt = vec![fakeqbp::mac(1), fakeqbp::mac(2)];
+            s.dev_rev = 4;
+        });
+        rig.prepare(3);
+        rig.cycle(T0);
+        rig.cycle(T0 + 1);
+        assert_eq!(
+            rig.pi.with(|s| s.exempt.clone()),
+            [fakeqbp::mac(1), fakeqbp::mac(2)]
+        );
+        assert_eq!(
+            rig.store().exempt_macs(),
+            [fakeqbp::mac(1), fakeqbp::mac(2)]
+        );
+        assert!(rig.exempt_puts().is_empty(), "nothing was pushed over it");
+        assert!(!rig.store().exempt_push_due());
     }
 
     #[test]
@@ -3590,7 +4580,7 @@ mod tests {
         let r = rig.report();
         assert_eq!((r.status, r.alerts.len()), ("ok", 1));
         assert!(
-            r.push_error.starts_with("exempt list: ") && r.push_error.contains("500"),
+            r.push_error.starts_with("ADS PASS list: ") && r.push_error.contains("500"),
             "{}",
             r.push_error
         );
@@ -3631,7 +4621,7 @@ mod tests {
         assert!(!store.exempt_push_due(), "the exempt list is recorded");
         let r = rig.report();
         assert!(
-            r.push_error.contains("500") && !r.push_error.starts_with("exempt list"),
+            r.push_error.contains("500") && !r.push_error.starts_with("ADS PASS list"),
             "the known list's failure is the one shown: {}",
             r.push_error
         );
@@ -3668,16 +4658,19 @@ mod tests {
         rig.pi.invalidate();
         rig.cycle(T0 + 1);
         assert_eq!(rig.known_puts().len(), 2, "the known list went out");
-        assert_eq!(rig.exempt_puts().len(), 2);
+        // Twice in this cycle: the push that the policy's and the labels' first
+        // turn made (and whose first request logged in again), and the push that
+        // the new session made after the alerts.
+        assert_eq!(rig.exempt_puts().len(), 3);
         // The store says nothing is due: the poller's own memory does.
         assert!(!rig.store().exempt_push_due());
         rig.pi.with(|s| s.fail_exempt = false);
         rig.cycle(T0 + 2);
-        assert_eq!(rig.exempt_puts().len(), 3);
+        assert_eq!(rig.exempt_puts().len(), 4);
         assert_eq!(rig.pi.with(|s| s.exempt.len()), 2);
         assert_eq!(rig.report().push_error, "");
         rig.cycle(T0 + 3);
-        assert_eq!(rig.exempt_puts().len(), 3);
+        assert_eq!(rig.exempt_puts().len(), 4);
     }
 
     #[test]
@@ -3795,7 +4788,14 @@ mod tests {
     // -- the exempt-by-default policy ------------------------------------------
 
     impl Rig {
+        /// The bodies of the policy pushes, without their `if_rev`.
         fn policy_puts(&self) -> Vec<Value> {
+            self.policy_puts_raw()
+                .into_iter()
+                .map(without_if_rev)
+                .collect()
+        }
+        fn policy_puts_raw(&self) -> Vec<Value> {
             self.pi.with(|s| s.policy_puts.clone())
         }
         /// The policy as the CLI would have left it: the mode `on` and the
@@ -4332,6 +5332,631 @@ mod tests {
 
     fn note_titles(out: &CycleOut) -> Vec<&str> {
         out.notifications.iter().map(|n| n.0.as_str()).collect()
+    }
+
+    // -- the front panel's edits, labels and the PIN -----------------------------
+
+    impl Rig {
+        fn label_puts(&self) -> Vec<Value> {
+            self.pi.with(|s| s.label_puts.clone())
+        }
+        fn panel_puts(&self) -> Vec<Value> {
+            self.pi.with(|s| s.panel_puts.clone())
+        }
+        fn gets(&self) -> usize {
+            self.pi.count("GET /api/qbp/devices")
+        }
+        fn pi_exempt(&self) -> Vec<String> {
+            self.pi.with(|s| s.exempt.clone())
+        }
+        /// The first cycles: the lists (here `exempt` of the first `known` MACs)
+        /// are pushed, and everything that is due at a first session is done.
+        fn settled(known: usize, exempt: usize) -> Rig {
+            let mut rig = Rig::new();
+            rig.prepare_exempt(known, exempt);
+            rig.cycle(T0);
+            rig.cycle(T0 + 1);
+            rig
+        }
+    }
+
+    fn m(n: usize) -> String {
+        fakeqbp::mac(n)
+    }
+
+    #[test]
+    fn the_panels_edit_of_the_ads_pass_list_is_adopted_at_the_next_session_not_overwritten() {
+        let mut rig = Rig::settled(5, 2);
+        assert_eq!(rig.pi_exempt(), [m(1), m(2)]);
+        let pushes = rig.exempt_puts().len();
+        // The panel takes 1 off and puts 4 on while this PC is not looking.
+        rig.pi.panel_ads_pass(&m(1), false);
+        rig.pi.panel_ads_pass(&m(4), true);
+        rig.pi.invalidate();
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.pi_exempt(), [m(2), m(4)], "the panel's list stands");
+        assert_eq!(
+            rig.exempt_puts().len(),
+            pushes,
+            "nothing was pushed over it"
+        );
+        let store = rig.store();
+        assert_eq!(store.exempt_macs(), [m(2), m(4)]);
+        assert!(
+            !store.exempt_push_due(),
+            "an adopted list is not to be pushed"
+        );
+        assert!(store.is_known(&m(1)), "the known list is not touched");
+        assert_eq!(rig.report().push_error, "");
+        // And it stays so: nothing is due, nothing is pushed.
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.exempt_puts().len(), pushes);
+    }
+
+    #[test]
+    fn a_panel_edit_is_adopted_when_the_devices_are_read_without_waiting_for_a_session() {
+        let mut rig = Rig::settled(5, 2);
+        rig.pi.panel_ads_pass(&m(3), true);
+        rig.cycle(T0 + 2);
+        assert_eq!(
+            rig.store().exempt_macs(),
+            [m(1), m(2)],
+            "a closed cycle reads no devices"
+        );
+        rig.cycle_with_devices(T0 + 3);
+        assert_eq!(rig.store().exempt_macs(), [m(1), m(2), m(3)]);
+        assert!(!rig.store().exempt_push_due());
+        assert_eq!(rig.exempt_puts().len(), 1, "never pushed over");
+        assert_eq!(rig.pi_exempt(), [m(1), m(2), m(3)]);
+        // An adopted device carries the label that this PC's known list has for it.
+        rig.edit(|s| s.know(&m(4), Some("Printer"), T0));
+        rig.pi.panel_ads_pass(&m(4), true);
+        rig.cycle_with_devices(T0 + 4);
+        let store = rig.store();
+        assert_eq!(store.exempt_macs(), [m(1), m(2), m(3), m(4)]);
+        assert_eq!(store.exempt[3].label.as_deref(), Some("Printer"));
+        assert_eq!(
+            store.exempt[2].label, None,
+            "no label for one this PC never named"
+        );
+    }
+
+    #[test]
+    fn a_panel_edit_of_the_block_list_in_the_exempt_by_default_mode_is_adopted_and_the_mode_is_not()
+    {
+        let mut rig = Rig::new();
+        rig.prepare_policy(true, 1);
+        rig.cycle(T0);
+        rig.cycle(T0 + 1);
+        assert!(rig.pi.with(|s| s.exempt_default));
+        let pushes = rig.policy_puts().len();
+        // In that mode the panel's BLOCK ADS puts a device on the block list.
+        rig.pi.panel_ads_pass(&m(2), false);
+        rig.cycle_with_devices(T0 + 2);
+        let store = rig.store();
+        assert_eq!(store.block_macs(), [m(1), m(2)]);
+        assert!(store.exempt_default, "the mode is this PC's");
+        assert!(!store.policy_push_due());
+        assert_eq!(rig.policy_puts().len(), pushes);
+        assert!(
+            store.exempt.is_empty(),
+            "the exempt list is not the one edited in that mode"
+        );
+    }
+
+    #[test]
+    fn a_push_that_the_panel_overtakes_is_a_409_and_the_panels_edit_is_not_lost() {
+        let mut rig = Rig::settled(5, 2);
+        let pushes = rig.exempt_puts().len();
+        // A new session pushes the lists again; the panel puts 3 on right after
+        // this PC read the Pi's lists, before it pushes.
+        rig.pi.with(|s| s.taps_after_next_get.push((m(3), true)));
+        rig.pi.invalidate();
+        rig.cycle(T0 + 2);
+        let conflicts = rig.pi.with(|s| s.conflicts);
+        assert_eq!(conflicts, 1, "the push was refused once");
+        let bodies = rig.exempt_puts_raw();
+        assert_eq!(
+            bodies.len(),
+            pushes + 1,
+            "and not made again over the panel's edit"
+        );
+        assert_eq!(
+            rig.pi_exempt(),
+            [m(1), m(2), m(3)],
+            "the panel's edit stands"
+        );
+        assert_eq!(
+            rig.store().exempt_macs(),
+            [m(1), m(2), m(3)],
+            "read again, and adopted"
+        );
+        assert_eq!(rig.report().push_error, "");
+        assert!(!rig.store().exempt_push_due());
+    }
+
+    #[test]
+    fn a_session_that_begins_while_the_known_list_is_pushed_still_reads_before_it_pushes_the_lists()
+    {
+        let mut rig = Rig::settled(5, 2);
+        rig.pi.panel_ads_pass(&m(3), true);
+        // The known list is due and the session is gone: the login happens in the
+        // known list's push, after which the lists of the new session are due.
+        rig.edit(|s| s.know(&m(9), None, T0));
+        rig.pi.invalidate();
+        let pushes = rig.exempt_puts_raw().len();
+        rig.cycle(T0 + 2);
+        assert_eq!(
+            rig.pi_exempt(),
+            [m(1), m(2), m(3)],
+            "the panel's edit stands"
+        );
+        assert_eq!(rig.store().exempt_macs(), [m(1), m(2), m(3)]);
+        assert_eq!(rig.exempt_puts_raw().len(), pushes, "not pushed over");
+    }
+
+    #[test]
+    fn a_push_carries_the_revision_that_was_read() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 2);
+        rig.pi.with(|s| s.dev_rev = 5);
+        rig.cycle(T0);
+        let body = rig.exempt_puts_raw().pop().unwrap();
+        assert_eq!(body["if_rev"], json!(5));
+        // The policy goes on the revision that the exempt push made.
+        rig.cycle(T0 + 1);
+        let rev_after = rig.pi.with(|s| s.dev_rev);
+        assert!(rev_after > 5);
+        rig.edit(|s| s.add_block(&m(2), None, T0));
+        rig.cycle(T0 + 2);
+        let body = rig.policy_puts_raw().pop().unwrap();
+        assert_eq!(body["if_rev"], json!(rev_after));
+        assert_eq!(rig.pi.with(|s| s.conflicts), 0, "no push was ever stale");
+    }
+
+    #[test]
+    fn a_local_edit_that_is_waiting_is_pushed_not_given_up_for_a_difference() {
+        let mut rig = Rig::settled(5, 2);
+        // The panel put 3 on; this PC has an edit of its own that was never pushed.
+        rig.pi.panel_ads_pass(&m(3), true);
+        rig.edit(|s| s.add_exempt(&m(4), None, T0));
+        rig.cycle(T0 + 2);
+        assert_eq!(
+            rig.pi_exempt(),
+            [m(1), m(2), m(4)],
+            "this PC's typed command wins"
+        );
+        assert_eq!(rig.store().exempt_macs(), [m(1), m(2), m(4)]);
+        assert!(!rig.store().exempt_push_due());
+    }
+
+    #[test]
+    fn a_pi_that_started_again_gets_this_pcs_list_not_its_own_empty_one_adopted() {
+        let mut rig = Rig::settled(5, 2);
+        rig.cycle_with_devices(T0 + 2);
+        rig.pi.reboot();
+        assert!(rig.pi_exempt().is_empty() && rig.pi.with(|s| s.dev_rev) == 0);
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.pi_exempt(), [m(1), m(2)], "re-pushed from the store");
+        assert_eq!(
+            rig.store().exempt_macs(),
+            [m(1), m(2)],
+            "and the store kept its list"
+        );
+        assert_eq!(rig.pi.with(|s| s.known.len()), 5);
+        assert!(!rig.store().exempt_push_due());
+    }
+
+    #[test]
+    fn a_pi_that_started_again_and_was_edited_at_its_panel_before_this_pc_came_is_this_pcs_to_push()
+    {
+        // After a restart the Pi's revision is small again but not 0: the panel
+        // already put a device on the list. The Pi waits for a known list that
+        // this PC has, which says it started again, so this PC's list goes, and
+        // the store is not overwritten by the one device the panel added.
+        let mut rig = Rig::settled(5, 2);
+        rig.pi.reboot();
+        rig.pi.panel_ads_pass(&m(9), true);
+        assert_eq!(rig.pi.with(|s| s.dev_rev), 1);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.store().exempt_macs(), [m(1), m(2)]);
+        assert_eq!(rig.pi_exempt(), [m(1), m(2)]);
+    }
+
+    #[test]
+    fn a_revision_that_went_backwards_is_a_restart_even_when_the_session_and_the_alerts_say_nothing(
+    ) {
+        let mut rig = Rig::settled(5, 2);
+        rig.cycle_with_devices(T0 + 2);
+        rig.pi.panel_ads_pass(&m(3), true);
+        rig.pi.panel_ads_pass(&m(4), true);
+        rig.cycle_with_devices(T0 + 3);
+        assert_eq!(rig.store().exempt_macs(), [m(1), m(2), m(3), m(4)]);
+        // The Pi lost its lists and its revision started over, with nothing
+        // else to show for it (it still waits for no list).
+        rig.pi.with(|s| {
+            s.exempt = vec![m(7)];
+            s.dev_rev = 1;
+        });
+        rig.cycle_with_devices(T0 + 4);
+        assert_eq!(rig.pi_exempt(), [m(1), m(2), m(3), m(4)]);
+        assert_eq!(rig.store().exempt_macs(), [m(1), m(2), m(3), m(4)]);
+    }
+
+    #[test]
+    fn a_pi_from_before_the_front_panel_is_pushed_to_as_it_always_was() {
+        let mut rig = Rig::on(FakePi::without_panel(200));
+        rig.prepare_exempt(5, 2);
+        rig.cycle(T0);
+        rig.cycle(T0 + 1);
+        // No revision to condition on, no pushed lists to adopt from.
+        assert_eq!(rig.exempt_puts_raw(), vec![Rig::exempt_body(2)]);
+        rig.edit(|s| s.add_exempt(&m(3), None, T0));
+        rig.pi.with(|s| s.exempt.push(m(8)));
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.pi_exempt(), [m(1), m(2), m(3)], "this PC is the master");
+        assert_eq!(rig.store().exempt_macs(), [m(1), m(2), m(3)]);
+        rig.cycle_with_devices(T0 + 3);
+        assert_eq!(rig.store().exempt_macs(), [m(1), m(2), m(3)]);
+        // The labels and the PIN are not there: asked once, 404, not again.
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/labels"), 1);
+        rig.edit(|s| s.know(&m(1), Some("TV"), T0));
+        rig.cycle(T0 + 4);
+        assert_eq!(
+            rig.pi.count("PUT /api/qbp/devices/labels"),
+            1,
+            "404, remembered"
+        );
+        assert_eq!(rig.report().push_error, "");
+    }
+
+    #[test]
+    fn a_failing_read_of_the_lists_holds_them_back_and_stops_nothing_else() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 2);
+        rig.pi.with(|s| s.fail_devices_get = true);
+        rig.pi.raise("beacon", "x.example", None, 1);
+        let out = rig.cycle(T0 + 1);
+        assert_eq!(rig.known_puts().len(), 1, "the known list got through");
+        assert!(
+            rig.exempt_puts_raw().is_empty(),
+            "no push on a revision nobody knows"
+        );
+        assert_eq!(out.notifications.len(), 1);
+        let r = rig.report();
+        assert!(
+            r.push_error.starts_with("ADS PASS list: ") && r.push_error.contains("500"),
+            "{}",
+            r.push_error
+        );
+        assert!(rig.store().exempt_push_due());
+        // Retried at the next cycle, and it goes once the Pi can be read.
+        rig.pi.with(|s| s.fail_devices_get = false);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.pi_exempt(), [m(1), m(2)]);
+        assert_eq!(rig.report().push_error, "");
+    }
+
+    #[test]
+    fn a_pi_that_keeps_changing_its_lists_is_given_up_for_the_cycle_not_forever() {
+        let mut rig = Rig::settled(5, 2);
+        // A local edit is waiting, so it is pushed, but the panel taps after
+        // every read: each push is stale.
+        rig.edit(|s| s.add_exempt(&m(3), None, T0));
+        rig.pi.with(|s| s.churn = true);
+        let before = rig.exempt_puts_raw().len();
+        rig.cycle(T0 + 2);
+        assert_eq!(
+            rig.pi.with(|s| s.conflicts),
+            3,
+            "three tries, then it stops"
+        );
+        assert_eq!(rig.exempt_puts_raw().len(), before + 3);
+        let r = rig.report();
+        assert!(
+            r.push_error.starts_with("ADS PASS list: ") && r.push_error.contains("kept changing"),
+            "{}",
+            r.push_error
+        );
+        assert!(rig.store().exempt_push_due(), "still due");
+        assert_eq!(r.status, "ok", "the cycle went on");
+        // It goes through once the Pi settles, at the next cycle.
+        rig.pi.with(|s| s.churn = false);
+        rig.cycle(T0 + 3);
+        assert!(rig.pi_exempt().contains(&m(3)));
+        assert!(!rig.store().exempt_push_due());
+        assert_eq!(rig.report().push_error, "");
+    }
+
+    fn named(rig: &Rig) {
+        rig.edit(|s| {
+            s.know(&m(1), Some("TV"), T0);
+            s.know(&m(2), Some("Desk PC"), T0);
+            s.know(&m(3), None, T0);
+        });
+    }
+
+    fn pi_labels(rig: &Rig) -> Vec<(String, String)> {
+        rig.pi.with(|s| s.labels.clone())
+    }
+
+    #[test]
+    fn the_labels_are_pushed_after_the_lists_in_this_pcs_order() {
+        let mut rig = Rig::new();
+        named(&rig);
+        rig.cycle(T0);
+        assert_eq!(
+            rig.label_puts(),
+            [
+                json!({"labels": [[m(1), "TV"], [m(2), "Desk PC"]], "append": false, "complete": true})
+            ]
+        );
+        assert_eq!(
+            pi_labels(&rig),
+            [(m(1), "TV".into()), (m(2), "Desk PC".into())]
+        );
+        let known = first_at(&rig.pi, "PUT /api/qbp/devices/known");
+        let labels = first_at(&rig.pi, "PUT /api/qbp/devices/labels");
+        let alerts = first_at(&rig.pi, "GET /api/qbp/alerts");
+        assert!(
+            known < labels && labels < alerts,
+            "after the known list, before the alerts"
+        );
+        assert_eq!(rig.report().push_error, "");
+        // Nothing is due any more.
+        rig.cycle(T0 + 1);
+        rig.cycle_with_devices(T0 + 2);
+        assert_eq!(rig.label_puts().len(), 1);
+    }
+
+    #[test]
+    fn the_labels_go_after_the_two_lists_so_that_they_do_not_make_them_stale() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 2);
+        rig.prepare_policy(true, 1);
+        named(&rig);
+        rig.cycle(T0);
+        rig.cycle(T0 + 1);
+        let exempt = first_at(&rig.pi, "PUT /api/qbp/devices/exempt");
+        let policy = first_at(&rig.pi, "PUT /api/qbp/devices/policy");
+        let labels = first_at(&rig.pi, "PUT /api/qbp/devices/labels");
+        assert!(exempt < policy && policy < labels);
+        assert_eq!(rig.pi.with(|s| s.conflicts), 0);
+        assert_eq!(rig.gets(), 1, "the Pi is read once for all of them");
+    }
+
+    #[test]
+    fn a_gate_moves_the_revision_and_nothing_of_this_pcs_lists() {
+        let mut rig = Rig::settled(5, 2);
+        // The panel opens a gate for a device and one expires: the revision moves
+        // with no change to the lists, so there is nothing to adopt, and the next
+        // push is made on the revision that is read then, not a stale one.
+        rig.pi.panel_gate(&m(3), 300);
+        rig.cycle_with_devices(T0 + 2);
+        assert_eq!(rig.store().exempt_macs(), [m(1), m(2)]);
+        assert!(!rig.store().exempt_push_due());
+        rig.pi.invalidate();
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.pi.with(|s| s.conflicts), 0);
+        assert_eq!(rig.pi_exempt(), [m(1), m(2)]);
+        assert_eq!(rig.report().push_error, "");
+    }
+
+    #[test]
+    fn an_edit_of_a_label_is_pushed_alone_and_a_new_session_and_a_reboot_push_them_again() {
+        let mut rig = Rig::new();
+        named(&rig);
+        rig.cycle(T0);
+        rig.edit(|s| s.know(&m(2), Some("Desk"), T0));
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.label_puts().len(), 2);
+        assert_eq!(pi_labels(&rig)[1].1, "Desk");
+        assert_eq!(rig.known_puts().len(), 2, "the known list changed too");
+        // An edit that gives a device a label, one that takes one off the lists.
+        rig.edit(|s| s.know(&m(3), Some("Cam"), T0));
+        rig.cycle(T0 + 2);
+        assert_eq!(pi_labels(&rig).len(), 3);
+        rig.edit(|s| s.forget(&m(1)));
+        rig.cycle(T0 + 3);
+        assert_eq!(
+            pi_labels(&rig),
+            [(m(2), "Desk".into()), (m(3), "Cam".into())]
+        );
+        let n = rig.label_puts().len();
+        rig.cycle(T0 + 4);
+        assert_eq!(rig.label_puts().len(), n, "unchanged, not pushed");
+        // The exempt list's edit does not push labels (no label changed).
+        rig.edit(|s| s.add_exempt(&m(2), None, T0));
+        rig.cycle(T0 + 5);
+        assert_eq!(rig.label_puts().len(), n);
+        // A new login session and a new client.
+        rig.pi.invalidate();
+        rig.cycle(T0 + 6);
+        assert_eq!(rig.label_puts().len(), n + 1);
+        rig.poller.client_replaced();
+        rig.cycle(T0 + 7);
+        assert_eq!(rig.label_puts().len(), n + 2);
+        // A Pi that started again has none, and gets them.
+        rig.pi.reboot();
+        assert!(pi_labels(&rig).is_empty());
+        rig.cycle(T0 + 8);
+        assert_eq!(
+            pi_labels(&rig),
+            [(m(2), "Desk".into()), (m(3), "Cam".into())]
+        );
+    }
+
+    #[test]
+    fn no_labels_are_pushed_to_a_pi_that_is_not_known_to_be_one_and_none_clears_a_stale_set() {
+        let mut rig = Rig::new();
+        rig.prepare(3);
+        // The first cycle has not seen a watchdog yet: a real Pi-hole is never
+        // asked for labels it has not got.
+        rig.cycle(T0);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/labels"), 0);
+        // The next has: the empty set goes, once, which clears what an earlier
+        // store left on the Pi.
+        rig.pi.with(|s| s.labels = vec![(m(1), "Old".into())]);
+        rig.cycle(T0 + 1);
+        assert_eq!(
+            rig.label_puts(),
+            [json!({"labels": [], "append": false, "complete": true})]
+        );
+        assert!(pi_labels(&rig).is_empty());
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.label_puts().len(), 1);
+        // On a real Pi-hole never.
+        let mut real = Rig::on(FakePi::pihole_only(50));
+        real.prepare(3);
+        real.cycle(T0);
+        real.cycle(T0 + 1);
+        assert_eq!(real.pi.count("PUT /api/qbp/devices/labels"), 0);
+    }
+
+    #[test]
+    fn a_failing_labels_push_stops_nothing_else_and_is_retried() {
+        let mut rig = Rig::new();
+        named(&rig);
+        rig.prepare_exempt(5, 2);
+        rig.pi.with(|s| s.fail_labels = true);
+        rig.pi.raise("beacon", "x.example", None, 1);
+        let out = rig.cycle(T0 + 1);
+        assert_eq!(rig.pi_exempt(), [m(1), m(2)], "the exempt list went");
+        assert_eq!(rig.known_puts().len(), 1);
+        assert_eq!(out.notifications.len(), 1);
+        let r = rig.report();
+        assert!(
+            r.push_error.starts_with("device labels: ") && r.push_error.contains("500"),
+            "{}",
+            r.push_error
+        );
+        assert_eq!(rig.label_puts().len(), 1);
+        rig.pi.with(|s| s.fail_labels = false);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.label_puts().len(), 2);
+        assert_eq!(pi_labels(&rig).len(), 2);
+        assert_eq!(rig.report().push_error, "");
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.label_puts().len(), 2);
+    }
+
+    fn hash(pin: &str) -> crate::pinhash::PinHash {
+        crate::pinhash::hash_with_salt(pin, [5; 16]).unwrap()
+    }
+
+    #[test]
+    fn a_pin_that_was_never_set_here_is_never_pushed_so_the_pis_own_stays() {
+        let mut rig = Rig::new();
+        rig.prepare(3);
+        for i in 0..4 {
+            rig.cycle(T0 + i);
+        }
+        rig.pi.invalidate();
+        rig.cycle(T0 + 5);
+        rig.pi.reboot();
+        rig.cycle(T0 + 6);
+        assert_eq!(rig.pi.count("PUT /api/qbp/panel"), 0);
+    }
+
+    #[test]
+    fn a_pin_hash_is_pushed_after_an_edit_each_session_and_a_reboot_with_the_hash_alone() {
+        let mut rig = Rig::new();
+        rig.prepare(3);
+        rig.cycle(T0);
+        rig.edit(|s| s.set_pin(hash("1234")));
+        rig.cycle(T0 + 1);
+        assert_eq!(
+            rig.panel_puts(),
+            [json!({"pin_hash": hash("1234").as_str()})]
+        );
+        assert!(!rig.store().pin_push_due());
+        assert_eq!(
+            rig.pi.with(|s| s.pin_hash.clone()).as_deref(),
+            Some(hash("1234").as_str())
+        );
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.panel_puts().len(), 1, "once");
+        // Again for a new session, a new client and a Pi that started again.
+        rig.pi.invalidate();
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.panel_puts().len(), 2);
+        rig.poller.client_replaced();
+        rig.cycle(T0 + 4);
+        assert_eq!(rig.panel_puts().len(), 3);
+        rig.pi.reboot();
+        assert!(rig.pi.with(|s| s.pin_hash.is_none()));
+        rig.cycle(T0 + 5);
+        assert_eq!(
+            rig.pi.with(|s| s.pin_hash.clone()).as_deref(),
+            Some(hash("1234").as_str())
+        );
+        // A new PIN is an edit.
+        rig.edit(|s| s.set_pin(hash("4321")));
+        rig.cycle(T0 + 6);
+        assert_eq!(
+            rig.pi.with(|s| s.pin_hash.clone()).as_deref(),
+            Some(hash("4321").as_str())
+        );
+    }
+
+    #[test]
+    fn clearing_the_pin_pushes_null_once_and_then_nothing() {
+        let mut rig = Rig::new();
+        rig.prepare(3);
+        rig.edit(|s| s.set_pin(hash("1234")));
+        rig.cycle(T0);
+        rig.cycle(T0 + 1);
+        rig.edit(|s| s.clear_pin());
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.panel_puts().last(), Some(&json!({"pin_hash": null})));
+        assert!(rig.pi.with(|s| s.pin_hash.is_none()));
+        let n = rig.panel_puts().len();
+        rig.pi.invalidate();
+        rig.cycle(T0 + 3);
+        rig.pi.reboot();
+        rig.cycle(T0 + 4);
+        assert_eq!(rig.panel_puts().len(), n, "no PIN here, none to say");
+    }
+
+    #[test]
+    fn a_failing_pin_push_stops_nothing_else_is_retried_and_names_no_digit() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 2);
+        rig.edit(|s| s.set_pin(hash("1234")));
+        rig.pi.with(|s| s.fail_panel = true);
+        let out = rig.cycle(T0 + 1);
+        assert_eq!(rig.pi_exempt(), [m(1), m(2)]);
+        assert!(out.notifications.is_empty());
+        let r = rig.report();
+        assert!(
+            r.push_error.starts_with("panel PIN: ") && r.push_error.contains("500"),
+            "{}",
+            r.push_error
+        );
+        assert!(!r.push_error.contains("1234") && !r.push_error.contains(hash("1234").as_str()));
+        assert!(rig.store().pin_push_due());
+        rig.pi.with(|s| s.fail_panel = false);
+        rig.cycle(T0 + 2);
+        assert!(!rig.store().pin_push_due());
+        assert_eq!(rig.report().push_error, "");
+    }
+
+    #[test]
+    fn a_pi_without_a_panel_route_is_asked_for_the_pin_once_per_session() {
+        let mut rig = Rig::on(FakePi::without_panel(200));
+        rig.prepare(3);
+        rig.edit(|s| s.set_pin(hash("1234")));
+        rig.cycle(T0);
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.pi.count("PUT /api/qbp/panel"), 1, "404, remembered");
+        assert_eq!(rig.report().push_error, "");
+        assert!(
+            rig.store().pin_push_due(),
+            "it stays due for a Pi that learns it"
+        );
+        rig.pi.invalidate();
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.pi.count("PUT /api/qbp/panel"), 2);
     }
 
     #[test]

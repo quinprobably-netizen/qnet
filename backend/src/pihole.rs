@@ -12,6 +12,16 @@ use zeroize::Zeroizing;
 
 use crate::https::{HttpError, HttpsClient};
 
+/// What [`Pihole::json_checked`] got: the body of a 2xx answer, the 404 of an
+/// endpoint that is not there, or the 409 of a refused conditional push with
+/// its body.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Checked {
+    Ok(Value),
+    NotFound,
+    Conflict(Value),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
     /// Bad or missing credentials.
@@ -541,6 +551,24 @@ impl Pihole {
             return Ok(None);
         }
         Self::ok_body(status, v).map(Some)
+    }
+
+    /// Like [`json_opt`](Self::json_opt), but HTTP 409 is an answer too, with
+    /// its body: the Pi refuses a push made on a revision that is no longer
+    /// the one it has, and says which is (the `rev` of the body). Every other
+    /// status behaves exactly as in `json_opt`.
+    pub fn json_checked(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Checked, ApiError> {
+        let (status, v) = self.send_authed(method, path, body)?;
+        match status {
+            404 => Ok(Checked::NotFound),
+            409 => Ok(Checked::Conflict(v)),
+            _ => Self::ok_body(status, v).map(Checked::Ok),
+        }
     }
 
     pub fn summary(&mut self) -> Result<Summary, ApiError> {

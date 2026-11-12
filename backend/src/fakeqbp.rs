@@ -1,15 +1,24 @@
 //! A fake Pi for the watchdog tests: the Pi-hole login and stats endpoints
 //! plus qberrypi's `/api/qbp/` watchdog (alerts, ack, acked, devices, known,
-//! exempt, policy), behind the throwaway TLS server of `https::testutil`.
+//! exempt, policy, labels, panel), behind the throwaway TLS server of
+//! `https::testutil`.
 //!
 //! The model lives in [`PiState`], shared with the test through [`FakePi`], so
 //! a test can raise alerts, invalidate the session ("the Pi forgot it") or
 //! "reboot" the Pi (rev and ids restart, the known list is back to `waiting`,
-//! the pushed exempt list and policy are gone, every session is gone) while a
-//! poller is running. An older Pi that has no exempt support (404 on its
-//! route, none of its fields in the devices answer) is
+//! the pushed exempt list, policy, labels, gates and PIN are gone, every
+//! session is gone) while a poller is running. An older Pi that has no exempt
+//! support (404 on its route, none of its fields in the devices answer) is
 //! [`FakePi::without_exempt`]; one that has the exempt list but not the
-//! exempt-by-default policy is [`FakePi::without_policy`]. Test data uses
+//! exempt-by-default policy is [`FakePi::without_policy`]; one from before
+//! the front panel (no `rev`, no pushed lists, no labels or panel route) is
+//! [`FakePi::without_panel`].
+//!
+//! The device inventory has a revision of its own, [`PiState::dev_rev`], that
+//! moves with every change of the pushed lists, the labels and the gates,
+//! whoever makes it ([`FakePi::panel_ads_pass`] is the front panel's tap), and
+//! `PUT devices/exempt` and `devices/policy` answer 409 with the revision
+//! that is when they are given an `if_rev` that is not it. Test data uses
 //! documentation addresses (192.0.2.x) and locally administered MACs
 //! (02:00:00:...) only.
 
@@ -35,6 +44,8 @@ const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r
 pub const EXEMPT_MAX: usize = 64;
 /// The most addresses the Pi takes in the block list of `PUT devices/policy`.
 pub const BLOCK_MAX: usize = 64;
+/// The most labels the Pi takes in one `PUT devices/labels` body, and in all.
+pub const LABELS_MAX: usize = 64;
 
 /// The `n`-th alert key: 16 lower-case hex digits, stable across "reboots".
 pub fn key(n: usize) -> String {
@@ -97,7 +108,20 @@ pub struct PiState {
     pub policy_support: bool,
     /// True: `PUT devices/policy` fails with HTTP 500 (the other routes work).
     pub fail_policy: bool,
+    /// False: a Pi from before the front panel. The devices answer has no
+    /// `rev`, no pushed lists and none of the new device fields; `PUT
+    /// devices/labels` and `PUT panel` are answered 404; `if_rev` is ignored.
+    pub panel_support: bool,
+    /// True: `PUT devices/labels` fails with HTTP 500.
+    pub fail_labels: bool,
+    /// True: `GET devices` fails with HTTP 500 (the other routes work).
+    pub fail_devices_get: bool,
+    /// True: `PUT panel` fails with HTTP 500.
+    pub fail_panel: bool,
     pub rev: u64,
+    /// The revision of the device inventory: it moves with every change of the
+    /// pushed lists, the mode, the labels and the gates, whoever makes it.
+    pub dev_rev: u64,
     next_id: u64,
     /// Moves 10 s with every alert raised.
     pub clock: u64,
@@ -117,6 +141,20 @@ pub struct PiState {
     pub exempt_default: bool,
     /// The block list that was pushed with the policy (memory only).
     pub policy_block: Vec<String>,
+    /// The labels in force (memory only), in the desktop's order.
+    pub labels: Vec<(String, String)>,
+    staged_labels: Vec<(String, String)>,
+    /// The seconds that the open gates have left, by MAC (memory only).
+    pub gates: Vec<(String, u16)>,
+    /// The PIN hash the desktop pushed for this boot, if it did (memory only).
+    pub pin_hash: Option<String>,
+    /// Panel taps that happen right after the next `GET devices` is answered:
+    /// the desktop read the lists, and the panel overtakes it before it
+    /// pushes. Each is `(mac, pass)` for [`PiState::ads_pass`].
+    pub taps_after_next_get: Vec<(String, bool)>,
+    /// True: the panel taps a new device (`02:00:00:99:xx:xx`) on after every
+    /// `GET devices`, so that every push made on what was read is stale.
+    pub churn: bool,
     /// (mac, ipv4) of the devices `GET devices` lists. Each is seen later than
     /// the one before it, so the list comes oldest first: the poller must
     /// sort, not trust the Pi's order.
@@ -140,6 +178,14 @@ pub struct PiState {
     /// The bodies of `PUT devices/policy`, every one that reached the route
     /// (also the ones answered 400 or 500).
     pub policy_puts: Vec<Value>,
+    /// The bodies of `PUT devices/labels`, every one that reached the route
+    /// (also the ones answered 400 or 500).
+    pub label_puts: Vec<Value>,
+    /// The bodies of `PUT panel`, every one that reached the route (also the
+    /// ones answered 400 or 500).
+    pub panel_puts: Vec<Value>,
+    /// How many pushes were answered 409.
+    pub conflicts: u64,
     /// The `since` of every `GET alerts`.
     pub since: Vec<u64>,
 }
@@ -155,7 +201,12 @@ impl PiState {
             fail_known: false,
             policy_support: true,
             fail_policy: false,
+            panel_support: true,
+            fail_labels: false,
+            fail_devices_get: false,
+            fail_panel: false,
             rev: 0,
+            dev_rev: 0,
             next_id: 1,
             clock: T0,
             alerts: Vec::new(),
@@ -166,6 +217,12 @@ impl PiState {
             exempt_config: Vec::new(),
             exempt_default: false,
             policy_block: Vec::new(),
+            labels: Vec::new(),
+            staged_labels: Vec::new(),
+            gates: Vec::new(),
+            pin_hash: None,
+            taps_after_next_get: Vec::new(),
+            churn: false,
             devices: (1..=3).map(|i| (mac(i), format!("192.0.2.{i}"))).collect(),
             sid: None,
             logins: 0,
@@ -176,6 +233,9 @@ impl PiState {
             known_puts: Vec::new(),
             exempt_puts: Vec::new(),
             policy_puts: Vec::new(),
+            label_puts: Vec::new(),
+            panel_puts: Vec::new(),
+            conflicts: 0,
             since: Vec::new(),
         }
     }
@@ -212,10 +272,37 @@ impl PiState {
     /// mode every device but the blocked ones, otherwise the ones on the
     /// effective exempt list.
     pub fn is_exempt(&self, mac: &str) -> bool {
+        if self.gates.iter().any(|(m, _)| m == mac) {
+            return true;
+        }
         if self.policy_support && self.exempt_default {
             !self.policy_block.iter().any(|b| b == mac)
         } else {
             self.exempt_macs().iter().any(|m| m == mac)
+        }
+    }
+
+    /// The front panel's tap on one device: ads pass (or stop passing) for it
+    /// for good. It edits the pushed list of the mode in force, the exempt list
+    /// in the list mode and the block list in the exempt-by-default mode, and
+    /// moves the revision when that changes the list.
+    pub fn ads_pass(&mut self, mac: &str, pass: bool) {
+        let (list, listed) = if self.exempt_default {
+            (&mut self.policy_block, !pass)
+        } else {
+            (&mut self.exempt, pass)
+        };
+        let before = list.clone();
+        if listed {
+            if !list.iter().any(|m| m == mac) {
+                list.push(mac.to_string());
+            }
+        } else {
+            list.retain(|m| m != mac);
+        }
+        list.sort();
+        if *list != before {
+            self.dev_rev += 1;
         }
     }
 
@@ -237,6 +324,19 @@ impl PiState {
                 if self.policy_support {
                     d["blocked"] = json!(self.policy_block.contains(m));
                 }
+                if self.panel_support {
+                    let label = self.labels.iter().find(|(l, _)| l == m).map(|(_, n)| n);
+                    let gate = self.gates.iter().find(|(g, _)| g == m).map(|(_, s)| s);
+                    let fixed = if self.exempt_default {
+                        false
+                    } else {
+                        self.exempt_config.contains(m)
+                    };
+                    d["label"] = json!(label);
+                    d["gate_left_secs"] = json!(gate);
+                    d["fixed"] = json!(fixed);
+                    d["always"] = json!(false);
+                }
                 d
             })
             .collect();
@@ -248,7 +348,40 @@ impl PiState {
             v["exempt_default"] = json!(self.exempt_default);
             v["block_macs"] = json!(self.policy_block);
         }
+        if self.panel_support {
+            v["rev"] = json!(self.dev_rev);
+            v["exempt_pushed"] = json!(self.exempt);
+            v["block_pushed"] = json!(self.policy_block);
+            v["own_mac"] = json!(null);
+        }
         v
+    }
+
+    /// The 409 of a push made on a revision that is not the one now (the
+    /// Pi's error object, and the revision that is), or `None` when the push
+    /// may go ahead.
+    fn stale(&mut self, body: &Value) -> Option<Vec<u8>> {
+        if !self.panel_support {
+            return None;
+        }
+        let wanted = body.get("if_rev")?.as_u64()?;
+        if wanted == self.dev_rev {
+            return None;
+        }
+        self.conflicts += 1;
+        let answer = json!({
+            "error": {"key": "stale", "message": "The lists changed since this revision; read them again", "hint": null},
+            "rev": self.dev_rev,
+            "took": 0.0,
+        })
+        .to_string();
+        Some(
+            format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{answer}",
+                answer.len()
+            )
+            .into_bytes(),
+        )
     }
 }
 
@@ -360,7 +493,19 @@ fn respond(st: &mut PiState, req: &str) -> Vec<u8> {
         return ok_json(&format!(r#"{{"restored":{}}}"#, keys.len()));
     }
     if method == "GET" && path == "/api/qbp/devices" {
-        return ok_json(&st.devices_json().to_string());
+        if st.fail_devices_get {
+            return SERVER_ERROR.to_vec();
+        }
+        let answer = st.devices_json().to_string();
+        // The panel overtakes the desktop after it has read.
+        for (mac, pass) in std::mem::take(&mut st.taps_after_next_get) {
+            st.ads_pass(&mac, pass);
+        }
+        if st.churn {
+            let n = st.dev_rev as usize + 1;
+            st.ads_pass(&mac(0x99_0000 + n), true);
+        }
+        return ok_json(&answer);
     }
     if method == "PUT" && path == "/api/qbp/devices/known" {
         if st.fail_known {
@@ -398,6 +543,9 @@ fn respond(st: &mut PiState, req: &str) -> Vec<u8> {
         if st.fail_exempt {
             return SERVER_ERROR.to_vec();
         }
+        if let Some(refused) = st.stale(&body) {
+            return refused;
+        }
         // The Pi refuses a body that is not `{"exempt": [<mac>, ...]}` with
         // at most 64 lower-case colon-separated addresses.
         let list = body["exempt"].as_array().filter(|a| a.len() <= EXEMPT_MAX);
@@ -412,8 +560,18 @@ fn respond(st: &mut PiState, req: &str) -> Vec<u8> {
         let Some(macs) = macs else {
             return BAD_REQUEST.to_vec();
         };
-        st.exempt = macs;
-        return ok_json(&format!(r#"{{"exempt":{}}}"#, st.exempt.len()));
+        let mut sorted = macs;
+        sorted.sort();
+        sorted.dedup();
+        if sorted != st.exempt {
+            st.dev_rev += 1;
+        }
+        st.exempt = sorted;
+        return ok_json(&if st.panel_support {
+            json!({"exempt": st.exempt.len(), "rev": st.dev_rev}).to_string()
+        } else {
+            format!(r#"{{"exempt":{}}}"#, st.exempt.len())
+        });
     }
     if method == "PUT" && path == "/api/qbp/devices/policy" {
         if !st.policy_support {
@@ -422,6 +580,9 @@ fn respond(st: &mut PiState, req: &str) -> Vec<u8> {
         st.policy_puts.push(body.clone());
         if st.fail_policy {
             return SERVER_ERROR.to_vec();
+        }
+        if let Some(refused) = st.stale(&body) {
+            return refused;
         }
         // The Pi refuses a body that is not exactly `{"exempt_default": <bool>,
         // "block": [<mac>, ...]}` (both keys, at most 64 lower-case
@@ -439,13 +600,107 @@ fn respond(st: &mut PiState, req: &str) -> Vec<u8> {
         let (Some(mode), Some(macs)) = (mode, macs) else {
             return BAD_REQUEST.to_vec();
         };
+        let mut sorted = macs;
+        sorted.sort();
+        sorted.dedup();
+        if mode != st.exempt_default || sorted != st.policy_block {
+            st.dev_rev += 1;
+        }
         st.exempt_default = mode;
-        st.policy_block = macs;
-        return ok_json(&format!(
-            r#"{{"exempt_default":{},"block":{}}}"#,
-            st.exempt_default,
-            st.policy_block.len()
-        ));
+        st.policy_block = sorted;
+        return ok_json(&if st.panel_support {
+            json!({"exempt_default": st.exempt_default, "block": st.policy_block.len(),
+                   "rev": st.dev_rev})
+            .to_string()
+        } else {
+            format!(
+                r#"{{"exempt_default":{},"block":{}}}"#,
+                st.exempt_default,
+                st.policy_block.len()
+            )
+        });
+    }
+    if method == "PUT" && path == "/api/qbp/devices/labels" {
+        if !st.panel_support {
+            return NOT_FOUND.to_vec();
+        }
+        st.label_puts.push(body.clone());
+        if st.fail_labels {
+            return SERVER_ERROR.to_vec();
+        }
+        // The Pi refuses a body that is not `{"labels": [[<mac>, <label>], ...]}`
+        // with at most 64 pairs, each an Ethernet address in lower-case colon
+        // form and a label of 1 to 24 printable ASCII characters, and flags
+        // that are not true or false.
+        let flag = |name: &str, default: bool| match body.get(name) {
+            None => Some(default),
+            Some(v) => v.as_bool(),
+        };
+        let pairs: Option<Vec<(String, String)>> = body["labels"]
+            .as_array()
+            .filter(|a| a.len() <= LABELS_MAX)
+            .and_then(|a| {
+                a.iter()
+                    .map(|p| {
+                        let [m, l] = p.as_array()?.as_slice() else {
+                            return None;
+                        };
+                        let (m, l) = (m.as_str()?, l.as_str()?);
+                        let fits = (1..=24).contains(&l.len())
+                            && l.bytes().all(|b| (0x20..=0x7e).contains(&b));
+                        (fits && crate::watchdog::normalize_mac(m).as_deref() == Some(m))
+                            .then(|| (m.to_string(), l.to_string()))
+                    })
+                    .collect()
+            });
+        let (Some(pairs), Some(append), Some(complete)) =
+            (pairs, flag("append", false), flag("complete", true))
+        else {
+            return BAD_REQUEST.to_vec();
+        };
+        let mut list = if append {
+            std::mem::take(&mut st.staged_labels)
+        } else {
+            Vec::new()
+        };
+        for (m, l) in pairs {
+            if list.len() < LABELS_MAX && !list.iter().any(|(held, _)| *held == m) {
+                list.push((m, l));
+            }
+        }
+        let kept = list.len();
+        if !complete {
+            st.staged_labels = list;
+            return ok_json(&json!({"labels": kept, "rev": st.dev_rev}).to_string());
+        }
+        if list != st.labels {
+            st.labels = list;
+            st.dev_rev += 1;
+        }
+        return ok_json(&json!({"labels": kept, "rev": st.dev_rev}).to_string());
+    }
+    if method == "PUT" && path == "/api/qbp/panel" {
+        if !st.panel_support {
+            return NOT_FOUND.to_vec();
+        }
+        st.panel_puts.push(body.clone());
+        if st.fail_panel {
+            return SERVER_ERROR.to_vec();
+        }
+        // The Pi refuses a body that has no `pin_hash`, or one that is neither
+        // null nor a line of the shape its own hash makes.
+        let hash = match body.get("pin_hash") {
+            Some(Value::Null) => None,
+            Some(Value::String(h)) if crate::pinhash::PinHash::parse(h).is_some() => {
+                Some(h.clone())
+            }
+            _ => return BAD_REQUEST.to_vec(),
+        };
+        st.pin_hash = hash;
+        return ok_json(
+            &json!({"night": null, "lock": {"on": st.pin_hash.is_some(), "source": "desktop"}})
+                .to_string(),
+        );
     }
     NOT_FOUND.to_vec()
 }
@@ -474,6 +729,15 @@ impl FakePi {
             s.exempt_support = false;
             s.policy_support = false;
         });
+        pi
+    }
+
+    /// A qberrypi from before the front panel: it has the exempt list and the
+    /// policy, but its devices answer has no `rev`, it takes no labels and no
+    /// PIN, and it ignores `if_rev`.
+    pub fn without_panel(conns: usize) -> Self {
+        let pi = Self::build(conns, true);
+        pi.with(|s| s.panel_support = false);
         pi
     }
 
@@ -585,12 +849,32 @@ impl FakePi {
             s.exempt.clear();
             s.exempt_default = false;
             s.policy_block.clear();
+            s.dev_rev = 0;
+            s.labels.clear();
+            s.staged_labels.clear();
+            s.gates.clear();
+            s.pin_hash = None;
             s.known_list = "waiting";
             if !keep_session {
                 s.sid = None;
             }
             s.clock += 100;
         })
+    }
+
+    /// The front panel's tap on a device: ads pass for it (or stop passing),
+    /// for good. See [`PiState::ads_pass`].
+    pub fn panel_ads_pass(&self, mac: &str, pass: bool) {
+        self.with(|s| s.ads_pass(mac, pass));
+    }
+
+    /// The front panel opens a device's gate for `secs` seconds.
+    pub fn panel_gate(&self, mac: &str, secs: u16) {
+        self.with(|s| {
+            s.gates.retain(|(m, _)| m != mac);
+            s.gates.push((mac.to_string(), secs));
+            s.dev_rev += 1;
+        });
     }
 
     pub fn set_known_list(&self, v: &'static str) {

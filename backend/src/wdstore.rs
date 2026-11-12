@@ -25,6 +25,20 @@
 //! policy rewrites this file without the policy's fields when it saves the
 //! exempt list: only a watcher that outlives an upgrade can do that.)
 //!
+//! The panel's PIN hash (`pinHash`, with a generation pair of its own) is in
+//! that file as well: the hash line that the Pi's `PUT /api/qbp/panel` takes,
+//! made by [`crate::pinhash`], never the digits. It is kept private like the
+//! rest of the file (mode 0600), and its `Debug` shows nothing of it. The
+//! Pi holds the PIN for the running boot only, so the watcher pushes it again
+//! after each start; with no hash and no edit waiting nothing is pushed, so
+//! that a PIN the Pi has in its own configuration is never cleared by a qnet
+//! that was never given one.
+//!
+//! The ADS PASS list and the block list are the Pi's front panel's to edit as
+//! well: [`Store::adopt_exempt`] and [`Store::adopt_block`] take over the
+//! Pi's list as it stands (the panel's edit is newer than this PC's list) and
+//! count it as pushed.
+//!
 //! The watcher and the CLI both write it, so every change goes through
 //! [`update`], a read-modify-write under an exclusive lock on
 //! `watchdog.lock` next to the file. A file that cannot be read or parsed is
@@ -38,6 +52,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pinhash::PinHash;
 use crate::watchdog::{normalize_mac, valid_key};
 
 /// At most this many entries in each of the three lists (the exempt list has
@@ -136,6 +151,16 @@ pub struct Store {
     /// The `policy_gen` that was last pushed to the Pi successfully.
     #[serde(skip)]
     pub pushed_policy_gen: u64,
+    /// The hash of the panel's PIN, as the Pi reads it; `None` when none was
+    /// set here, or it was cleared. Kept in `watchdog-exempt.json` only.
+    #[serde(skip)]
+    pub pin_hash: Option<PinHash>,
+    /// Bumped by every set or clear of the PIN.
+    #[serde(skip)]
+    pub pin_gen: u64,
+    /// The `pin_gen` that was last pushed to the Pi successfully.
+    #[serde(skip)]
+    pub pushed_pin_gen: u64,
 }
 
 /// The content of `watchdog-exempt.json`: the exempt list and its counters,
@@ -156,6 +181,12 @@ struct ExemptFile {
     policy_generation: u64,
     /// The `policy_generation` that was last pushed to the Pi successfully.
     pushed_policy_generation: u64,
+    /// The hash of the panel's PIN, if one is set.
+    pin_hash: Option<PinHash>,
+    /// Bumped by every set or clear of the PIN.
+    pin_generation: u64,
+    /// The `pin_generation` that was last pushed to the Pi successfully.
+    pushed_pin_generation: u64,
 }
 
 impl Default for ExemptFile {
@@ -169,6 +200,9 @@ impl Default for ExemptFile {
             block: Vec::new(),
             policy_generation: 0,
             pushed_policy_generation: 0,
+            pin_hash: None,
+            pin_generation: 0,
+            pushed_pin_generation: 0,
         }
     }
 }
@@ -218,6 +252,9 @@ impl Default for Store {
             block: Vec::new(),
             policy_gen: 0,
             pushed_policy_gen: 0,
+            pin_hash: None,
+            pin_gen: 0,
+            pushed_pin_gen: 0,
         }
     }
 }
@@ -271,6 +308,42 @@ fn upsert(
             mac,
             label,
             first_seen,
+        });
+    }
+    true
+}
+
+/// Make `list` (at most `cap` entries) hold exactly the addresses `macs`, as
+/// [`Store::replace_exempt`] says; `known` is where a new entry takes its label
+/// and first-seen time from. True when the set of addresses changed (a list
+/// that only comes in another order is left as it is).
+fn replace_list(
+    list: &mut Vec<Known>,
+    cap: usize,
+    macs: &[String],
+    known: &[Known],
+    now: u64,
+) -> bool {
+    let mut wanted: Vec<String> = Vec::new();
+    for m in macs.iter().filter_map(|m| normalize_mac(m)) {
+        if wanted.len() < cap && !wanted.contains(&m) {
+            wanted.push(m);
+        }
+    }
+    let same = list.len() == wanted.len() && list.iter().all(|e| wanted.contains(&e.mac));
+    if same {
+        return false;
+    }
+    list.retain(|e| wanted.contains(&e.mac));
+    for m in wanted {
+        if list.iter().any(|e| e.mac == m) {
+            continue;
+        }
+        let from = known.iter().find(|k| k.mac == m);
+        list.push(Known {
+            label: from.and_then(|k| k.label.clone()),
+            first_seen: from.map_or(now, |k| k.first_seen),
+            mac: m,
         });
     }
     true
@@ -336,6 +409,9 @@ impl Store {
             block: self.block.clone(),
             policy_generation: self.policy_gen,
             pushed_policy_generation: self.pushed_policy_gen,
+            pin_hash: self.pin_hash.clone(),
+            pin_generation: self.pin_gen,
+            pushed_pin_generation: self.pushed_pin_gen,
         }
     }
 
@@ -347,6 +423,11 @@ impl Store {
         self.block = f.block;
         self.policy_gen = f.policy_generation;
         self.pushed_policy_gen = f.pushed_policy_generation;
+        // A hash that is not a hash line is no PIN: a damaged file must not
+        // push garbage to the Pi.
+        self.pin_hash = f.pin_hash.and_then(|h| PinHash::parse(h.as_str()));
+        self.pin_gen = f.pin_generation;
+        self.pushed_pin_gen = f.pushed_pin_generation;
     }
 
     /// Whether the exempt fields hold anything (what an earlier
@@ -573,6 +654,83 @@ impl Store {
     /// [`mark_pushed`](Self::mark_pushed)).
     pub fn mark_policy_pushed(&mut self, generation: u64) {
         self.pushed_policy_gen = generation;
+    }
+
+    // -- what the Pi's front panel edited ----------------------------------------
+
+    /// Make the exempt list the Pi's `macs`: the entries that are there stay as
+    /// they are (label, first seen), those that are not are dropped, and the
+    /// ones that are new, from the panel, are appended in the Pi's order, with
+    /// the label and the first-seen time that the known list has for them (and
+    /// `now` and no label for a device that is not on it). `exempt_gen` goes
+    /// up only when the set of addresses changed; at most [`MAX_EXEMPT`] are
+    /// kept. True when the list changed.
+    pub fn replace_exempt(&mut self, macs: &[String], now: u64) -> bool {
+        if !replace_list(&mut self.exempt, MAX_EXEMPT, macs, &self.known, now) {
+            return false;
+        }
+        self.exempt_gen = self.exempt_gen.wrapping_add(1);
+        true
+    }
+
+    /// [`replace_exempt`](Self::replace_exempt) for a list that the Pi has
+    /// already: the change is counted as pushed.
+    pub fn adopt_exempt(&mut self, macs: &[String], now: u64) -> bool {
+        let changed = self.replace_exempt(macs, now);
+        if changed {
+            self.pushed_exempt_gen = self.exempt_gen;
+        }
+        changed
+    }
+
+    /// [`replace_exempt`](Self::replace_exempt) for the block list
+    /// ([`MAX_BLOCK`]); `policy_gen` goes up when the set changed.
+    pub fn replace_block(&mut self, macs: &[String], now: u64) -> bool {
+        if !replace_list(&mut self.block, MAX_BLOCK, macs, &self.known, now) {
+            return false;
+        }
+        self.bump_policy_gen();
+        true
+    }
+
+    /// [`replace_block`](Self::replace_block) for a list that the Pi has
+    /// already: the change is counted as pushed, and only when nothing else of
+    /// the policy (the mode) was waiting to be pushed.
+    pub fn adopt_block(&mut self, macs: &[String], now: u64) -> bool {
+        let waiting = self.policy_push_due();
+        let changed = self.replace_block(macs, now);
+        if changed && !waiting {
+            self.pushed_policy_gen = self.policy_gen;
+        }
+        changed
+    }
+
+    // -- the panel's PIN -------------------------------------------------------
+
+    /// Keep `hash` as the panel's PIN; `pin_gen` goes up (a new hash is a new
+    /// salt, so it is always a change).
+    pub fn set_pin(&mut self, hash: PinHash) {
+        self.pin_hash = Some(hash);
+        self.pin_gen = self.pin_gen.wrapping_add(1);
+    }
+
+    /// Forget the PIN. `pin_gen` goes up whether there was one or not: this is
+    /// an explicit edit, and it is pushed (the Pi may hold a PIN that was set
+    /// at its panel for this boot).
+    pub fn clear_pin(&mut self) {
+        self.pin_hash = None;
+        self.pin_gen = self.pin_gen.wrapping_add(1);
+    }
+
+    /// Whether the PIN was set or cleared since it was last pushed to the Pi.
+    pub fn pin_push_due(&self) -> bool {
+        self.pin_gen != self.pushed_pin_gen
+    }
+
+    /// Record a successful push of PIN generation `generation` (the `pin_gen`
+    /// that was read before the push, as for [`mark_pushed`](Self::mark_pushed)).
+    pub fn mark_pin_pushed(&mut self, generation: u64) {
+        self.pushed_pin_gen = generation;
     }
 
     // -- notifications ---------------------------------------------------------
@@ -1779,6 +1937,162 @@ mod tests {
         // A no-op update rewrites nothing.
         update(&p, |s| s.block.len()).unwrap();
         assert_eq!(std::fs::read(exempt_path(&p)).unwrap(), before);
+    }
+
+    #[test]
+    fn the_pis_exempt_list_is_adopted_as_it_stands_and_counts_as_pushed() {
+        let mut s = Store::default();
+        s.know(&mac(5), Some("Printer"), 40);
+        s.add_exempt(&mac(1), Some("TV"), 10);
+        s.add_exempt(&mac(2), None, 20);
+        s.mark_exempt_pushed(s.exempt_gen);
+        let gen = s.exempt_gen;
+        // The panel took 2 off and put 5 and 9 on. Entries that stay keep
+        // their label and first-seen time; a new one that is known takes the
+        // known list's, an unknown one gets none and the time it is adopted.
+        assert!(s.adopt_exempt(&[mac(5), mac(1), mac(9)], 777));
+        assert_eq!(s.exempt_macs(), [mac(1), mac(5), mac(9)]);
+        assert_eq!(s.exempt[0].label.as_deref(), Some("TV"));
+        assert_eq!((s.exempt[0].first_seen, s.exempt[1].first_seen), (10, 40));
+        assert_eq!(s.exempt[1].label.as_deref(), Some("Printer"));
+        assert_eq!(
+            (s.exempt[2].label.as_deref(), s.exempt[2].first_seen),
+            (None, 777)
+        );
+        assert_eq!(s.exempt_gen, gen + 1);
+        assert!(!s.exempt_push_due(), "what the Pi has is not to be pushed");
+        // The same set, in another order or spelling, is no change.
+        assert!(!s.adopt_exempt(&[mac(9), mac(1).to_uppercase(), mac(5)], 800));
+        assert_eq!(s.exempt_gen, gen + 1);
+        // Empty means empty; the other lists are not touched.
+        assert!(s.adopt_exempt(&[], 800));
+        assert!(s.exempt.is_empty() && !s.exempt_push_due());
+        assert_eq!(s.known_macs(), [mac(5)]);
+        assert!(s.block.is_empty() && !s.policy_push_due());
+    }
+
+    #[test]
+    fn a_replaced_exempt_list_stays_due_until_it_is_pushed() {
+        let mut s = Store::default();
+        s.add_exempt(&mac(1), None, 10);
+        s.mark_exempt_pushed(s.exempt_gen);
+        assert!(s.replace_exempt(&[mac(1), mac(2)], 50));
+        assert!(s.exempt_push_due());
+        assert!(!s.replace_exempt(&[mac(2), mac(1)], 50), "same set");
+    }
+
+    #[test]
+    fn adopting_a_list_ignores_what_is_not_an_address_and_holds_the_cap() {
+        let mut s = Store::default();
+        let mut macs: Vec<String> = (1..=70).map(mac).collect();
+        macs.insert(3, "not a mac".to_string());
+        macs.push(mac(1));
+        assert!(s.adopt_exempt(&macs, 5));
+        assert_eq!(s.exempt.len(), MAX_EXEMPT);
+        assert!(s.adopt_block(&macs, 5));
+        assert_eq!(s.block.len(), MAX_BLOCK);
+    }
+
+    #[test]
+    fn the_pis_block_list_is_adopted_and_the_mode_is_left_alone() {
+        let mut s = Store::default();
+        s.set_exempt_default(true);
+        s.add_block(&mac(1), Some("Work"), 10);
+        s.mark_policy_pushed(s.policy_gen);
+        assert!(s.adopt_block(&[mac(1), mac(2)], 60));
+        assert_eq!(s.block_macs(), [mac(1), mac(2)]);
+        assert!(s.exempt_default, "the panel cannot change the mode");
+        assert!(!s.policy_push_due());
+        // A mode change that is waiting to be pushed stays due.
+        s.set_exempt_default(false);
+        assert!(s.policy_push_due());
+        assert!(s.adopt_block(&[mac(3)], 70));
+        assert_eq!(s.block_macs(), [mac(3)]);
+        assert!(s.policy_push_due(), "the mode was not pushed yet");
+    }
+
+    #[test]
+    fn the_pin_hash_lives_in_the_exempt_file_and_survives_a_save_and_load() {
+        use crate::pinhash;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("qnet").join("watchdog.json");
+        let ep = exempt_path(&p);
+        let hash = pinhash::hash_with_salt("1234", [3; 16]).unwrap();
+        let mut s = Store::default();
+        assert!(s.pin_hash.is_none() && !s.pin_push_due());
+        s.set_pin(hash.clone());
+        assert!(s.pin_push_due());
+        s.mark_pin_pushed(s.pin_gen);
+        assert!(!s.pin_push_due());
+        s.save(&p).unwrap();
+        let back = Store::load(&p);
+        assert_eq!(back, s);
+        assert_eq!(back.pin_hash.as_ref(), Some(&hash));
+        let text = std::fs::read_to_string(&ep).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["pinHash"], hash.as_str());
+        assert_eq!(
+            (
+                v["pinGeneration"].as_u64(),
+                v["pushedPinGeneration"].as_u64()
+            ),
+            (Some(1), Some(1))
+        );
+        assert_eq!(mode(&ep), 0o600);
+        // Not in the store's own file, and not in the digits' clear form.
+        let own = std::fs::read_to_string(&p).unwrap();
+        assert!(!own.contains("pin") && !own.contains(hash.as_str()));
+        assert!(!text.contains("1234"));
+        assert!(!format!("{back:?}").contains(hash.as_str()));
+    }
+
+    #[test]
+    fn clearing_the_pin_is_an_edit_even_when_there_was_none() {
+        let mut s = Store::default();
+        s.clear_pin();
+        assert!(
+            s.pin_hash.is_none() && s.pin_push_due(),
+            "the Pi may hold one of its own"
+        );
+        s.mark_pin_pushed(s.pin_gen);
+        assert!(!s.pin_push_due());
+        s.set_pin(crate::pinhash::hash_with_salt("0000", [1; 16]).unwrap());
+        s.mark_pin_pushed(s.pin_gen);
+        s.clear_pin();
+        assert!(s.pin_hash.is_none() && s.pin_push_due());
+    }
+
+    #[test]
+    fn a_damaged_pin_hash_is_no_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        let ep = exempt_path(&p);
+        std::fs::write(
+            &ep,
+            r#"{"version":1,"pinHash":"hunter2","pinGeneration":4}"#,
+        )
+        .unwrap();
+        let s = Store::load(&p);
+        assert!(s.pin_hash.is_none());
+        assert_eq!(s.pin_gen, 4);
+        // A file from before the PIN has none.
+        std::fs::write(&ep, r#"{"version":1,"exempt":[]}"#).unwrap();
+        let s = Store::load(&p);
+        assert!(s.pin_hash.is_none() && !s.pin_push_due());
+    }
+
+    #[test]
+    fn a_pin_edit_writes_only_the_exempt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        update(&p, |s| s.know(&mac(1), Some("Printer"), 5)).unwrap();
+        let store_bytes = std::fs::read(&p).unwrap();
+        update(&p, |s| {
+            s.set_pin(crate::pinhash::hash_with_salt("1234", [9; 16]).unwrap())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), store_bytes, "watchdog.json");
+        assert!(Store::load(&p).pin_hash.is_some());
     }
 
     #[test]

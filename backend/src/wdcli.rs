@@ -1,9 +1,9 @@
 //! The `qnet watchdog …` verbs: look at the Pi's alerts and devices, acknowledge
-//! an alert, and edit the known-device list, the exempt-device list (the
-//! devices that skip ad blocking; threat blocking stays) and the
-//! exempt-by-default policy (the mode in which every device skips ad blocking
+//! an alert, and edit the known-device list, the ADS PASS list (`exempt`: the
+//! devices that are exempt from ad blocking; threat blocking stays) and the
+//! exempt-by-default policy (the mode in which every device has ADS PASS
 //! except the ones on a block list) of this PC, which are then pushed to the
-//! Pi.
+//! Pi, and set or clear the PIN of the Pi's front panel.
 //!
 //! Each verb is a function of the API client, the path of the PC-side store
 //! and the time (unix seconds), so tests run against the fake Pi and a
@@ -12,15 +12,28 @@
 //!
 //! The known list is edited on this PC first and pushed second: when the push
 //! fails, or the Pi has no watchdog, the edit stays and the watcher pushes it
-//! later (the store's `knownGen` says it is due). The exempt list works the
+//! later (the store's `knownGen` says it is due). The ADS PASS list works the
 //! same way (its `generation`), with its own push and its own result keys
 //! (`exemptPushed`, `exemptPushError`), so one failing never hides the other.
-//! A Pi that answers 404 for the exempt route has no exempt support: the edit
-//! is saved here and reported as "not pushed: not supported yet". The policy
-//! works the same way (the mode and the block list are one push, with
+//! A Pi that answers 404 for the exempt route has no ADS PASS support: the
+//! edit is saved here and reported as "not pushed: not supported yet". The
+//! policy works the same way (the mode and the block list are one push, with
 //! `policyPushed`/`policyPushError` in the result), and `block` pushes the
-//! lists it changed in order: known list, exempt list (a device that is
-//! blocked is taken off it), policy.
+//! lists it changed in order: known list, ADS PASS list (a device that is
+//! blocked is taken off it), policy. The names (labels) of the devices are
+//! pushed after any edit that may change them (`labelsPushed`,
+//! `labelsPushError`), and the PIN hash by `pin set` and `pin clear`
+//! (`panelPushed`, `panelPushError`).
+//!
+//! The Pi's front panel edits the ADS PASS list and the block list as well. A
+//! verb that edits one of them reads the Pi's inventory first: when the
+//! panel changed the list since this PC pushed it (the Pi's revision is above 0
+//! and its pushed list differs from this PC's, with no edit of this PC waiting
+//! and no sign that the Pi started again) the panel's list is adopted before
+//! the verb edits it, and the push carries the revision that was read as
+//! `if_rev`. A push that the panel overtook in between is a 409: the Pi's
+//! list is read again and the verb's edit (what it added and took off) is put
+//! on top of it, so neither edit is lost.
 //!
 //! `block-this` finds this computer's own hardware address without running
 //! anything: the interface of the default IPv4 route from `/proc/net/route`,
@@ -34,26 +47,39 @@ use serde_json::{json, Value};
 
 use crate::actions::{ActionErr, ActionResult};
 use crate::pihole::Pihole;
+use crate::pinhash::PinHash;
 use crate::state::{WatchdogAlertOut, WatchdogDeviceOut};
-use crate::watchdog::{self, normalize_mac, Inventory, Qbp};
+use crate::watchdog::{self, normalize_mac, Inventory, ListPut, Qbp};
 use crate::wdstore::{self, clean_label, Store};
 
-const USAGE: &str = "usage: qnet watchdog alerts | devices | know-all | ack <id> | \
-know <mac> [label...] | forget <mac> | exempt <mac> [label...] | unexempt <mac> | \
-exempt-default on|off | block <mac> [label...] | unblock <mac> | block-this";
+pub const USAGE: &str = "usage: qnet watchdog alerts | devices | know-all | ack <id> | \
+know <mac> [label...] | forget <mac> | exempt|ads-pass <mac> [label...] | \
+unexempt|ads-block <mac> | exempt-default on|off | block <mac> [label...] | \
+unblock <mac> | block-this | pin set|clear";
 
-/// What an exempt push says when the Pi answered 404 for the route (an older
+/// What an ADS PASS push says when the Pi answered 404 for the route (an older
 /// Pi, or a Pi-hole that is not a qberrypi at all).
-const UNSUPPORTED: &str = "the Pi's software does not support exempt devices yet";
+const UNSUPPORTED: &str = "the Pi's software does not support ADS PASS devices yet";
 
 /// What a policy push says when the Pi answered 404 for the route (an older
 /// Pi, or a Pi-hole that is not a qberrypi at all).
 const UNSUPPORTED_POLICY: &str =
     "the Pi's software does not support exempt-by-default blocking yet";
 
+/// What a labels push says when the Pi answered 404 for the route (a Pi from
+/// before its front panel, or a Pi-hole that is not a qberrypi at all).
+const UNSUPPORTED_LABELS: &str = "the Pi's software does not show device names yet";
+
+/// What a PIN push says when the Pi answered 404 for the route.
+const UNSUPPORTED_PANEL: &str = "the Pi's software does not take a panel PIN yet";
+
 /// The warning that goes with turning the exempt-by-default mode on.
-const EXEMPT_DEFAULT_NOTE: &str = "every device that is not on the block list now skips ad \
-blocking (threat blocking stays); keep a device blocked with `qnet watchdog block <mac>`";
+const EXEMPT_DEFAULT_NOTE: &str = "every device that is not on the block list now has ADS PASS \
+(threat blocking stays); keep a device's ads blocked with `qnet watchdog block <mac>`";
+
+/// The note that goes with taking the PIN off.
+const PIN_CLEAR_NOTE: &str = "the PIN is off on the Pi for this boot; a PIN in the Pi's own \
+configuration comes back when the Pi restarts";
 
 /// One `qnet watchdog` verb, validated.
 #[derive(Debug, PartialEq, Eq)]
@@ -74,11 +100,13 @@ pub enum WdCmd {
         mac: String,
     },
     KnowAll,
-    /// As `Know`, and the device is put on the exempt list as well.
+    /// As `Know`, and the device is put on the ADS PASS list as well
+    /// (`exempt`, or `ads-pass`).
     Exempt {
         mac: String,
         label: Option<String>,
     },
+    /// Take the device off the ADS PASS list (`unexempt`, or `ads-block`).
     Unexempt {
         mac: String,
     },
@@ -98,6 +126,11 @@ pub enum WdCmd {
     /// `Block` for this computer (its address and hostname are found by
     /// [`block_this`]).
     BlockThis,
+    /// Set the panel's PIN. The digits are read from stdin by `main`, never
+    /// from the command line, and are not part of this value.
+    PinSet,
+    /// Take the panel's PIN off.
+    PinClear,
 }
 
 fn usage() -> ActionErr {
@@ -143,10 +176,10 @@ pub fn parse(args: &[String]) -> Result<WdCmd, ActionErr> {
             mac: parse_mac(mac)?,
             label: clean_label(&label.join(" ")),
         }),
-        ["unexempt", mac] => Ok(WdCmd::Unexempt {
+        ["unexempt" | "ads-block", mac] => Ok(WdCmd::Unexempt {
             mac: parse_mac(mac)?,
         }),
-        ["exempt", mac, label @ ..] => Ok(WdCmd::Exempt {
+        ["exempt" | "ads-pass", mac, label @ ..] => Ok(WdCmd::Exempt {
             mac: parse_mac(mac)?,
             label: clean_label(&label.join(" ")),
         }),
@@ -160,6 +193,8 @@ pub fn parse(args: &[String]) -> Result<WdCmd, ActionErr> {
             label: clean_label(&label.join(" ")),
         }),
         ["block-this"] => Ok(WdCmd::BlockThis),
+        ["pin", "set"] => Ok(WdCmd::PinSet),
+        ["pin", "clear"] => Ok(WdCmd::PinClear),
         _ => Err(usage()),
     }
 }
@@ -185,11 +220,18 @@ pub fn run_with(
         WdCmd::Forget { mac } => forget(api, store_path, mac),
         WdCmd::KnowAll => know_all(api, store_path, now),
         WdCmd::Exempt { mac, label } => exempt(api, store_path, now, mac, label.as_deref()),
-        WdCmd::Unexempt { mac } => unexempt(api, store_path, mac),
-        WdCmd::ExemptDefault { on } => exempt_default(api, store_path, *on),
+        WdCmd::Unexempt { mac } => unexempt(api, store_path, now, mac),
+        WdCmd::ExemptDefault { on } => exempt_default(api, store_path, now, *on),
         WdCmd::Block { mac, label } => block(api, store_path, now, mac, label.as_deref()),
-        WdCmd::Unblock { mac } => unblock(api, store_path, mac),
+        WdCmd::Unblock { mac } => unblock(api, store_path, now, mac),
         WdCmd::BlockThis => block_this(api, store_path, now, host),
+        // The digits come from stdin, which only `main` reads: see
+        // [`pin_set`].
+        WdCmd::PinSet => Err(ActionErr::new(
+            "usage",
+            "the PIN is read from stdin: run `qnet watchdog pin set`",
+        )),
+        WdCmd::PinClear => pin_clear(api, store_path),
     }
 }
 
@@ -204,7 +246,11 @@ fn store_err(e: std::io::Error) -> ActionErr {
 }
 
 fn exempt_store_err(e: std::io::Error) -> ActionErr {
-    ActionErr::new("store", format!("could not save the exempt list: {e}"))
+    ActionErr::new("store", format!("could not save the ADS PASS list: {e}"))
+}
+
+fn pin_store_err(e: std::io::Error) -> ActionErr {
+    ActionErr::new("store", format!("could not save the panel PIN: {e}"))
 }
 
 fn policy_store_err(e: std::io::Error) -> ActionErr {
@@ -275,6 +321,68 @@ fn push(api: &mut Pihole, store_path: &Path, snap: &Snapshot) -> Pushed {
     }
 }
 
+/// How many times a push that the front panel overtook (a 409) is read again
+/// and merged before the verb gives up and says so.
+const PUSH_TRIES: usize = 3;
+
+/// What a verb knows of the Pi's lists when it pushes: the revision it read
+/// (the `if_rev` of the push) and each list as the verb found it, before its
+/// edit, when that was the Pi's pushed list too: the common ground that a
+/// panel edit that overtakes the push is merged on (see [`watchdog::rebase`]).
+#[derive(Debug, Default, Clone)]
+struct Base {
+    rev: Option<u64>,
+    exempt: Option<Vec<String>>,
+    block: Option<Vec<String>>,
+}
+
+/// The Pi's inventory, if it can be read at all.
+fn read_pi(api: &mut Pihole) -> Option<Inventory> {
+    match watchdog::get_devices(api) {
+        Ok(Qbp::Present(inv)) => Some(inv),
+        _ => None,
+    }
+}
+
+/// Whether two lists of addresses name the same devices, whatever their order.
+fn same_set(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().all(|m| b.contains(m))
+}
+
+/// The first step of a verb that edits the ADS PASS list or the block list,
+/// inside its locked edit: when the Pi's front panel changed a list since this
+/// PC pushed it, take the panel's over (the panel's edit is newer than this
+/// PC's list), so that the verb edits what the Pi has. That is when the Pi
+/// says its revision (above 0: something changed its lists since it started)
+/// and a pushed list that differs from this PC's, with no edit of this PC
+/// waiting to be pushed and no sign that the Pi started again (it still waits
+/// for a known list that this PC has). Returns what the push needs: the
+/// revision and the lists as they stand now, before the verb's edit.
+fn adopt_panel(s: &mut Store, inv: Option<&Inventory>, now: u64) -> Base {
+    let Some((inv, rev)) = inv.and_then(|inv| Some((inv, inv.rev?))) else {
+        return Base::default();
+    };
+    let restarted = inv.known_list == "waiting" && !s.known.is_empty();
+    let adoptable = rev > 0 && !restarted;
+    let mut base = Base {
+        rev: Some(rev),
+        ..Base::default()
+    };
+    if let Some(on_pi) = &inv.exempt_pushed {
+        if adoptable && !s.exempt_push_due() && !same_set(&s.exempt_macs(), on_pi) {
+            s.adopt_exempt(on_pi, now);
+        }
+        base.exempt = same_set(&s.exempt_macs(), on_pi).then(|| s.exempt_macs());
+    }
+    if let Some(on_pi) = &inv.block_pushed {
+        if adoptable && !s.policy_push_due() && !same_set(&s.block_macs(), on_pi) {
+            s.adopt_block(on_pi, now);
+        }
+        base.block = same_set(&s.block_macs(), on_pi).then(|| s.block_macs());
+    }
+    base
+}
+
 /// The exempt list as it was after an edit, like [`Snapshot`] for the known one.
 struct ExemptSnapshot {
     generation: u64,
@@ -290,22 +398,70 @@ impl ExemptSnapshot {
     }
 }
 
-/// Push the PC's exempt list to the Pi and record the push. An empty list is
+/// Push the PC's ADS PASS list to the Pi and record the push. An empty list is
 /// pushed as it is (it clears the Pi's list): these verbs are explicit edits.
-/// A 404 is "not supported", whatever the reason: the edit stays on this PC
-/// and the watcher asks again once per login session.
-fn push_exempt(api: &mut Pihole, store_path: &Path, snap: &ExemptSnapshot) -> Pushed {
-    match watchdog::put_exempt(api, &snap.macs) {
-        Ok(Qbp::Present(_)) => {
-            // If this cannot be recorded the list stays due and the watcher
-            // pushes it once more: harmless.
-            let _ = wdstore::update(store_path, |s| s.mark_exempt_pushed(snap.generation));
-            Pushed::Sent
+/// The push is made on the revision that was read (`base`); when the panel
+/// overtook it (a 409) the Pi's list is read again, this PC's edit is put on
+/// top of it and the push is made again. A 404 is "not supported", whatever the
+/// reason: the edit stays on this PC and the watcher asks again once per login
+/// session.
+fn push_exempt(
+    api: &mut Pihole,
+    store_path: &Path,
+    now: u64,
+    mut snap: ExemptSnapshot,
+    base: &Base,
+) -> Pushed {
+    let (mut rev, mut from) = (base.rev, base.exempt.clone());
+    for attempt in 1..=PUSH_TRIES {
+        match watchdog::put_exempt(api, &snap.macs, rev) {
+            Ok(ListPut::Done { .. }) => {
+                // If this cannot be recorded the list stays due and the
+                // watcher pushes it once more: harmless.
+                let _ = wdstore::update(store_path, |s| s.mark_exempt_pushed(snap.generation));
+                return Pushed::Sent;
+            }
+            Ok(ListPut::Absent) => return Pushed::Failed(UNSUPPORTED.to_string()),
+            Err(e) => return Pushed::Failed(e.message().to_string()),
+            Ok(ListPut::Stale { .. }) if attempt < PUSH_TRIES => {
+                let Some(inv) = read_pi(api) else {
+                    return Pushed::Failed(CHANGED_UNREAD.to_string());
+                };
+                let Some(current) = inv.exempt_pushed else {
+                    break;
+                };
+                if let Some(from) = from.as_mut() {
+                    let merged = watchdog::rebase(from, &snap.macs, &current);
+                    if !same_set(&merged, &snap.macs) {
+                        match wdstore::update(store_path, |s| {
+                            s.replace_exempt(&merged, now);
+                            ExemptSnapshot::of(s)
+                        }) {
+                            Ok(next) => snap = next,
+                            Err(e) => {
+                                return Pushed::Failed(format!("could not save the merge: {e}"))
+                            }
+                        }
+                    }
+                    // What the Pi has now is what the next merge starts from.
+                    *from = current;
+                }
+                rev = inv.rev;
+            }
+            Ok(ListPut::Stale { .. }) => break,
         }
-        Ok(Qbp::Absent) => Pushed::Failed(UNSUPPORTED.to_string()),
-        Err(e) => Pushed::Failed(e.message().to_string()),
     }
+    Pushed::Failed(CHANGING.to_string())
 }
+
+/// What a push says when the panel overtook it and the Pi's lists could not be
+/// read again.
+const CHANGED_UNREAD: &str = "the Pi's lists changed while this was sent (its front panel?) and \
+could not be read again; run it again";
+
+/// What a push says when the Pi's lists kept changing under it.
+const CHANGING: &str = "the Pi's lists kept changing while this was sent (its front panel?); \
+run it again";
 
 /// The policy as it was after an edit: the mode and the block list to push,
 /// and which generation that was (like [`Snapshot`]).
@@ -325,19 +481,86 @@ impl PolicySnapshot {
     }
 }
 
-/// Push the PC's policy to the Pi and record the push. The default policy is
-/// pushed as it is (it clears the Pi's): these verbs are explicit edits. A 404
-/// is "not supported", whatever the reason: the edit stays on this PC and the
-/// watcher asks again once per login session.
-fn push_policy(api: &mut Pihole, store_path: &Path, snap: &PolicySnapshot) -> Pushed {
-    match watchdog::put_policy(api, snap.exempt_default, &snap.macs) {
-        Ok(Qbp::Present(_)) => {
-            // If this cannot be recorded the policy stays due and the watcher
+/// Push the PC's policy to the Pi and record the push, as [`push_exempt`] does
+/// for the ADS PASS list: the default policy is pushed as it is (it clears the
+/// Pi's), and a push that the panel overtook is merged and made again. The mode
+/// is this PC's to say and is never merged.
+fn push_policy(
+    api: &mut Pihole,
+    store_path: &Path,
+    now: u64,
+    mut snap: PolicySnapshot,
+    base: &Base,
+) -> Pushed {
+    let (mut rev, mut from) = (base.rev, base.block.clone());
+    for attempt in 1..=PUSH_TRIES {
+        match watchdog::put_policy(api, snap.exempt_default, &snap.macs, rev) {
+            Ok(ListPut::Done { .. }) => {
+                // If this cannot be recorded the policy stays due and the
+                // watcher pushes it once more: harmless.
+                let _ = wdstore::update(store_path, |s| s.mark_policy_pushed(snap.generation));
+                return Pushed::Sent;
+            }
+            Ok(ListPut::Absent) => return Pushed::Failed(UNSUPPORTED_POLICY.to_string()),
+            Err(e) => return Pushed::Failed(e.message().to_string()),
+            Ok(ListPut::Stale { .. }) if attempt < PUSH_TRIES => {
+                let Some(inv) = read_pi(api) else {
+                    return Pushed::Failed(CHANGED_UNREAD.to_string());
+                };
+                let Some(current) = inv.block_pushed else {
+                    break;
+                };
+                if let Some(from) = from.as_mut() {
+                    let merged = watchdog::rebase(from, &snap.macs, &current);
+                    if !same_set(&merged, &snap.macs) {
+                        match wdstore::update(store_path, |s| {
+                            s.replace_block(&merged, now);
+                            PolicySnapshot::of(s)
+                        }) {
+                            Ok(next) => snap = next,
+                            Err(e) => {
+                                return Pushed::Failed(format!("could not save the merge: {e}"))
+                            }
+                        }
+                    }
+                    *from = current;
+                }
+                rev = inv.rev;
+            }
+            Ok(ListPut::Stale { .. }) => break,
+        }
+    }
+    Pushed::Failed(CHANGING.to_string())
+}
+
+/// Push the names of this PC's devices (see [`watchdog::labels_for_pi`]) to the
+/// Pi, as the lists are now. Pushed after every edit that may have changed
+/// them, also when none did. A 404 is "not supported", as for the lists.
+fn push_labels(api: &mut Pihole, store_path: &Path) -> Pushed {
+    let store = Store::load(store_path);
+    match watchdog::put_labels(api, &watchdog::labels_for_pi(&store)) {
+        Ok(Qbp::Present(_)) => Pushed::Sent,
+        Ok(Qbp::Absent) => Pushed::Failed(UNSUPPORTED_LABELS.to_string()),
+        Err(e) => Pushed::Failed(e.message().to_string()),
+    }
+}
+
+/// Push the PIN hash (or its absence) of generation `generation` to the Pi and
+/// record the push. The hash is in no error and no result.
+fn push_panel(
+    api: &mut Pihole,
+    store_path: &Path,
+    generation: u64,
+    hash: Option<&PinHash>,
+) -> Pushed {
+    match watchdog::put_panel(api, hash) {
+        Ok(Qbp::Present(())) => {
+            // If this cannot be recorded the PIN stays due and the watcher
             // pushes it once more: harmless.
-            let _ = wdstore::update(store_path, |s| s.mark_policy_pushed(snap.generation));
+            let _ = wdstore::update(store_path, |s| s.mark_pin_pushed(generation));
             Pushed::Sent
         }
-        Ok(Qbp::Absent) => Pushed::Failed(UNSUPPORTED_POLICY.to_string()),
+        Ok(Qbp::Absent) => Pushed::Failed(UNSUPPORTED_PANEL.to_string()),
         Err(e) => Pushed::Failed(e.message().to_string()),
     }
 }
@@ -390,11 +613,17 @@ pub fn ack(api: &mut Pihole, store_path: &Path, now: u64, id: u64) -> ActionResu
 // -- devices ------------------------------------------------------------------
 
 /// `watchdog devices`: the Pi's inventory, last seen first, with what this PC
-/// knows about each device (known, exempt) and what the Pi says (known,
-/// exempt), the PC's known and exempt devices the Pi did not report
-/// (`knownOffline`, `exemptOffline`), and the addresses only the Pi exempts
-/// (`exemptOnPiOnly`: they come from its config file, not from this PC's
-/// list). The exempt-by-default policy has the same two views: `exemptDefault`
+/// knows about each device (known, ADS PASS) and what the Pi says (known,
+/// ADS PASS), the PC's known and ADS PASS devices the Pi did not report
+/// (`knownOffline`, `exemptOffline`), and the addresses only the Pi passes
+/// (`exemptOnPiOnly`: they come from its config file or from its front panel,
+/// not from this PC's list). The front panel's fields are shown too: `rev`
+/// on top (the revision of the Pi's device lists, `null` when it does not
+/// say), and on each device `labelOnPi` (the name the Pi was given, `null`
+/// for none; `label` is this PC's), `gateLeftSecs` (the seconds that the
+/// panel's gate for the device stays open, `null` while shut), `fixed` (the Pi's
+/// configuration decides the device, so no edit changes it) and `always` (the
+/// router or the Pi itself: never ADS PASS). The exempt-by-default policy has the same two views: `exemptDefault`
 /// (this PC's mode) and `exemptDefaultOnPi` (the Pi's), `blockOffline` (this
 /// PC's block list minus the reported devices) and `blockOnPiOnly` (the Pi's
 /// block list minus this PC's), and `blocked`/`blockedOnPi` on every device.
@@ -455,12 +684,20 @@ pub fn devices(api: &mut Pihole, store_path: &Path) -> ActionResult {
         .collect();
     let mut list = inv.devices.clone();
     list.sort_by_key(|d| std::cmp::Reverse(d.last_unix));
-    let devices: Vec<WatchdogDeviceOut> = watchdog::annotate(list, &store)
+    let devices: Vec<Value> = watchdog::annotate(list, &store)
         .iter()
-        .map(WatchdogDeviceOut::from_report_device)
+        .map(|d| {
+            let mut out = json!(WatchdogDeviceOut::from_report_device(d));
+            out["labelOnPi"] = json!(d.device.label);
+            out["gateLeftSecs"] = json!(d.device.gate_left_secs);
+            out["fixed"] = json!(d.device.fixed);
+            out["always"] = json!(d.device.always);
+            out
+        })
         .collect();
     Ok(json!({
         "ok": true,
+        "rev": inv.rev,
         "knownList": inv.known_list,
         "devices": devices,
         "knownOffline": offline,
@@ -565,6 +802,7 @@ pub fn know(
         out["seeded"] = json!(seeded);
     }
     push(api, store_path, &snap).add_to(&mut out);
+    push_labels(api, store_path).add_as(&mut out, "labelsPushed", "labelsPushError");
     Ok(out)
 }
 
@@ -578,24 +816,28 @@ pub fn forget(api: &mut Pihole, store_path: &Path, mac: &str) -> ActionResult {
         .ok_or_else(|| ActionErr::new("not-found", "that device is not on the known list"))?;
     let mut out = json!({ "ok": true, "mac": mac, "known": snap.macs.len() });
     push(api, store_path, &snap).add_to(&mut out);
+    push_labels(api, store_path).add_as(&mut out, "labelsPushed", "labelsPushError");
     Ok(out)
 }
 
-// -- the exempt list ----------------------------------------------------------
+// -- the ADS PASS list ----------------------------------------------------------
 
-/// `watchdog exempt <mac> [label]`: put the device on this PC's exempt list
-/// (or change its label; without a label an existing one stays) and on the
-/// known list exactly as [`know`] does (the owner named it, so the Pi must
-/// not raise a new-device alert for it; the first edit on an empty known list
-/// seeds it from the Pi's, see [`seed_from_pi`]), in one locked edit, then
-/// push the known list and then the exempt list. Both are pushed on every
-/// call, also when nothing changed. Refused (`full`, nothing changed, nothing
-/// pushed) when the exempt list holds [`wdstore::MAX_EXEMPT`] devices already
-/// and this is a new one, or when the known list is full and the device is
-/// not on it. The result carries `known` and `pushed`/`pushError` for the
-/// known list as `know` does, plus `exempt` (the size of the exempt list
-/// after the edit) and `exemptPushed`/`exemptPushError` for its push (a Pi
-/// that answers 404 for it has no exempt support yet).
+/// `watchdog exempt <mac> [label]` (or `ads-pass`): put the device on this PC's
+/// ADS PASS list (or change its label; without a label an existing one stays)
+/// and on the known list exactly as [`know`] does (the owner named it, so the
+/// Pi must not raise a new-device alert for it; the first edit on an empty
+/// known list seeds it from the Pi's, see [`seed_from_pi`]), in one locked
+/// edit, then push the known list and then the ADS PASS list. Both are pushed
+/// on every call, also when nothing changed. Before the edit the Pi's own list
+/// is adopted if its front panel changed it (see [`adopt_panel`]), and the push
+/// is made on the revision that was read, merged with the panel's edit when it
+/// is overtaken (see [`push_exempt`]). Refused (`full`, nothing changed,
+/// nothing pushed) when the list holds [`wdstore::MAX_EXEMPT`] devices already
+/// and this is a new one, or when the known list is full and the device is not
+/// on it. The result carries `known` and `pushed`/`pushError` for the known
+/// list as `know` does, plus `exempt` (the size of the list after the edit)
+/// and `exemptPushed`/`exemptPushError` for its push (a Pi that answers 404
+/// for it has no ADS PASS support yet), and `labelsPushed`/`labelsPushError`.
 pub fn exempt(
     api: &mut Pihole,
     store_path: &Path,
@@ -607,12 +849,13 @@ pub fn exempt(
         normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
     let (inv, first_seen) = look_up(api, &mac, now);
     let edit = wdstore::update(store_path, |s| {
+        let base = adopt_panel(s, inv.as_ref(), now);
         // Checked before anything is touched: a refusal changes nothing.
         if !s.is_exempt(&mac) && s.exempt_is_full() {
             return Err(ActionErr::new(
                 "full",
                 format!(
-                    "the exempt list holds {} devices already",
+                    "the ADS PASS list holds {} devices already",
                     wdstore::MAX_EXEMPT
                 ),
             ));
@@ -634,10 +877,10 @@ pub fn exempt(
             .iter()
             .find(|k| k.mac == mac)
             .and_then(|k| k.label.clone());
-        Ok((Snapshot::of(s), ExemptSnapshot::of(s), label, seeded))
+        Ok((Snapshot::of(s), ExemptSnapshot::of(s), label, seeded, base))
     })
     .map_err(exempt_store_err)??;
-    let (known, exempt, label, seeded) = edit;
+    let (known, exempt, label, seeded, base) = edit;
     let mut out = json!({
         "ok": true, "mac": mac, "known": known.macs.len(), "exempt": exempt.macs.len(),
     });
@@ -648,23 +891,38 @@ pub fn exempt(
         out["seeded"] = json!(seeded);
     }
     push(api, store_path, &known).add_to(&mut out);
-    push_exempt(api, store_path, &exempt).add_as(&mut out, "exemptPushed", "exemptPushError");
+    push_exempt(api, store_path, now, exempt, &base).add_as(
+        &mut out,
+        "exemptPushed",
+        "exemptPushError",
+    );
+    push_labels(api, store_path).add_as(&mut out, "labelsPushed", "labelsPushError");
     Ok(out)
 }
 
-/// `watchdog unexempt <mac>`: take the device off this PC's exempt list, then
-/// push that list (an emptied list is pushed too: this is an explicit edit).
-/// The device stays on the known list, which is not touched or pushed.
-pub fn unexempt(api: &mut Pihole, store_path: &Path, mac: &str) -> ActionResult {
+/// `watchdog unexempt <mac>` (or `ads-block`): take the device off this PC's
+/// ADS PASS list, then push that list (an emptied list is pushed too: this is
+/// an explicit edit). The device stays on the known list, which is not touched
+/// or pushed. The Pi's own list is adopted first when its front panel changed
+/// it, as for [`exempt`], so a device that the panel took off the list already
+/// is `not-found`.
+pub fn unexempt(api: &mut Pihole, store_path: &Path, now: u64, mac: &str) -> ActionResult {
     let mac =
         normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
-    let snap = wdstore::update(store_path, |s| {
-        s.remove_exempt(&mac).then(|| ExemptSnapshot::of(s))
+    let inv = read_pi(api);
+    let (snap, base) = wdstore::update(store_path, |s| {
+        let base = adopt_panel(s, inv.as_ref(), now);
+        s.remove_exempt(&mac).then(|| (ExemptSnapshot::of(s), base))
     })
     .map_err(exempt_store_err)?
-    .ok_or_else(|| ActionErr::new("not-found", "that device is not on the exempt list"))?;
+    .ok_or_else(|| ActionErr::new("not-found", "that device is not on the ADS PASS list"))?;
     let mut out = json!({ "ok": true, "mac": mac, "exempt": snap.macs.len() });
-    push_exempt(api, store_path, &snap).add_as(&mut out, "exemptPushed", "exemptPushError");
+    push_exempt(api, store_path, now, snap, &base).add_as(
+        &mut out,
+        "exemptPushed",
+        "exemptPushError",
+    );
+    push_labels(api, store_path).add_as(&mut out, "labelsPushed", "labelsPushError");
     Ok(out)
 }
 
@@ -674,23 +932,30 @@ pub fn unexempt(api: &mut Pihole, store_path: &Path, mac: &str) -> ActionResult 
 /// policy (the mode and the block list). It pushes on every call, also when
 /// nothing changed (so a Pi that lost the policy gets it, and a PC that wants
 /// the default policy on the Pi can say so). Turning it on warns, in `note`,
-/// that every device that is not on the block list skips ad blocking from
-/// then on (threat blocking stays). The block list is not touched: it is kept
-/// while the mode is off, for the next time. The result is `{"ok":true,
+/// that every device that is not on the block list has ADS PASS from then on
+/// (threat blocking stays). The block list is not touched: it is kept while the
+/// mode is off, for the next time (but for what the Pi's front panel changed
+/// of it, which is adopted first, as for [`exempt`]). The result is `{"ok":true,
 /// "exemptDefault":bool,"block":n,"policyPushed":bool,"policyPushError"?,
 /// "note"?}`; a 404 is reported as not supported (the edit stays and the
 /// watcher asks again once per login session).
-pub fn exempt_default(api: &mut Pihole, store_path: &Path, on: bool) -> ActionResult {
-    let snap = wdstore::update(store_path, |s| {
+pub fn exempt_default(api: &mut Pihole, store_path: &Path, now: u64, on: bool) -> ActionResult {
+    let inv = read_pi(api);
+    let (snap, base) = wdstore::update(store_path, |s| {
+        let base = adopt_panel(s, inv.as_ref(), now);
         s.set_exempt_default(on);
-        PolicySnapshot::of(s)
+        (PolicySnapshot::of(s), base)
     })
     .map_err(policy_store_err)?;
     let mut out = json!({ "ok": true, "exemptDefault": on, "block": snap.macs.len() });
     if on {
         out["note"] = json!(EXEMPT_DEFAULT_NOTE);
     }
-    push_policy(api, store_path, &snap).add_as(&mut out, "policyPushed", "policyPushError");
+    push_policy(api, store_path, now, snap, &base).add_as(
+        &mut out,
+        "policyPushed",
+        "policyPushError",
+    );
     Ok(out)
 }
 
@@ -698,17 +963,19 @@ pub fn exempt_default(api: &mut Pihole, store_path: &Path, on: bool) -> ActionRe
 /// change its label; without a label an existing one stays) and on the known
 /// list exactly as [`know`] does (the owner named it, so the Pi must not raise
 /// a new-device alert for it; the first edit on an empty known list seeds it
-/// from the Pi's, see [`seed_from_pi`]), and take it off the exempt list if it
+/// from the Pi's, see [`seed_from_pi`]), and take it off the ADS PASS list if it
 /// is there (a device is not both), in one locked edit. Then push the known
-/// list, the exempt list (only when the device was taken off it) and the
+/// list, the ADS PASS list (only when the device was taken off it) and the
 /// policy. Pushes on every call, also when nothing changed. Refused (`full`,
 /// nothing changed, nothing pushed) when the block list holds
 /// [`wdstore::MAX_BLOCK`] devices already and this is a new one, or when the
 /// known list is full and the device is not on it. The result carries `known`
 /// and `pushed`/`pushError` as `know` does, `block` (the size of the block list
 /// after the edit) and `policyPushed`/`policyPushError`, and when the device
-/// was exempt `unexempted: true`, `exempt` and `exemptPushed`/`exemptPushError`.
-/// Every push has its own keys, so one failing never hides another.
+/// was on the ADS PASS list `unexempted: true`, `exempt` and
+/// `exemptPushed`/`exemptPushError`, and `labelsPushed`/`labelsPushError`.
+/// Every push has its own keys, so one failing never hides another. The Pi's
+/// own lists are adopted first, and the pushes merged, as for [`exempt`].
 pub fn block(
     api: &mut Pihole,
     store_path: &Path,
@@ -720,6 +987,7 @@ pub fn block(
         normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
     let (inv, first_seen) = look_up(api, &mac, now);
     let edit = wdstore::update(store_path, |s| {
+        let base = adopt_panel(s, inv.as_ref(), now);
         // Checked before anything is touched: a refusal changes nothing.
         if !s.is_blocked(&mac) && s.block_is_full() {
             return Err(ActionErr::new(
@@ -754,6 +1022,7 @@ pub fn block(
             policy: PolicySnapshot::of(s),
             label,
             seeded,
+            base,
         })
     })
     .map_err(policy_store_err)??;
@@ -771,36 +1040,94 @@ pub fn block(
         out["exempt"] = json!(e.macs.len());
     }
     push(api, store_path, &edit.known).add_to(&mut out);
-    if let Some(e) = &edit.exempt {
-        push_exempt(api, store_path, e).add_as(&mut out, "exemptPushed", "exemptPushError");
+    if let Some(e) = edit.exempt {
+        push_exempt(api, store_path, now, e, &edit.base).add_as(
+            &mut out,
+            "exemptPushed",
+            "exemptPushError",
+        );
     }
-    push_policy(api, store_path, &edit.policy).add_as(&mut out, "policyPushed", "policyPushError");
+    push_policy(api, store_path, now, edit.policy, &edit.base).add_as(
+        &mut out,
+        "policyPushed",
+        "policyPushError",
+    );
+    push_labels(api, store_path).add_as(&mut out, "labelsPushed", "labelsPushError");
     Ok(out)
 }
 
 /// What one locked edit of [`block`] leaves to push and to report.
 struct BlockEdit {
     known: Snapshot,
-    /// Set when the device was taken off the exempt list.
+    /// Set when the device was taken off the ADS PASS list.
     exempt: Option<ExemptSnapshot>,
     policy: PolicySnapshot,
     label: Option<String>,
     seeded: u64,
+    base: Base,
 }
 
 /// `watchdog unblock <mac>`: take the device off this PC's block list, then
 /// push the policy (an emptied list is pushed too: this is an explicit edit).
 /// The device stays on the known list, which is neither changed nor pushed.
-pub fn unblock(api: &mut Pihole, store_path: &Path, mac: &str) -> ActionResult {
+/// The Pi's own list is adopted first, as for [`exempt`].
+pub fn unblock(api: &mut Pihole, store_path: &Path, now: u64, mac: &str) -> ActionResult {
     let mac =
         normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
-    let snap = wdstore::update(store_path, |s| {
-        s.remove_block(&mac).then(|| PolicySnapshot::of(s))
+    let inv = read_pi(api);
+    let (snap, base) = wdstore::update(store_path, |s| {
+        let base = adopt_panel(s, inv.as_ref(), now);
+        s.remove_block(&mac).then(|| (PolicySnapshot::of(s), base))
     })
     .map_err(policy_store_err)?
     .ok_or_else(|| ActionErr::new("not-found", "that device is not on the block list"))?;
     let mut out = json!({ "ok": true, "mac": mac, "block": snap.macs.len() });
-    push_policy(api, store_path, &snap).add_as(&mut out, "policyPushed", "policyPushError");
+    push_policy(api, store_path, now, snap, &base).add_as(
+        &mut out,
+        "policyPushed",
+        "policyPushError",
+    );
+    push_labels(api, store_path).add_as(&mut out, "labelsPushed", "labelsPushError");
+    Ok(out)
+}
+
+// -- the panel's PIN ----------------------------------------------------------
+
+/// `watchdog pin set`, once `main` has read the four digits from stdin and made
+/// the hash (see [`crate::pinhash`]): keep the hash (nothing of the digits is
+/// kept) and push it to the Pi with `PUT /api/qbp/panel`, for the running boot;
+/// the watcher pushes it again after each start of the Pi, and when this push
+/// fails. The result is `{"ok":true,"pin":"set","panelPushed":bool,
+/// "panelPushError"?}`: no digit and no hash is in it, or in any error.
+pub fn pin_set(api: &mut Pihole, store_path: &Path, hash: PinHash) -> ActionResult {
+    let generation = wdstore::update(store_path, |s| {
+        s.set_pin(hash.clone());
+        s.pin_gen
+    })
+    .map_err(pin_store_err)?;
+    let mut out = json!({ "ok": true, "pin": "set" });
+    push_panel(api, store_path, generation, Some(&hash)).add_as(
+        &mut out,
+        "panelPushed",
+        "panelPushError",
+    );
+    Ok(out)
+}
+
+/// `watchdog pin clear`: forget the hash on this PC and push `null`, which
+/// takes the PIN off the Pi for the running boot (also one that was set at its
+/// panel). It pushes on every call, also when this PC had none. The result is
+/// `{"ok":true,"pin":"cleared","panelPushed":bool,"panelPushError"?,"note"}`;
+/// the note says that a PIN in the Pi's own configuration comes back when it
+/// restarts, which only the Pi's configuration changes.
+pub fn pin_clear(api: &mut Pihole, store_path: &Path) -> ActionResult {
+    let generation = wdstore::update(store_path, |s| {
+        s.clear_pin();
+        s.pin_gen
+    })
+    .map_err(pin_store_err)?;
+    let mut out = json!({ "ok": true, "pin": "cleared", "note": PIN_CLEAR_NOTE });
+    push_panel(api, store_path, generation, None).add_as(&mut out, "panelPushed", "panelPushError");
     Ok(out)
 }
 
@@ -967,6 +1294,23 @@ mod tests {
     // Test data uses documentation addresses (192.0.2.x) and locally
     // administered MACs (02:00:00:…) only.
 
+    /// A verb's result without the names' push (`labelsPushed`,
+    /// `labelsPushError`), which the tests of the lists leave to their own.
+    fn bare(mut result: ActionResult) -> ActionResult {
+        if let Ok(v) = &mut result {
+            let out = v.as_object_mut().unwrap();
+            out.remove("labelsPushed");
+            out.remove("labelsPushError");
+        }
+        result
+    }
+
+    /// A push body without its `if_rev` (the Pi's revision when it was read).
+    fn without_if_rev(mut body: Value) -> Value {
+        body.as_object_mut().unwrap().remove("if_rev");
+        body
+    }
+
     /// A fake Pi, a client for it and a temporary store.
     struct Rig {
         pi: FakePi,
@@ -1003,11 +1347,11 @@ mod tests {
         }
         fn know(&mut self, mac: &str, label: Option<&str>) -> ActionResult {
             let path = self.path();
-            know(&mut self.api, &path, T0 + 999, mac, label)
+            bare(know(&mut self.api, &path, T0 + 999, mac, label))
         }
         fn forget(&mut self, mac: &str) -> ActionResult {
             let path = self.path();
-            forget(&mut self.api, &path, mac)
+            bare(forget(&mut self.api, &path, mac))
         }
         fn know_all(&mut self) -> ActionResult {
             let path = self.path();
@@ -1211,7 +1555,7 @@ mod tests {
             s.known = vec![mac(2)];
             s.known_list = "learned";
         });
-        let v = rig.devices().unwrap();
+        let v = without_panel_fields(rig.devices().unwrap());
         // The fake lists oldest first; the answer is last seen first.
         assert_eq!(
             v,
@@ -1257,6 +1601,19 @@ mod tests {
         assert_eq!(v["devices"].as_array().unwrap().len(), 300);
         assert_eq!(v["knownOffline"], json!([]));
         assert_eq!(v["exemptOffline"], json!([]));
+    }
+
+    /// A `devices` result without the front panel's fields: `rev` on top, and
+    /// `labelOnPi`, `gateLeftSecs`, `fixed` and `always` on every device.
+    fn without_panel_fields(mut v: Value) -> Value {
+        v.as_object_mut().unwrap().remove("rev");
+        for d in v["devices"].as_array_mut().unwrap() {
+            let d = d.as_object_mut().unwrap();
+            for key in ["labelOnPi", "gateLeftSecs", "fixed", "always"] {
+                d.remove(key);
+            }
+        }
+        v
     }
 
     // -- know -----------------------------------------------------------------
@@ -1704,18 +2061,24 @@ mod tests {
 
     // -- exempt and unexempt ---------------------------------------------------
 
-    const UNSUPPORTED: &str = "the Pi's software does not support exempt devices yet";
+    const UNSUPPORTED: &str = "the Pi's software does not support ADS PASS devices yet";
 
     impl Rig {
         fn exempt(&mut self, mac: &str, label: Option<&str>) -> ActionResult {
             let path = self.path();
-            exempt(&mut self.api, &path, T0 + 999, mac, label)
+            bare(exempt(&mut self.api, &path, T0 + 999, mac, label))
         }
         fn unexempt(&mut self, mac: &str) -> ActionResult {
             let path = self.path();
-            unexempt(&mut self.api, &path, mac)
+            bare(unexempt(&mut self.api, &path, T0, mac))
         }
         fn exempt_puts(&self) -> Vec<Value> {
+            self.exempt_puts_raw()
+                .into_iter()
+                .map(without_if_rev)
+                .collect()
+        }
+        fn exempt_puts_raw(&self) -> Vec<Value> {
             self.pi.with(|s| s.exempt_puts.clone())
         }
         fn pi_exempt(&self) -> Vec<String> {
@@ -1837,7 +2200,7 @@ mod tests {
         let e = err(rig.exempt(&mac(5000), Some("One too many")));
         assert_eq!(e.code, "full");
         assert!(
-            e.detail.contains("exempt") && e.detail.contains("64"),
+            e.detail.contains("ADS PASS") && e.detail.contains("64"),
             "{}",
             e.detail
         );
@@ -2018,14 +2381,20 @@ mod tests {
     }
 
     #[test]
-    fn unexempt_of_a_device_that_is_not_listed_is_not_found_and_makes_no_request() {
+    fn unexempt_of_a_device_that_is_not_listed_is_not_found_and_pushes_nothing() {
         let mut rig = Rig::new();
         rig.exempt(&mac(1), None).unwrap();
         let before = rig.pi.with(|s| s.log.len());
         let e = err(rig.unexempt(&mac(2)));
         assert_eq!(e.code, "not-found");
-        assert!(e.detail.contains("exempt"), "{}", e.detail);
-        assert_eq!(rig.pi.with(|s| s.log.len()), before);
+        assert!(e.detail.contains("ADS PASS"), "{}", e.detail);
+        // It looked at the Pi's list first (the front panel may have put the
+        // device on it), and that is all.
+        assert_eq!(rig.pi.with(|s| s.log.len()), before + 1);
+        assert_eq!(
+            rig.pi.with(|s| s.log.last().cloned()).as_deref(),
+            Some("GET /api/qbp/devices HTTP/1.1")
+        );
         assert_eq!(rig.store().exempt_macs(), vec![mac(1)]);
         // Known but not exempt is just as not found.
         rig.know(&mac(3), None).unwrap();
@@ -2038,8 +2407,8 @@ mod tests {
         let bad = unwritable(rig.dir.path());
         let e = exempt(&mut rig.api, &bad, T0, &mac(1), None).unwrap_err();
         assert_eq!(e.code, "store");
-        assert!(e.detail.contains("exempt list"), "{}", e.detail);
-        let e = unexempt(&mut rig.api, &bad, &mac(1)).unwrap_err();
+        assert!(e.detail.contains("ADS PASS list"), "{}", e.detail);
+        let e = unexempt(&mut rig.api, &bad, T0, &mac(1)).unwrap_err();
         assert_eq!(e.code, "store");
         assert!(rig.known_puts().is_empty() && rig.exempt_puts().is_empty());
     }
@@ -2140,17 +2509,23 @@ mod tests {
     impl Rig {
         fn exempt_default(&mut self, on: bool) -> ActionResult {
             let path = self.path();
-            exempt_default(&mut self.api, &path, on)
+            bare(exempt_default(&mut self.api, &path, T0, on))
         }
         fn block(&mut self, mac: &str, label: Option<&str>) -> ActionResult {
             let path = self.path();
-            block(&mut self.api, &path, T0 + 999, mac, label)
+            bare(block(&mut self.api, &path, T0 + 999, mac, label))
         }
         fn unblock(&mut self, mac: &str) -> ActionResult {
             let path = self.path();
-            unblock(&mut self.api, &path, mac)
+            bare(unblock(&mut self.api, &path, T0, mac))
         }
         fn policy_puts(&self) -> Vec<Value> {
+            self.policy_puts_raw()
+                .into_iter()
+                .map(without_if_rev)
+                .collect()
+        }
+        fn policy_puts_raw(&self) -> Vec<Value> {
             self.pi.with(|s| s.policy_puts.clone())
         }
         fn pi_block(&self) -> Vec<String> {
@@ -2172,7 +2547,7 @@ mod tests {
         let v = rig.exempt_default(true).unwrap();
         let note = v["note"].as_str().expect("a note").to_string();
         assert!(
-            note.contains("block list") && note.contains("ad blocking") && note.contains("threat"),
+            note.contains("block list") && note.contains("ADS PASS") && note.contains("threat"),
             "{note}"
         );
         assert_eq!(
@@ -2542,14 +2917,22 @@ mod tests {
     }
 
     #[test]
-    fn unblock_of_a_device_that_is_not_listed_is_not_found_and_makes_no_request() {
+    fn unblock_of_a_device_that_is_not_listed_is_not_found_and_pushes_nothing() {
         let mut rig = Rig::new();
         rig.block(&mac(1), None).unwrap();
         let before = rig.pi.with(|s| s.log.len());
         let e = err(rig.unblock(&mac(2)));
         assert_eq!(e.code, "not-found");
         assert!(e.detail.contains("block"), "{}", e.detail);
-        assert_eq!(rig.pi.with(|s| s.log.len()), before);
+        assert_eq!(
+            rig.pi.with(|s| s.log.len()),
+            before + 1,
+            "it read the Pi's list, as unexempt does"
+        );
+        assert_eq!(
+            rig.pi.with(|s| s.log.last().cloned()).as_deref(),
+            Some("GET /api/qbp/devices HTTP/1.1")
+        );
         assert_eq!(rig.store().block_macs(), vec![mac(1)]);
         // Known (or exempt) but not blocked is just as not found.
         rig.exempt(&mac(3), None).unwrap();
@@ -2560,12 +2943,12 @@ mod tests {
     fn the_policy_verbs_need_a_writable_store_and_push_nothing_without_one() {
         let mut rig = Rig::new();
         let bad = unwritable(rig.dir.path());
-        let e = exempt_default(&mut rig.api, &bad, true).unwrap_err();
+        let e = exempt_default(&mut rig.api, &bad, T0, true).unwrap_err();
         assert_eq!(e.code, "store");
         assert!(e.detail.contains("policy"), "{}", e.detail);
         let e = block(&mut rig.api, &bad, T0, &mac(1), None).unwrap_err();
         assert_eq!(e.code, "store");
-        let e = unblock(&mut rig.api, &bad, &mac(1)).unwrap_err();
+        let e = unblock(&mut rig.api, &bad, T0, &mac(1)).unwrap_err();
         assert_eq!(e.code, "store");
         assert!(rig.known_puts().is_empty() && rig.policy_puts().is_empty());
     }
@@ -2645,7 +3028,7 @@ mod tests {
     impl Rig {
         fn block_this(&mut self, host: &FakeHost) -> ActionResult {
             let path = self.path();
-            block_this(&mut self.api, &path, T0 + 999, &host.files())
+            bare(block_this(&mut self.api, &path, T0 + 999, &host.files()))
         }
     }
 
@@ -2978,6 +3361,7 @@ mod tests {
             go(WdCmd::ExemptDefault { on: false })["exemptDefault"],
             false
         );
+        assert_eq!(go(WdCmd::PinClear)["pin"], "cleared");
     }
 
     #[test]
@@ -2992,5 +3376,436 @@ mod tests {
             (json!(mac(7)), json!("eth0"))
         );
         assert_eq!(rig.pi_block(), vec![mac(7)]);
+    }
+
+    // -- ADS PASS aliases, the front panel's fields, adoption, the PIN -----------
+
+    #[test]
+    fn ads_pass_and_ads_block_are_the_exempt_and_unexempt_verbs() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse(&words(&["ads-pass", &mac(1), "Smart", "TV"])),
+            parse(&words(&["exempt", &mac(1), "Smart", "TV"]))
+        );
+        assert_eq!(
+            parse(&words(&["ads-pass", &mac(1)])),
+            Ok(WdCmd::Exempt {
+                mac: mac(1),
+                label: None
+            })
+        );
+        assert_eq!(
+            parse(&words(&["ads-block", &mac(1)])),
+            parse(&words(&["unexempt", &mac(1)]))
+        );
+        assert_eq!(
+            parse(&words(&["ads-block", "nonsense"])).unwrap_err().code,
+            "invalid"
+        );
+        assert_eq!(parse(&words(&["ads-pass"])).unwrap_err().code, "usage");
+        assert_eq!(
+            parse(&words(&["ads-block", &mac(1), "extra"]))
+                .unwrap_err()
+                .code,
+            "usage"
+        );
+    }
+
+    #[test]
+    fn the_pin_verbs_take_no_argument_so_the_digits_are_never_on_the_command_line() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse(&words(&["pin", "set"])), Ok(WdCmd::PinSet));
+        assert_eq!(parse(&words(&["pin", "clear"])), Ok(WdCmd::PinClear));
+        for bad in [
+            &["pin"][..],
+            &["pin", "set", "1234"],
+            &["pin", "1234"],
+            &["pin", "clear", "x"],
+        ] {
+            let e = parse(&words(bad)).unwrap_err();
+            assert_eq!(e.code, "usage");
+            assert!(!e.detail.contains("1234"), "{}", e.detail);
+        }
+        // `run` has no digits to hash: it says where they come from.
+        let mut rig = Rig::new();
+        let path = rig.path();
+        let e = run(&mut rig.api, &path, T0, &WdCmd::PinSet).unwrap_err();
+        assert_eq!(e.code, "usage");
+        assert_eq!(rig.pi.qbp_requests(), 0);
+    }
+
+    #[test]
+    fn the_usage_names_the_new_words_and_no_pin_argument() {
+        assert!(USAGE.contains("ads-pass") && USAGE.contains("ads-block"));
+        assert!(USAGE.contains("pin set|clear") && !USAGE.contains("pin set <"));
+    }
+
+    #[test]
+    fn devices_shows_the_front_panels_fields_and_the_revision() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| {
+            s.dev_rev = 7;
+            s.labels = vec![(mac(2), "Desk PC".to_string())];
+            s.gates = vec![(mac(3), 240)];
+            s.exempt_config = vec![mac(1)];
+        });
+        let v = rig.devices().unwrap();
+        assert_eq!(v["rev"], 7);
+        let by_mac = |m: &str| {
+            v["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["mac"] == m)
+                .unwrap()
+                .clone()
+        };
+        let (a, b, c) = (by_mac(&mac(1)), by_mac(&mac(2)), by_mac(&mac(3)));
+        assert_eq!(
+            (
+                &a["labelOnPi"],
+                &a["gateLeftSecs"],
+                &a["fixed"],
+                &a["always"]
+            ),
+            (&json!(null), &json!(null), &json!(true), &json!(false))
+        );
+        assert_eq!(b["labelOnPi"], "Desk PC");
+        assert_eq!(b["label"], "", "label is this PC's, labelOnPi the Pi's");
+        assert_eq!(
+            (&c["gateLeftSecs"], &c["exempt"], &c["exemptOnPi"]),
+            (&json!(240), &json!(false), &json!(true))
+        );
+        // From a Pi from before the front panel: nothing, said as null and false.
+        let mut old = Rig::on(FakePi::without_panel(20));
+        let v = old.devices().unwrap();
+        assert_eq!(v["rev"], json!(null));
+        for d in v["devices"].as_array().unwrap() {
+            assert_eq!(
+                (
+                    &d["labelOnPi"],
+                    &d["gateLeftSecs"],
+                    &d["fixed"],
+                    &d["always"]
+                ),
+                (&json!(null), &json!(null), &json!(false), &json!(false))
+            );
+        }
+    }
+
+    #[test]
+    fn exempt_starts_from_the_list_the_panel_changed_and_does_not_overwrite_it() {
+        let mut rig = Rig::new();
+        rig.exempt(&mac(1), None).unwrap();
+        rig.exempt(&mac(2), None).unwrap();
+        // The panel takes 1 off and puts 9 on.
+        rig.pi.panel_ads_pass(&mac(1), false);
+        rig.pi.panel_ads_pass(&mac(9), true);
+        let v = rig.exempt(&mac(3), Some("Camera")).unwrap();
+        assert_eq!(v["exempt"], 3);
+        assert_eq!(
+            rig.pi_exempt(),
+            vec![mac(2), mac(3), mac(9)],
+            "the panel's edits are in"
+        );
+        assert_eq!(rig.store().exempt_macs(), vec![mac(2), mac(9), mac(3)]);
+        assert!(!rig.store().exempt_push_due());
+        assert_eq!(rig.pi.with(|s| s.conflicts), 0);
+        // The push was made on the revision that was read.
+        let body = rig.exempt_puts_raw().pop().unwrap();
+        assert!(body["if_rev"].is_u64());
+    }
+
+    #[test]
+    fn unexempt_takes_a_device_off_the_panels_list_and_not_found_for_what_the_panel_took_off() {
+        let mut rig = Rig::new();
+        rig.exempt(&mac(1), None).unwrap();
+        rig.pi.panel_ads_pass(&mac(9), true);
+        // 9 is on the Pi's list only: adopted first, then taken off.
+        let v = rig.unexempt(&mac(9)).unwrap();
+        assert_eq!(v["exempt"], 1);
+        assert_eq!(rig.pi_exempt(), vec![mac(1)]);
+        // What the panel took off already is not on the list any more.
+        rig.pi.panel_ads_pass(&mac(1), false);
+        assert_eq!(err(rig.unexempt(&mac(1))).code, "not-found");
+        assert!(rig.store().exempt.is_empty(), "adopted all the same");
+        assert_eq!(rig.pi_exempt(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_push_that_the_panel_overtakes_is_read_again_and_merged_not_overwritten() {
+        let mut rig = Rig::new();
+        rig.exempt(&mac(1), None).unwrap();
+        // After this command read the Pi's lists the panel puts 9 on: the push is
+        // refused once, the list is read again and this command's 5 goes on top.
+        rig.pi.with(|s| s.taps_after_next_get.push((mac(9), true)));
+        let v = rig.exempt(&mac(5), None).unwrap();
+        assert_eq!(rig.pi.with(|s| s.conflicts), 1);
+        assert_eq!(v["exemptPushed"], true);
+        assert!(v.get("exemptPushError").is_none());
+        assert_eq!(
+            rig.pi_exempt(),
+            vec![mac(1), mac(5), mac(9)],
+            "both edits stand"
+        );
+        assert_eq!(rig.store().exempt_macs(), vec![mac(1), mac(5), mac(9)]);
+        assert!(
+            !rig.store().exempt_push_due(),
+            "and the merge is recorded as pushed"
+        );
+        // The same for taking one off.
+        rig.pi.with(|s| s.taps_after_next_get.push((mac(1), false)));
+        rig.unexempt(&mac(5)).unwrap();
+        assert_eq!(rig.pi.with(|s| s.conflicts), 2);
+        assert_eq!(
+            rig.pi_exempt(),
+            vec![mac(9)],
+            "the panel's removal and this one both stand"
+        );
+        assert_eq!(rig.store().exempt_macs(), vec![mac(9)]);
+    }
+
+    #[test]
+    fn a_push_that_the_panel_keeps_overtaking_is_given_up_and_reported() {
+        let mut rig = Rig::new();
+        rig.exempt(&mac(1), None).unwrap();
+        rig.pi.with(|s| s.churn = true);
+        let v = rig.exempt(&mac(5), None).unwrap();
+        assert_eq!(rig.pi.with(|s| s.conflicts), 3);
+        assert_eq!(v["exemptPushed"], false);
+        let why = v["exemptPushError"].as_str().unwrap();
+        assert!(
+            why.contains("kept changing") && why.contains("run it again"),
+            "{why}"
+        );
+        // The edit stays, due, for the watcher; the ok is still true.
+        assert_eq!(v["ok"], true);
+        assert!(rig.store().is_exempt(&mac(5)) && rig.store().exempt_push_due());
+    }
+
+    #[test]
+    fn block_and_exempt_default_adopt_the_panels_block_list_and_merge_a_race() {
+        let mut rig = Rig::new();
+        rig.exempt_default(true).unwrap();
+        rig.block(&mac(1), None).unwrap();
+        // In that mode the panel's BLOCK ADS puts a device on the block list.
+        rig.pi.panel_ads_pass(&mac(2), false);
+        let v = rig.block(&mac(3), None).unwrap();
+        assert_eq!(v["block"], 3);
+        assert_eq!(rig.pi_block(), vec![mac(1), mac(2), mac(3)]);
+        // A race: the panel takes 1 off after the read.
+        rig.pi.with(|s| s.taps_after_next_get.push((mac(1), true)));
+        let v = rig.block(&mac(4), None).unwrap();
+        assert_eq!(v["policyPushed"], true);
+        assert_eq!(rig.pi.with(|s| s.conflicts), 1);
+        assert_eq!(rig.pi_block(), vec![mac(2), mac(3), mac(4)]);
+        assert_eq!(rig.store().block_macs(), vec![mac(2), mac(3), mac(4)]);
+        // The mode is this PC's: turned off here, the Pi follows.
+        rig.exempt_default(false).unwrap();
+        assert!(!rig.pi.with(|s| s.exempt_default));
+        let body = rig.policy_puts_raw().pop().unwrap();
+        assert!(body["if_rev"].is_u64());
+    }
+
+    #[test]
+    fn a_pi_that_just_started_again_is_not_read_as_a_panel_that_emptied_the_lists() {
+        let mut rig = Rig::new();
+        rig.exempt(&mac(1), None).unwrap();
+        rig.exempt(&mac(2), None).unwrap();
+        rig.pi.reboot();
+        // The Pi waits for the known list that this PC has: its empty list is
+        // no edit of the panel, and this PC's list is the one to push.
+        rig.pi.panel_ads_pass(&mac(9), true);
+        let v = rig.exempt(&mac(3), None).unwrap();
+        assert_eq!(v["exempt"], 3);
+        assert_eq!(rig.store().exempt_macs(), vec![mac(1), mac(2), mac(3)]);
+        assert_eq!(rig.pi_exempt(), vec![mac(1), mac(2), mac(3)]);
+    }
+
+    #[test]
+    fn an_edit_that_is_waiting_is_not_given_up_for_the_panels_list() {
+        let mut rig = Rig::new();
+        rig.exempt(&mac(1), None).unwrap();
+        // A command whose push failed left an edit due; the panel changed the list too.
+        rig.pi.with(|s| s.fail_exempt = true);
+        rig.exempt(&mac(2), None).unwrap();
+        rig.pi.with(|s| s.fail_exempt = false);
+        rig.pi.panel_ads_pass(&mac(9), true);
+        assert!(rig.store().exempt_push_due());
+        rig.exempt(&mac(3), None).unwrap();
+        assert_eq!(rig.store().exempt_macs(), vec![mac(1), mac(2), mac(3)]);
+        assert_eq!(rig.pi_exempt(), vec![mac(1), mac(2), mac(3)]);
+    }
+
+    #[test]
+    fn a_pi_from_before_the_front_panel_gets_pushes_without_if_rev() {
+        let mut rig = Rig::on(FakePi::without_panel(20));
+        let v = rig.exempt(&mac(1), None).unwrap();
+        assert_eq!(v["exemptPushed"], true);
+        assert_eq!(rig.exempt_puts_raw(), vec![json!({"exempt": [mac(1)]})]);
+        rig.block(&mac(2), None).unwrap();
+        assert_eq!(rig.policy_puts_raw(), vec![policy_body(false, &[mac(2)])]);
+    }
+
+    #[test]
+    fn the_verbs_push_the_labels_after_the_lists_and_say_so() {
+        let mut rig = Rig::new();
+        let path = rig.path();
+        let v = exempt(&mut rig.api, &path, T0, &mac(2), Some("Smart TV")).unwrap();
+        assert_eq!(v["labelsPushed"], true);
+        assert!(v.get("labelsPushError").is_none());
+        assert_eq!(
+            rig.pi.with(|s| s.labels.clone()),
+            vec![(mac(2), "Smart TV".to_string())]
+        );
+        let known = rig.pi.with(|s| {
+            s.log
+                .iter()
+                .position(|l| l.starts_with("PUT /api/qbp/devices/known"))
+        });
+        let exempt_at = rig.pi.with(|s| {
+            s.log
+                .iter()
+                .position(|l| l.starts_with("PUT /api/qbp/devices/exempt"))
+        });
+        let labels = rig.pi.with(|s| {
+            s.log
+                .iter()
+                .position(|l| l.starts_with("PUT /api/qbp/devices/labels"))
+        });
+        assert!(known < exempt_at && exempt_at < labels);
+        let v = know(&mut rig.api, &path, T0, &mac(5), Some("Printer")).unwrap();
+        assert_eq!(v["labelsPushed"], true);
+        assert_eq!(rig.pi.with(|s| s.labels.len()), 2);
+        let v = forget(&mut rig.api, &path, &mac(5)).unwrap();
+        assert_eq!(v["labelsPushed"], true);
+        assert_eq!(
+            rig.pi.with(|s| s.labels.clone()),
+            vec![(mac(2), "Smart TV".to_string())]
+        );
+        let v = block(&mut rig.api, &path, T0, &mac(6), Some("Guest")).unwrap();
+        assert_eq!(v["labelsPushed"], true);
+        let v = unblock(&mut rig.api, &path, T0, &mac(6)).unwrap();
+        assert_eq!(v["labelsPushed"], true);
+        let v = unexempt(&mut rig.api, &path, T0, &mac(2)).unwrap();
+        assert_eq!(v["labelsPushed"], true);
+        assert_eq!(
+            rig.pi.with(|s| s.labels.len()),
+            2,
+            "the names stay with the known list"
+        );
+    }
+
+    #[test]
+    fn a_failing_or_unsupported_labels_push_is_reported_on_its_own_and_stops_nothing() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| s.fail_labels = true);
+        let path = rig.path();
+        let v = exempt(&mut rig.api, &path, T0, &mac(2), Some("TV")).unwrap();
+        assert_eq!(
+            (
+                v["ok"].clone(),
+                v["pushed"].clone(),
+                v["exemptPushed"].clone()
+            ),
+            (json!(true), json!(true), json!(true))
+        );
+        assert_eq!(v["labelsPushed"], false);
+        assert!(v["labelsPushError"].as_str().unwrap().contains("500"));
+        let mut old = Rig::on(FakePi::without_panel(20));
+        let path = old.path();
+        let v = know(&mut old.api, &path, T0, &mac(2), Some("TV")).unwrap();
+        assert_eq!(v["pushed"], true);
+        assert_eq!(v["labelsPushed"], false);
+        assert_eq!(
+            v["labelsPushError"],
+            "the Pi's software does not show device names yet"
+        );
+    }
+
+    fn hash_of(pin: &str) -> PinHash {
+        crate::pinhash::hash_with_salt(pin, [4; 16]).unwrap()
+    }
+
+    #[test]
+    fn pin_set_keeps_the_hash_pushes_it_and_says_nothing_of_either_it_or_the_digits() {
+        let mut rig = Rig::new();
+        let path = rig.path();
+        let hash = hash_of("1234");
+        let v = pin_set(&mut rig.api, &path, hash.clone()).unwrap();
+        assert_eq!(v, json!({"ok": true, "pin": "set", "panelPushed": true}));
+        assert_eq!(
+            rig.pi.with(|s| s.pin_hash.clone()).as_deref(),
+            Some(hash.as_str())
+        );
+        let store = rig.store();
+        assert_eq!(store.pin_hash.as_ref(), Some(&hash));
+        assert!(!store.pin_push_due(), "the push was recorded");
+        let text = v.to_string();
+        assert!(!text.contains("1234") && !text.contains(hash.as_str()));
+        // The digits are nowhere on disk: only the hash, in the exempt file.
+        let on_disk = std::fs::read_to_string(wdstore::exempt_path(&path)).unwrap();
+        assert!(on_disk.contains(hash.as_str()) && !on_disk.contains("1234"));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains("pin"));
+    }
+
+    #[test]
+    fn pin_clear_pushes_null_and_forgets_the_hash_and_says_what_a_config_pin_does() {
+        let mut rig = Rig::new();
+        let path = rig.path();
+        pin_set(&mut rig.api, &path, hash_of("1234")).unwrap();
+        let v = pin_clear(&mut rig.api, &path).unwrap();
+        assert_eq!(v["pin"], "cleared");
+        assert_eq!(v["panelPushed"], true);
+        assert!(v["note"].as_str().unwrap().contains("restarts"));
+        assert!(rig.pi.with(|s| s.pin_hash.is_none()));
+        assert!(rig.store().pin_hash.is_none() && !rig.store().pin_push_due());
+        // On every call, also when this PC had none (the Pi may have one set at its panel).
+        let n = rig.pi.with(|s| s.panel_puts.len());
+        pin_clear(&mut rig.api, &path).unwrap();
+        assert_eq!(rig.pi.with(|s| s.panel_puts.len()), n + 1);
+    }
+
+    #[test]
+    fn a_pin_that_could_not_be_pushed_stays_set_and_due_with_a_reason_that_names_nothing() {
+        let mut rig = Rig::new();
+        let path = rig.path();
+        rig.pi.with(|s| s.fail_panel = true);
+        let hash = hash_of("1234");
+        let v = pin_set(&mut rig.api, &path, hash.clone()).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["panelPushed"], false);
+        let why = v["panelPushError"].as_str().unwrap();
+        assert!(
+            why.contains("500") && !why.contains("1234") && !why.contains(hash.as_str()),
+            "{why}"
+        );
+        assert!(
+            rig.store().pin_push_due() && rig.store().pin_hash.is_some(),
+            "the watcher pushes it"
+        );
+        // A Pi that does not take a PIN yet.
+        let mut old = Rig::on(FakePi::without_panel(20));
+        let path = old.path();
+        let v = pin_set(&mut old.api, &path, hash_of("4321")).unwrap();
+        assert_eq!(
+            v["panelPushError"],
+            "the Pi's software does not take a panel PIN yet"
+        );
+        assert!(old.store().pin_push_due());
+    }
+
+    #[test]
+    fn a_pin_needs_a_writable_store_and_pushes_nothing_without_one() {
+        let mut rig = Rig::new();
+        let bad = unwritable(rig.dir.path());
+        let e = pin_set(&mut rig.api, &bad, hash_of("1234")).unwrap_err();
+        assert_eq!(e.code, "store");
+        assert!(!e.detail.contains("1234"));
+        let e = pin_clear(&mut rig.api, &bad).unwrap_err();
+        assert_eq!(e.code, "store");
+        assert_eq!(rig.pi.with(|s| s.panel_puts.len()), 0);
     }
 }
