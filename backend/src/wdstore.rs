@@ -1,7 +1,10 @@
 //! The PC-side watchdog store (`~/.local/state/qnet/watchdog.json`, mode
 //! 0600): which alerts were acknowledged here, the known-device list (with
-//! labels) that is pushed to the Pi, and which alert instances already got a
-//! desktop notification.
+//! labels) that is pushed to the Pi, the exempt-device list (the devices that
+//! skip ad blocking; also with labels, also pushed to the Pi, at most
+//! [`MAX_EXEMPT`] long) and which alert instances already got a desktop
+//! notification. A file from before the exempt list has none: it loads with
+//! an empty one.
 //!
 //! The watcher and the CLI both write it, so every change goes through
 //! [`update`], a read-modify-write under an exclusive lock on
@@ -18,8 +21,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::watchdog::{normalize_mac, valid_key};
 
-/// At most this many entries in each of the three lists.
+/// At most this many entries in each of the three lists (the exempt list has
+/// its own, smaller bound: [`MAX_EXEMPT`]).
 pub const MAX_ENTRIES: usize = 1024;
+/// At most this many addresses on the exempt list: the Pi takes the whole
+/// list in one body of at most this many.
+pub const MAX_EXEMPT: usize = 64;
 /// Longest label, in characters.
 pub const LABEL_MAX: usize = 64;
 
@@ -43,6 +50,9 @@ pub struct Known {
     pub label: Option<String>,
     pub first_seen: u64,
 }
+
+/// A device on the exempt list: the same shape as a known one.
+pub type Exempt = Known;
 
 /// An alert instance that already got a notification: its key, the
 /// `first_unix` of that instance (a fresh instance after a Pi reboot has a
@@ -72,6 +82,13 @@ pub struct Store {
     /// is seen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub absent_for: Option<String>,
+    /// The devices that skip ad blocking, at most [`MAX_EXEMPT`]. Pushed to
+    /// the Pi like the known list; the Pi holds it in memory only.
+    pub exempt: Vec<Exempt>,
+    /// Bumped by every edit of the exempt list.
+    pub exempt_gen: u64,
+    /// The `exempt_gen` that was last pushed to the Pi successfully.
+    pub pushed_exempt_gen: u64,
 }
 
 impl Default for Store {
@@ -84,6 +101,9 @@ impl Default for Store {
             pushed_known_gen: 0,
             notified: Vec::new(),
             absent_for: None,
+            exempt: Vec::new(),
+            exempt_gen: 0,
+            pushed_exempt_gen: 0,
         }
     }
 }
@@ -109,6 +129,37 @@ fn trim_oldest<T>(list: &mut Vec<T>, at: impl Fn(&T) -> u64) {
             .unwrap_or(0);
         list.remove(oldest);
     }
+}
+
+/// Put `mac` on `list` (at most `cap` entries) or update its label: the rule
+/// of [`Store::know`] and [`Store::add_exempt`]. True when the list changed.
+fn upsert(
+    list: &mut Vec<Known>,
+    cap: usize,
+    mac: &str,
+    label: Option<&str>,
+    first_seen: u64,
+) -> bool {
+    let Some(mac) = normalize_mac(mac) else {
+        return false;
+    };
+    let label = label.and_then(clean_label);
+    if let Some(entry) = list.iter_mut().find(|k| k.mac == mac) {
+        match label {
+            Some(l) if entry.label.as_deref() != Some(l.as_str()) => entry.label = Some(l),
+            _ => return false,
+        }
+    } else {
+        if list.len() >= cap {
+            return false;
+        }
+        list.push(Known {
+            mac,
+            label,
+            first_seen,
+        });
+    }
+    true
 }
 
 impl Store {
@@ -176,24 +227,8 @@ impl Store {
     /// when [`MAX_ENTRIES`] are on the list already (see [`is_known`](Self::is_known)
     /// to tell these apart).
     pub fn know(&mut self, mac: &str, label: Option<&str>, first_seen: u64) -> bool {
-        let Some(mac) = normalize_mac(mac) else {
+        if !upsert(&mut self.known, MAX_ENTRIES, mac, label, first_seen) {
             return false;
-        };
-        let label = label.and_then(clean_label);
-        if let Some(entry) = self.known.iter_mut().find(|k| k.mac == mac) {
-            match label {
-                Some(l) if entry.label.as_deref() != Some(l.as_str()) => entry.label = Some(l),
-                _ => return false,
-            }
-        } else {
-            if self.known.len() >= MAX_ENTRIES {
-                return false;
-            }
-            self.known.push(Known {
-                mac,
-                label,
-                first_seen,
-            });
         }
         self.bump_gen();
         true
@@ -228,6 +263,69 @@ impl Store {
     /// been edited while the push was on the wire).
     pub fn mark_pushed(&mut self, generation: u64) {
         self.pushed_known_gen = generation;
+    }
+
+    // -- the exempt list -------------------------------------------------------
+
+    /// Whether `mac` (any accepted spelling) is on the exempt list.
+    pub fn is_exempt(&self, mac: &str) -> bool {
+        normalize_mac(mac).is_some_and(|m| self.exempt.iter().any(|e| e.mac == m))
+    }
+
+    /// Whether the exempt list holds [`MAX_EXEMPT`] entries already.
+    pub fn exempt_is_full(&self) -> bool {
+        self.exempt.len() >= MAX_EXEMPT
+    }
+
+    /// Put `mac` on the exempt list or update its label, exactly as
+    /// [`know`](Self::know) does for the known list (same label cleaning, same
+    /// `first_seen` rule); `exempt_gen` goes up only when something changed.
+    /// False with no change for a MAC that does not parse, for an entry that
+    /// is there with the same label, and for a new entry when
+    /// [`MAX_EXEMPT`] are on the list already (see
+    /// [`is_exempt`](Self::is_exempt) and [`exempt_is_full`](Self::exempt_is_full)
+    /// to tell these apart). The device is not put on the known list: that is
+    /// a separate edit.
+    pub fn add_exempt(&mut self, mac: &str, label: Option<&str>, first_seen: u64) -> bool {
+        if !upsert(&mut self.exempt, MAX_EXEMPT, mac, label, first_seen) {
+            return false;
+        }
+        self.exempt_gen = self.exempt_gen.wrapping_add(1);
+        true
+    }
+
+    /// Take `mac` off the exempt list; true (and `exempt_gen` up) when it was
+    /// there. The device stays on the known list.
+    pub fn remove_exempt(&mut self, mac: &str) -> bool {
+        let Some(mac) = normalize_mac(mac) else {
+            return false;
+        };
+        let before = self.exempt.len();
+        self.exempt.retain(|e| e.mac != mac);
+        if self.exempt.len() == before {
+            return false;
+        }
+        self.exempt_gen = self.exempt_gen.wrapping_add(1);
+        true
+    }
+
+    /// The exempt MACs, in list order.
+    pub fn exempt_macs(&self) -> Vec<String> {
+        self.exempt.iter().map(|e| e.mac.clone()).collect()
+    }
+
+    /// Whether the exempt list changed since it was last pushed to the Pi.
+    // Read by the tests only until the watcher pushes the exempt list too.
+    #[allow(dead_code)]
+    pub fn exempt_push_due(&self) -> bool {
+        self.exempt_gen != self.pushed_exempt_gen
+    }
+
+    /// Record a successful push of exempt generation `generation` (the
+    /// `exempt_gen` that was read before the push, as for
+    /// [`mark_pushed`](Self::mark_pushed)).
+    pub fn mark_exempt_pushed(&mut self, generation: u64) {
+        self.pushed_exempt_gen = generation;
     }
 
     // -- notifications ---------------------------------------------------------
@@ -747,6 +845,173 @@ mod tests {
         // An older file without the field reads as no verdict.
         std::fs::write(&p, r#"{"version":1,"knownGen":2}"#).unwrap();
         assert_eq!(Store::load(&p).absent_for, None);
+    }
+
+    // -- the exempt list -------------------------------------------------------
+
+    #[test]
+    fn the_exempt_list_survives_a_save_and_load_in_camel_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("qnet").join("watchdog.json");
+        let mut s = Store::default();
+        assert!(s.add_exempt("02:00:00:00:00:AA", Some(" Smart TV "), 70));
+        assert!(s.add_exempt(&mac(2), None, 80));
+        s.mark_exempt_pushed(1);
+        s.save(&p).unwrap();
+        let back = Store::load(&p);
+        assert_eq!(back, s);
+        assert_eq!(back.exempt[0].mac, "02:00:00:00:00:aa");
+        assert_eq!(back.exempt[0].label.as_deref(), Some("Smart TV"));
+        assert_eq!(back.exempt[1].label, None);
+        assert_eq!((back.exempt_gen, back.pushed_exempt_gen), (2, 1));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["exempt"][0]["mac"], "02:00:00:00:00:aa");
+        assert_eq!(v["exempt"][0]["firstSeen"], 70);
+        assert_eq!(v["exempt"][1].get("label"), None, "no label, no key");
+        assert_eq!(v["exemptGen"], 2);
+        assert_eq!(v["pushedExemptGen"], 1);
+        assert_eq!(v["knownGen"], 0, "the known list is not touched");
+        assert!(v["known"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_from_before_the_exempt_list_loads_with_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        let old = r#"{"version":1,"acked":[{"key":"0000000000000001","at":5}],
+            "known":[{"mac":"02:00:00:00:00:01","label":"Printer","firstSeen":9}],
+            "knownGen":3,"pushedKnownGen":3,"notified":[],"absentFor":"192.0.2.9|ab"}"#;
+        std::fs::write(&p, old).unwrap();
+        let s = Store::load(&p);
+        assert!(s.exempt.is_empty());
+        assert_eq!((s.exempt_gen, s.pushed_exempt_gen), (0, 0));
+        assert!(!s.exempt_push_due());
+        // Everything else is as it was.
+        assert_eq!(s.known_macs(), [mac(1)]);
+        assert_eq!((s.known_gen, s.pushed_known_gen), (3, 3));
+        assert_eq!(s.acked_keys(), [key(1)]);
+        assert_eq!(s.absent_for.as_deref(), Some("192.0.2.9|ab"));
+
+        // A no-op update neither rewrites the file nor loses anything.
+        update(&p, |s| s.exempt.len()).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), old);
+        // A change adds the exempt keys and keeps the old data.
+        update(&p, |s| s.add_exempt(&mac(1), None, 1)).unwrap();
+        let s = Store::load(&p);
+        assert_eq!(s.exempt_macs(), [mac(1)]);
+        assert_eq!(s.known[0].label.as_deref(), Some("Printer"));
+        assert_eq!(s.absent_for.as_deref(), Some("192.0.2.9|ab"));
+        assert!(bad_files(&p).is_empty(), "an old file is not corrupt");
+    }
+
+    #[test]
+    fn add_exempt_inserts_updates_labels_and_bumps_the_generation_only_on_change() {
+        let mut s = Store::default();
+        assert!(!s.exempt_push_due());
+        assert!(s.add_exempt("02:00:00:00:00:AA", Some("  TV\n"), 100));
+        assert_eq!(s.exempt_gen, 1);
+        assert!(s.exempt_push_due());
+        assert_eq!(s.exempt[0].mac, "02:00:00:00:00:aa", "normalised");
+        assert_eq!(s.exempt[0].label.as_deref(), Some("TV"), "cleaned");
+        assert_eq!(s.exempt[0].first_seen, 100);
+
+        // The same entry again: nothing changes.
+        assert!(!s.add_exempt("02-00-00-00-00-aa", Some("TV"), 999));
+        assert!(!s.add_exempt("02:00:00:00:00:aa", None, 999));
+        assert!(!s.add_exempt("02:00:00:00:00:aa", Some("  "), 999));
+        assert_eq!(s.exempt_gen, 1);
+
+        // A new label changes it, first_seen stays.
+        assert!(s.add_exempt("02:00:00:00:00:aa", Some("Living room TV"), 999));
+        assert_eq!(s.exempt_gen, 2);
+        assert_eq!(s.exempt[0].label.as_deref(), Some("Living room TV"));
+        assert_eq!(s.exempt[0].first_seen, 100);
+        assert_eq!(s.exempt.len(), 1);
+
+        // Bad MACs are refused.
+        assert!(!s.add_exempt("nonsense", Some("x"), 1));
+        assert!(!s.add_exempt("", None, 1));
+        assert_eq!(s.exempt_gen, 2);
+        assert!(s.is_exempt("02:00:00:00:00:AA"));
+        assert!(!s.is_exempt("02:00:00:00:00:bb"));
+        assert!(!s.is_exempt("junk"));
+    }
+
+    #[test]
+    fn the_exempt_and_known_lists_do_not_touch_each_other() {
+        let mut s = Store::default();
+        s.know(&mac(1), None, 1);
+        s.add_exempt(&mac(2), None, 1);
+        assert_eq!((s.known_gen, s.exempt_gen), (1, 1));
+        assert_eq!(s.known_macs(), [mac(1)]);
+        assert_eq!(s.exempt_macs(), [mac(2)]);
+        assert!(!s.is_known(&mac(2)) && !s.is_exempt(&mac(1)));
+        // Forgetting a device leaves the exempt list alone, and removing it
+        // from the exempt list leaves it known.
+        s.add_exempt(&mac(1), None, 1);
+        assert!(s.forget(&mac(1)));
+        assert!(s.is_exempt(&mac(1)));
+        s.know(&mac(2), None, 1);
+        assert!(s.remove_exempt(&mac(2)));
+        assert!(s.is_known(&mac(2)));
+        // Each list has its own pushed generation.
+        let (k, e) = (s.known_gen, s.exempt_gen);
+        s.mark_pushed(k);
+        assert!(!s.push_due() && s.exempt_push_due());
+        s.mark_exempt_pushed(e);
+        assert!(!s.exempt_push_due());
+    }
+
+    #[test]
+    fn remove_exempt_bumps_the_generation_only_when_it_removes_something() {
+        let mut s = Store::default();
+        s.add_exempt(&mac(1), None, 1);
+        s.add_exempt(&mac(2), None, 1);
+        assert_eq!(s.exempt_gen, 2);
+        assert!(!s.remove_exempt(&mac(3)));
+        assert!(!s.remove_exempt("junk"));
+        assert_eq!(s.exempt_gen, 2);
+        assert!(s.remove_exempt(&mac(1).to_uppercase()));
+        assert_eq!(s.exempt_gen, 3);
+        assert_eq!(s.exempt_macs(), [mac(2)]);
+        assert!(!s.remove_exempt(&mac(1)), "already gone");
+        assert_eq!(s.exempt_gen, 3);
+    }
+
+    #[test]
+    fn the_exempt_list_holds_at_most_64() {
+        assert_eq!(MAX_EXEMPT, 64);
+        let mut s = Store::default();
+        for i in 0..MAX_EXEMPT {
+            assert!(!s.exempt_is_full(), "{i}");
+            assert!(s.add_exempt(&mac(i), None, 1), "{i}");
+        }
+        assert!(s.exempt_is_full());
+        let gen = s.exempt_gen;
+        assert!(!s.add_exempt(&mac(5000), None, 1), "refused beyond 64");
+        assert_eq!(s.exempt.len(), 64);
+        assert_eq!(s.exempt_gen, gen, "a refusal changes nothing");
+        // An existing entry can still be relabelled when the list is full.
+        assert!(s.add_exempt(&mac(0), Some("still editable"), 1));
+        assert!(s.remove_exempt(&mac(1)));
+        assert!(!s.exempt_is_full());
+        assert!(s.add_exempt(&mac(5000), None, 1), "room again");
+    }
+
+    #[test]
+    fn exempt_push_due_follows_the_generations() {
+        let mut s = Store::default();
+        assert!(!s.exempt_push_due());
+        s.add_exempt(&mac(1), None, 1);
+        assert!(s.exempt_push_due());
+        let pushed = s.exempt_gen;
+        // An edit while the push is on the wire stays due.
+        s.add_exempt(&mac(2), None, 1);
+        s.mark_exempt_pushed(pushed);
+        assert!(s.exempt_push_due());
+        s.mark_exempt_pushed(s.exempt_gen);
+        assert!(!s.exempt_push_due());
     }
 
     #[test]

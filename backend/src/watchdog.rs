@@ -1,13 +1,16 @@
 //! Support for the qberrypi watchdog: the `/api/qbp/` calls behind the
 //! Pi-hole login, the tolerant parsers for their answers, notification text
 //! (titles, markup escaping, burst folding) and the chunking of the two
-//! lists that are pushed to the Pi (acknowledged alerts, known devices).
+//! lists that are pushed in chunks to the Pi (acknowledged alerts, known
+//! devices). The exempt list (devices that skip ad blocking) is pushed whole,
+//! in one body of at most 64 addresses ([`put_exempt`]); a Pi that answers 404
+//! for it has no exempt support.
 //!
 //! A real Pi-hole answers 404 on every `/api/qbp/` path. The calls here turn
 //! that into [`Qbp::Absent`], so the caller can treat the watchdog as not
 //! there and behave exactly as it did before.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
@@ -24,6 +27,10 @@ pub const QBP_BODY_MAX: usize = 4000;
 pub const MAX_ALERTS: usize = 256;
 /// Devices kept from one answer (the ones seen last).
 pub const MAX_DEVICES: usize = 512;
+/// Exempt addresses kept from one answer.
+pub const MAX_EXEMPT_MACS: usize = 512;
+/// The most addresses `PUT devices/exempt` takes (the Pi's cap).
+pub const EXEMPT_MAX: usize = wdstore::MAX_EXEMPT;
 /// IPv4 addresses kept per device.
 pub const MAX_IPV4: usize = 4;
 /// Longest subject kept, in bytes.
@@ -85,6 +92,9 @@ pub struct Device {
     pub last_unix: u64,
     /// Whether the Pi counts it as known.
     pub known: bool,
+    /// Whether the Pi skips ad blocking for it (false when it does not say,
+    /// as an older Pi does not).
+    pub exempt: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +103,10 @@ pub struct Inventory {
     pub known_list: String,
     /// As the Pi sent them (last seen first).
     pub devices: Vec<Device>,
+    /// The Pi's effective exempt list: its own config file's plus the one
+    /// pushed to it. Lower-case colon form, each address once, at most
+    /// [`MAX_EXEMPT_MACS`]; empty when the Pi does not say.
+    pub exempt_macs: Vec<String>,
 }
 
 // -- validation helpers -------------------------------------------------------
@@ -235,12 +249,34 @@ fn parse_device(v: &Value) -> Option<Device> {
         first_unix: num(v, "first_unix", 0),
         last_unix: num(v, "last_unix", 0),
         known: v.get("known").and_then(Value::as_bool).unwrap_or(false),
+        exempt: v.get("exempt").and_then(Value::as_bool).unwrap_or(false),
     })
+}
+
+/// The Pi's `exempt_macs`: the entries that are hardware addresses, in lower-case
+/// colon form, each once, at most [`MAX_EXEMPT_MACS`]. Anything else (no list,
+/// a list of another shape) is empty.
+fn parse_exempt_macs(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(items) = v.get("exempt_macs").and_then(Value::as_array) else {
+        return out;
+    };
+    for m in items.iter().filter_map(|x| normalize_mac(x.as_str()?)) {
+        if out.len() >= MAX_EXEMPT_MACS {
+            break;
+        }
+        if !out.contains(&m) {
+            out.push(m);
+        }
+    }
+    out
 }
 
 /// Validate a `GET devices` answer. `None` when `devices` is missing or not a
 /// list. Entries without a valid MAC are dropped; at most [`MAX_DEVICES`]
-/// are kept (the Pi sends the one seen last first, so those are kept).
+/// are kept (the Pi sends the one seen last first, so those are kept). The
+/// exempt fields (`exempt` on a device, `exempt_macs` on top) are optional:
+/// an older Pi has neither.
 pub fn parse_devices(v: &Value) -> Option<Inventory> {
     let items = v.get("devices")?.as_array()?;
     let mut devices: Vec<Device> = items.iter().filter_map(parse_device).collect();
@@ -251,6 +287,7 @@ pub fn parse_devices(v: &Value) -> Option<Inventory> {
     Some(Inventory {
         known_list: known_list.to_string(),
         devices,
+        exempt_macs: parse_exempt_macs(v),
     })
 }
 
@@ -341,6 +378,33 @@ pub fn put_known(api: &mut Pihole, macs: &[String]) -> Result<Qbp<u64>, ApiError
         }
     }
     Ok(Qbp::Present(known))
+}
+
+/// `PUT /api/qbp/devices/exempt`: replace the Pi's pushed exempt list with
+/// `macs`: one body `{"exempt":[…]}`, no chunking. Entries that are not
+/// hardware addresses are skipped, the rest are sent in lower-case colon form,
+/// each once, and no more than [`EXEMPT_MAX`] (the Pi refuses a longer list
+/// with a 400; the store never holds more). An empty list is sent as it is: it
+/// clears the Pi's list, so the caller decides whether it wants that.
+/// Returns the size of the Pi's pushed list. `Absent` is the Pi saying 404
+/// for the route: it has no exempt support (when the watchdog itself is
+/// there, which the caller knows from its other calls). A 400 or any other
+/// failure is an error.
+pub fn put_exempt(api: &mut Pihole, macs: &[String]) -> Result<Qbp<u64>, ApiError> {
+    let mut list: Vec<String> = Vec::new();
+    for m in macs.iter().filter_map(|m| normalize_mac(m)) {
+        if !list.contains(&m) {
+            list.push(m);
+        }
+    }
+    list.truncate(EXEMPT_MAX);
+    let body = json!({ "exempt": list });
+    Ok(
+        match api.json_opt("PUT", "/api/qbp/devices/exempt", Some(&body))? {
+            None => Qbp::Absent,
+            Some(v) => Qbp::Present(num(&v, "exempt", 0)),
+        },
+    )
 }
 
 // -- chunking -----------------------------------------------------------------
@@ -577,16 +641,19 @@ pub struct ReportDevice {
     pub known: bool,
     /// The label from the known list, "" when there is none.
     pub label: String,
+    /// On this PC's exempt list.
+    pub exempt: bool,
 }
 
-/// `devices` with what this PC's known list says about each, in the same
-/// order.
+/// `devices` with what this PC's known and exempt lists say about each, in
+/// the same order.
 pub fn annotate(devices: Vec<Device>, store: &Store) -> Vec<ReportDevice> {
     let mine: HashMap<&str, Option<&str>> = store
         .known
         .iter()
         .map(|k| (k.mac.as_str(), k.label.as_deref()))
         .collect();
+    let exempt: HashSet<&str> = store.exempt.iter().map(|e| e.mac.as_str()).collect();
     devices
         .into_iter()
         .map(|d| {
@@ -594,6 +661,7 @@ pub fn annotate(devices: Vec<Device>, store: &Store) -> Vec<ReportDevice> {
             ReportDevice {
                 known: entry.is_some(),
                 label: entry.and_then(|l| *l).unwrap_or_default().to_string(),
+                exempt: exempt.contains(d.mac.as_str()),
                 device: d,
             }
         })
@@ -1312,10 +1380,70 @@ mod tests {
                 first_unix: 10,
                 last_unix: 20,
                 known: true,
+                exempt: false,
             }
         );
         assert_eq!(inv.devices[1].mac, "02:00:00:00:00:ab", "normalised");
         assert!(!inv.devices[1].known);
+        // An older Pi sends no exempt fields: no flags, no list.
+        assert!(inv.devices.iter().all(|d| !d.exempt));
+        assert!(inv.exempt_macs.is_empty());
+    }
+
+    #[test]
+    fn the_exempt_fields_of_a_devices_answer_parse() {
+        let v = json!({"known_list": "received",
+            "exempt_macs": ["02:00:00:00:00:07", "02-00-00-00-00-AB"],
+            "devices": [
+            {"mac": "02:00:00:00:00:07", "known": true, "exempt": true},
+            {"mac": "02:00:00:00:00:08", "known": true, "exempt": false},
+            {"mac": "02:00:00:00:00:09", "known": true},
+        ]});
+        let inv = parse_devices(&v).unwrap();
+        assert_eq!(inv.exempt_macs, ["02:00:00:00:00:07", "02:00:00:00:00:ab"]);
+        let flags: Vec<bool> = inv.devices.iter().map(|d| d.exempt).collect();
+        assert_eq!(flags, [true, false, false]);
+    }
+
+    #[test]
+    fn odd_exempt_fields_are_read_tolerantly() {
+        let exempt_of = |d: Value| {
+            let v = json!({"devices": [{"mac": mac(1), "exempt": d}]});
+            parse_devices(&v).unwrap().devices[0].exempt
+        };
+        assert!(exempt_of(json!(true)));
+        assert!(!exempt_of(json!(false)));
+        for odd in [json!(null), json!("true"), json!(1), json!([]), json!({})] {
+            assert!(!exempt_of(odd.clone()), "{odd}");
+        }
+        let list_of = |l: Value| {
+            parse_devices(&json!({"devices": [], "exempt_macs": l}))
+                .unwrap()
+                .exempt_macs
+        };
+        assert!(list_of(json!(null)).is_empty());
+        assert!(list_of(json!("02:00:00:00:00:01")).is_empty());
+        assert!(list_of(json!({})).is_empty());
+        assert!(list_of(json!([])).is_empty());
+        // Bad entries are dropped, the rest is normalised, kept in order and
+        // listed once.
+        assert_eq!(
+            list_of(json!([
+                "nonsense",
+                5,
+                null,
+                "02:00:00:00:00:0B",
+                "02:00:00:00:00:0a",
+                "02-00-00-00-00-0b",
+                "02:00:00:00:00"
+            ])),
+            ["02:00:00:00:00:0b", "02:00:00:00:00:0a"]
+        );
+        // A list from a Pi that has gone wild is bounded.
+        let many: Vec<String> = (1..=2000).map(mac).collect();
+        let got = list_of(json!(many));
+        assert_eq!(got.len(), MAX_EXEMPT_MACS);
+        assert_eq!(got[0], mac(1));
     }
 
     #[test]
@@ -1524,6 +1652,9 @@ mod tests {
                     n
                 };
                 Some(ok_json(&format!(r#"{{"known":{}}}"#, *set)))
+            } else if first.starts_with("PUT /api/qbp/devices/exempt ") {
+                let n = body_of(req)["exempt"].as_array().unwrap().len();
+                Some(ok_json(&format!(r#"{{"exempt":{n}}}"#)))
             } else {
                 Some(NOT_FOUND.to_vec())
             }
@@ -1540,6 +1671,7 @@ mod tests {
         assert_eq!(restore_acked(&mut api, &keys(2)).unwrap(), Qbp::Absent);
         assert_eq!(get_devices(&mut api).unwrap(), Qbp::Absent);
         assert_eq!(put_known(&mut api, &macs(2)).unwrap(), Qbp::Absent);
+        assert_eq!(put_exempt(&mut api, &macs(2)).unwrap(), Qbp::Absent);
         assert_eq!(
             qbp_lines(&log),
             [
@@ -1548,6 +1680,7 @@ mod tests {
                 "PUT /api/qbp/alerts/acked HTTP/1.1",
                 "GET /api/qbp/devices HTTP/1.1",
                 "PUT /api/qbp/devices/known HTTP/1.1",
+                "PUT /api/qbp/devices/exempt HTTP/1.1",
             ]
         );
     }
@@ -1608,6 +1741,7 @@ mod tests {
         assert_eq!(ack(&mut api, 1).unwrap(), Qbp::Present(()));
         assert_eq!(restore_acked(&mut api, &keys(1)).unwrap(), Qbp::Present(0));
         assert_eq!(put_known(&mut api, &macs(1)).unwrap(), Qbp::Present(0));
+        assert_eq!(put_exempt(&mut api, &macs(1)).unwrap(), Qbp::Present(0));
     }
 
     #[test]
@@ -1653,6 +1787,7 @@ mod tests {
         assert!(get_alerts(&mut api, 0).is_err());
         assert!(ack(&mut api, 1).is_err());
         assert!(put_known(&mut api, &macs(1)).is_err());
+        assert!(put_exempt(&mut api, &macs(1)).is_err());
     }
 
     // -- chunking -------------------------------------------------------------
@@ -1845,6 +1980,85 @@ mod tests {
             puts(&log, "/api/qbp/devices/known"),
             [json!({"known": [], "append": false, "complete": true})]
         );
+    }
+
+    #[test]
+    fn put_exempt_sends_the_whole_list_in_one_body() {
+        let log: Log = Arc::default();
+        let srv = watchdog_pi(log.clone());
+        let mut api = client(&srv);
+        assert_eq!(put_exempt(&mut api, &macs(3)).unwrap(), Qbp::Present(3));
+        assert_eq!(
+            puts(&log, "/api/qbp/devices/exempt"),
+            [json!({"exempt": [mac(1), mac(2), mac(3)]})],
+            "exactly this body: no append, no complete"
+        );
+    }
+
+    #[test]
+    fn put_exempt_normalises_dedups_and_skips_bad_entries() {
+        let log: Log = Arc::default();
+        let srv = watchdog_pi(log.clone());
+        let mut api = client(&srv);
+        let list = vec![
+            "02-00-00-00-00-AA".to_string(),
+            "nonsense".to_string(),
+            "02:00:00:00:00:bb".to_string(),
+            "02:00:00:00:00:AA".to_string(),
+        ];
+        assert_eq!(put_exempt(&mut api, &list).unwrap(), Qbp::Present(2));
+        assert_eq!(
+            puts(&log, "/api/qbp/devices/exempt"),
+            [json!({"exempt": ["02:00:00:00:00:aa", "02:00:00:00:00:bb"]})]
+        );
+    }
+
+    #[test]
+    fn put_exempt_with_an_empty_list_clears_the_pis_list() {
+        let log: Log = Arc::default();
+        let srv = watchdog_pi(log.clone());
+        let mut api = client(&srv);
+        assert_eq!(put_exempt(&mut api, &[]).unwrap(), Qbp::Present(0));
+        assert_eq!(
+            puts(&log, "/api/qbp/devices/exempt"),
+            [json!({"exempt": []})]
+        );
+    }
+
+    #[test]
+    fn put_exempt_never_sends_more_than_the_pi_takes() {
+        let log: Log = Arc::default();
+        let srv = watchdog_pi(log.clone());
+        let mut api = client(&srv);
+        let input = macs(100);
+        put_exempt(&mut api, &input).unwrap();
+        let sent = puts(&log, "/api/qbp/devices/exempt");
+        assert_eq!(sent.len(), 1, "one body, no chunking");
+        assert_eq!(sent[0], json!({"exempt": &input[..64]}), "the first 64");
+        assert!(body_len(&sent[0]) <= QBP_BODY_MAX);
+    }
+
+    #[test]
+    fn put_exempt_answers_absent_on_a_404_and_an_error_on_a_refusal() {
+        let log: Log = Arc::default();
+        let srv = real_pihole(log.clone());
+        let mut api = client(&srv);
+        assert_eq!(put_exempt(&mut api, &macs(1)).unwrap(), Qbp::Absent);
+        assert_eq!(puts(&log, "/api/qbp/devices/exempt").len(), 1);
+
+        // 400: the body was refused. An error, not an absence.
+        let srv = serve(16, |_, req| {
+            if first_line(req).starts_with("POST /api/auth") {
+                Some(ok_json(LOGIN_OK))
+            } else {
+                Some(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}".to_vec())
+            }
+        });
+        let mut api = client(&srv);
+        assert!(matches!(
+            put_exempt(&mut api, &macs(1)),
+            Err(ApiError::Other(m)) if m.contains("400")
+        ));
     }
 
     #[test]

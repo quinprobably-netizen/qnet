@@ -330,6 +330,10 @@ pub struct WatchdogDeviceOut {
     /// It is on this PC's known list.
     pub known: bool,
     pub label: String,
+    /// The Pi skips ad blocking for it (false when the Pi does not say).
+    pub exempt_on_pi: bool,
+    /// It is on this PC's exempt list.
+    pub exempt: bool,
 }
 
 impl WatchdogDeviceOut {
@@ -343,6 +347,8 @@ impl WatchdogDeviceOut {
             known_on_pi: d.device.known,
             known: d.known,
             label: d.label.clone(),
+            exempt_on_pi: d.device.exempt,
+            exempt: d.exempt,
         }
     }
 }
@@ -1033,9 +1039,11 @@ mod tests {
                     first_unix: 1_794_000_000,
                     last_unix: 1_794_000_050,
                     known: false,
+                    exempt: true,
                 },
                 known: true,
                 label: "Printer".into(),
+                exempt: false,
             }],
             known_count: 12,
             pushed_at: 1_794_000_001,
@@ -1230,7 +1238,8 @@ mod tests {
                 "devices": [{
                     "mac": "02:00:00:00:00:07", "ipv4": ["192.0.2.7"], "hostname": "",
                     "firstUnix": 1794000000, "lastUnix": 1794000050,
-                    "knownOnPi": false, "known": true, "label": "Printer"
+                    "knownOnPi": false, "known": true, "label": "Printer",
+                    "exemptOnPi": true, "exempt": false
                 }],
                 "knownCount": 12, "pushedAt": 1794000001, "pushError": "",
                 "polledAt": 1794000005
@@ -1371,6 +1380,10 @@ mod tests {
             (true, false)
         );
         assert_eq!(w.devices[0].label, "Printer");
+        assert_eq!(
+            (w.devices[0].exempt, w.devices[0].exempt_on_pi),
+            (false, true)
+        );
         assert_eq!((w.pushed_at, w.polled_at), (1_794_000_001, 1_794_000_005));
     }
 

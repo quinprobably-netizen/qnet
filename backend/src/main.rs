@@ -11,6 +11,7 @@
 //!   qnet watchdog alerts|devices|know-all
 //!   qnet watchdog ack <id>         acknowledge a watchdog alert on the Pi
 //!   qnet watchdog know <mac> [label...]|forget <mac>   known-device list
+//!   qnet watchdog exempt <mac> [label...]|unexempt <mac>   exempt-device list
 //!
 //! One-shot verbs print one JSON line and exit 0 (`ok`) or 1.
 
@@ -49,7 +50,8 @@ use actions::{ActionErr, ActionResult, Ctx};
 
 const USAGE: &str = "usage: qnet watch | state | dns pihole|auto [--force] | dns pin <uuid> [--force] | \
 pihole pause [secs]|resume|setup <addr> | wifi connect <ap-path>|down|scan|forget <uuid>|radio on|off | portal | \
-watchdog alerts|devices|know-all | watchdog ack <id> | watchdog know <mac> [label...] | watchdog forget <mac>";
+watchdog alerts|devices|know-all | watchdog ack <id> | watchdog know <mac> [label...] | watchdog forget <mac> | \
+watchdog exempt <mac> [label...] | watchdog unexempt <mac>";
 
 fn usage() -> ActionErr {
     ActionErr::new("usage", USAGE)
@@ -604,6 +606,13 @@ mod tests {
         })
     }
 
+    fn exempt(mac: &str, label: Option<&str>) -> Cmd {
+        Cmd::Watchdog(WdCmd::Exempt {
+            mac: mac.into(),
+            label: label.map(String::from),
+        })
+    }
+
     #[test]
     fn watchdog_verbs_parse() {
         assert_eq!(p(&["watchdog", "alerts"]), Ok(Cmd::Watchdog(WdCmd::Alerts)));
@@ -637,6 +646,15 @@ mod tests {
             p(&["watchdog", "know", M, "Printer"]),
             Ok(know(M, Some("Printer")))
         );
+        assert_eq!(
+            p(&["watchdog", "unexempt", M]),
+            Ok(Cmd::Watchdog(WdCmd::Unexempt { mac: M.into() }))
+        );
+        assert_eq!(p(&["watchdog", "exempt", M]), Ok(exempt(M, None)));
+        assert_eq!(
+            p(&["watchdog", "exempt", M, "Smart", "TV"]),
+            Ok(exempt(M, Some("Smart TV")))
+        );
     }
 
     #[test]
@@ -647,6 +665,11 @@ mod tests {
         assert_eq!(
             p(&["watchdog", "forget", upper]),
             Ok(Cmd::Watchdog(WdCmd::Forget { mac: lower.into() }))
+        );
+        assert_eq!(p(&["watchdog", "exempt", upper]), Ok(exempt(lower, None)));
+        assert_eq!(
+            p(&["watchdog", "unexempt", upper]),
+            Ok(Cmd::Watchdog(WdCmd::Unexempt { mac: lower.into() }))
         );
     }
 
@@ -685,6 +708,28 @@ mod tests {
     }
 
     #[test]
+    fn an_exempt_label_is_handled_like_a_known_label() {
+        assert_eq!(
+            p(&["watchdog", "exempt", M, "Living", "room", "TV"]),
+            Ok(exempt(M, Some("Living room TV")))
+        );
+        assert_eq!(
+            p(&["watchdog", "exempt", M, "--force", "--if-stale", "x"]),
+            Ok(exempt(M, Some("--force --if-stale x")))
+        );
+        assert_eq!(
+            p(&["watchdog", "exempt", M, "  Hall\u{7}way", "cam\t"]),
+            Ok(exempt(M, Some("Hallway cam")))
+        );
+        assert_eq!(p(&["watchdog", "exempt", M, "", " "]), Ok(exempt(M, None)));
+        let long = "x".repeat(100);
+        assert_eq!(
+            p(&["watchdog", "exempt", M, &long]),
+            Ok(exempt(M, Some(&"x".repeat(64))))
+        );
+    }
+
+    #[test]
     fn bad_watchdog_input_is_rejected_before_anything_runs() {
         for id in [
             "x",
@@ -716,7 +761,7 @@ mod tests {
             "020000000001",
             "",
         ] {
-            for verb in ["know", "forget"] {
+            for verb in ["know", "forget", "exempt", "unexempt"] {
                 let e = p(&["watchdog", verb, mac]).unwrap_err();
                 assert_eq!(e.code, "invalid", "{verb} {mac:?}");
             }
@@ -733,6 +778,10 @@ mod tests {
             &["watchdog", "forget"],
             &["watchdog", "forget", M, "Printer"],
             &["watchdog", "know"],
+            &["watchdog", "exempt"],
+            &["watchdog", "unexempt"],
+            &["watchdog", "unexempt", M, "Printer"],
+            &["watchdog", "exempt-all"],
         ] {
             let e = p(bad).unwrap_err();
             assert_eq!(e.code, "usage", "{bad:?} -> {e:?}");

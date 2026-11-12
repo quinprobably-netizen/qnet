@@ -1,6 +1,7 @@
 //! The `qnet watchdog …` verbs: look at the Pi's alerts and devices, acknowledge
-//! an alert, and edit the known-device list of this PC (which is then pushed
-//! to the Pi).
+//! an alert, and edit the known-device list and the exempt-device list (the
+//! devices that skip ad blocking; threat blocking stays) of this PC, which are
+//! then pushed to the Pi.
 //!
 //! Each verb is a function of the API client, the path of the PC-side store
 //! and the time (unix seconds), so tests run against the fake Pi and a
@@ -9,7 +10,11 @@
 //!
 //! The known list is edited on this PC first and pushed second: when the push
 //! fails, or the Pi has no watchdog, the edit stays and the watcher pushes it
-//! later (the store's `knownGen` says it is due).
+//! later (the store's `knownGen` says it is due). The exempt list works the
+//! same way (`exemptGen`), with its own push and its own result keys
+//! (`exemptPushed`, `exemptPushError`), so one failing never hides the other.
+//! A Pi that answers 404 for the exempt route has no exempt support: the edit
+//! is saved here and reported as "not pushed: not supported yet".
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -23,7 +28,11 @@ use crate::watchdog::{self, normalize_mac, Inventory, Qbp};
 use crate::wdstore::{self, clean_label, Store};
 
 const USAGE: &str = "usage: qnet watchdog alerts | devices | know-all | ack <id> | \
-know <mac> [label...] | forget <mac>";
+know <mac> [label...] | forget <mac> | exempt <mac> [label...] | unexempt <mac>";
+
+/// What an exempt push says when the Pi answered 404 for the route (an older
+/// Pi, or a Pi-hole that is not a qberrypi at all).
+const UNSUPPORTED: &str = "the Pi's software does not support exempt devices yet";
 
 /// One `qnet watchdog` verb, validated.
 #[derive(Debug, PartialEq, Eq)]
@@ -44,6 +53,14 @@ pub enum WdCmd {
         mac: String,
     },
     KnowAll,
+    /// As `Know`, and the device is put on the exempt list as well.
+    Exempt {
+        mac: String,
+        label: Option<String>,
+    },
+    Unexempt {
+        mac: String,
+    },
 }
 
 fn usage() -> ActionErr {
@@ -89,6 +106,13 @@ pub fn parse(args: &[String]) -> Result<WdCmd, ActionErr> {
             mac: parse_mac(mac)?,
             label: clean_label(&label.join(" ")),
         }),
+        ["unexempt", mac] => Ok(WdCmd::Unexempt {
+            mac: parse_mac(mac)?,
+        }),
+        ["exempt", mac, label @ ..] => Ok(WdCmd::Exempt {
+            mac: parse_mac(mac)?,
+            label: clean_label(&label.join(" ")),
+        }),
         _ => Err(usage()),
     }
 }
@@ -102,6 +126,8 @@ pub fn run(api: &mut Pihole, store_path: &Path, now: u64, cmd: &WdCmd) -> Action
         WdCmd::Know { mac, label } => know(api, store_path, now, mac, label.as_deref()),
         WdCmd::Forget { mac } => forget(api, store_path, mac),
         WdCmd::KnowAll => know_all(api, store_path, now),
+        WdCmd::Exempt { mac, label } => exempt(api, store_path, now, mac, label.as_deref()),
+        WdCmd::Unexempt { mac } => unexempt(api, store_path, mac),
     }
 }
 
@@ -113,6 +139,10 @@ fn absent() -> ActionErr {
 
 fn store_err(e: std::io::Error) -> ActionErr {
     ActionErr::new("store", format!("could not save the known list: {e}"))
+}
+
+fn exempt_store_err(e: std::io::Error) -> ActionErr {
+    ActionErr::new("store", format!("could not save the exempt list: {e}"))
 }
 
 /// How pushing the PC list to the Pi ended.
@@ -127,12 +157,18 @@ enum Pushed {
 
 impl Pushed {
     fn add_to(self, out: &mut Value) {
+        self.add_as(out, "pushed", "pushError");
+    }
+
+    /// The result under the keys `pushed` and `error` (the exempt list has
+    /// its own).
+    fn add_as(self, out: &mut Value, pushed: &str, error: &str) {
         match self {
-            Pushed::Sent => out["pushed"] = json!(true),
-            Pushed::Skipped => out["pushed"] = json!(false),
+            Pushed::Sent => out[pushed] = json!(true),
+            Pushed::Skipped => out[pushed] = json!(false),
             Pushed::Failed(why) => {
-                out["pushed"] = json!(false);
-                out["pushError"] = json!(why);
+                out[pushed] = json!(false);
+                out[error] = json!(why);
             }
         }
     }
@@ -166,6 +202,38 @@ fn push(api: &mut Pihole, store_path: &Path, snap: &Snapshot) -> Pushed {
             Pushed::Sent
         }
         Ok(Qbp::Absent) => Pushed::Failed("absent".to_string()),
+        Err(e) => Pushed::Failed(e.message().to_string()),
+    }
+}
+
+/// The exempt list as it was after an edit, like [`Snapshot`] for the known one.
+struct ExemptSnapshot {
+    generation: u64,
+    macs: Vec<String>,
+}
+
+impl ExemptSnapshot {
+    fn of(s: &Store) -> Self {
+        Self {
+            generation: s.exempt_gen,
+            macs: s.exempt_macs(),
+        }
+    }
+}
+
+/// Push the PC's exempt list to the Pi and record the push. An empty list is
+/// pushed as it is (it clears the Pi's list): these verbs are explicit edits.
+/// A 404 is "not supported", whatever the reason: the edit stays on this PC
+/// and the watcher asks again once per login session.
+fn push_exempt(api: &mut Pihole, store_path: &Path, snap: &ExemptSnapshot) -> Pushed {
+    match watchdog::put_exempt(api, &snap.macs) {
+        Ok(Qbp::Present(_)) => {
+            // If this cannot be recorded the list stays due and the watcher
+            // pushes it once more: harmless.
+            let _ = wdstore::update(store_path, |s| s.mark_exempt_pushed(snap.generation));
+            Pushed::Sent
+        }
+        Ok(Qbp::Absent) => Pushed::Failed(UNSUPPORTED.to_string()),
         Err(e) => Pushed::Failed(e.message().to_string()),
     }
 }
@@ -218,7 +286,11 @@ pub fn ack(api: &mut Pihole, store_path: &Path, now: u64, id: u64) -> ActionResu
 // -- devices ------------------------------------------------------------------
 
 /// `watchdog devices`: the Pi's inventory, last seen first, with what this PC
-/// knows about each device, and the PC's known devices the Pi did not report.
+/// knows about each device (known, exempt) and what the Pi says (known,
+/// exempt), the PC's known and exempt devices the Pi did not report
+/// (`knownOffline`, `exemptOffline`), and the addresses only the Pi exempts
+/// (`exemptOnPiOnly`: they come from its config file, not from this PC's
+/// list).
 pub fn devices(api: &mut Pihole, store_path: &Path) -> ActionResult {
     let inv = match watchdog::get_devices(api)? {
         Qbp::Absent => return Err(absent()),
@@ -238,6 +310,24 @@ pub fn devices(api: &mut Pihole, store_path: &Path) -> ActionResult {
             })
         })
         .collect();
+    let exempt_offline: Vec<Value> = store
+        .exempt
+        .iter()
+        .filter(|e| !reported.contains(e.mac.as_str()))
+        .map(|e| {
+            json!({
+                "mac": e.mac,
+                "label": e.label.as_deref().unwrap_or(""),
+                "firstSeen": e.first_seen,
+            })
+        })
+        .collect();
+    let mine: HashSet<&str> = store.exempt.iter().map(|e| e.mac.as_str()).collect();
+    let exempt_on_pi_only: Vec<&String> = inv
+        .exempt_macs
+        .iter()
+        .filter(|m| !mine.contains(m.as_str()))
+        .collect();
     let mut list = inv.devices.clone();
     list.sort_by_key(|d| std::cmp::Reverse(d.last_unix));
     let devices: Vec<WatchdogDeviceOut> = watchdog::annotate(list, &store)
@@ -249,6 +339,8 @@ pub fn devices(api: &mut Pihole, store_path: &Path) -> ActionResult {
         "knownList": inv.known_list,
         "devices": devices,
         "knownOffline": offline,
+        "exemptOffline": exempt_offline,
+        "exemptOnPiOnly": exempt_on_pi_only,
     }))
 }
 
@@ -279,6 +371,22 @@ fn seed_from_pi(s: &mut Store, inv: &Inventory, now: u64) -> u64 {
     seeded
 }
 
+/// The Pi's inventory, if it can be read, and when the Pi first saw `mac`
+/// (`now` when it does not say, or cannot be asked).
+fn look_up(api: &mut Pihole, mac: &str, now: u64) -> (Option<Inventory>, u64) {
+    let inv = match watchdog::get_devices(api) {
+        Ok(Qbp::Present(inv)) => Some(inv),
+        _ => None,
+    };
+    let first_seen = inv
+        .as_ref()
+        .and_then(|inv| inv.devices.iter().find(|d| d.mac == mac))
+        .map(|d| d.first_unix)
+        .filter(|&t| t > 0)
+        .unwrap_or(now);
+    (inv, first_seen)
+}
+
 /// `watchdog know <mac> [label]`: put the device on this PC's list (or change
 /// its label; without a label an existing one stays), then push the list.
 /// `first_seen` of a new entry is when the Pi first saw the device, or `now`
@@ -295,16 +403,7 @@ pub fn know(
 ) -> ActionResult {
     let mac =
         normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
-    let inv = match watchdog::get_devices(api) {
-        Ok(Qbp::Present(inv)) => Some(inv),
-        _ => None,
-    };
-    let first_seen = inv
-        .as_ref()
-        .and_then(|inv| inv.devices.iter().find(|d| d.mac == mac))
-        .map(|d| d.first_unix)
-        .filter(|&t| t > 0)
-        .unwrap_or(now);
+    let (inv, first_seen) = look_up(api, &mac, now);
     let edit = wdstore::update(store_path, |s| {
         let seeded = inv.as_ref().map_or(0, |inv| seed_from_pi(s, inv, now));
         let was_known = s.is_known(&mac);
@@ -350,6 +449,93 @@ pub fn forget(api: &mut Pihole, store_path: &Path, mac: &str) -> ActionResult {
         .ok_or_else(|| ActionErr::new("not-found", "that device is not on the known list"))?;
     let mut out = json!({ "ok": true, "mac": mac, "known": snap.macs.len() });
     push(api, store_path, &snap).add_to(&mut out);
+    Ok(out)
+}
+
+// -- the exempt list ----------------------------------------------------------
+
+/// `watchdog exempt <mac> [label]`: put the device on this PC's exempt list
+/// (or change its label; without a label an existing one stays) and on the
+/// known list exactly as [`know`] does (the owner named it, so the Pi must
+/// not raise a new-device alert for it; the first edit on an empty known list
+/// seeds it from the Pi's, see [`seed_from_pi`]), in one locked edit, then
+/// push the known list and then the exempt list. Both are pushed on every
+/// call, also when nothing changed. Refused (`full`, nothing changed, nothing
+/// pushed) when the exempt list holds [`wdstore::MAX_EXEMPT`] devices already
+/// and this is a new one, or when the known list is full and the device is
+/// not on it. The result carries `known` and `pushed`/`pushError` for the
+/// known list as `know` does, plus `exempt` (the size of the exempt list
+/// after the edit) and `exemptPushed`/`exemptPushError` for its push (a Pi
+/// that answers 404 for it has no exempt support yet).
+pub fn exempt(
+    api: &mut Pihole,
+    store_path: &Path,
+    now: u64,
+    mac: &str,
+    label: Option<&str>,
+) -> ActionResult {
+    let mac =
+        normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
+    let (inv, first_seen) = look_up(api, &mac, now);
+    let edit = wdstore::update(store_path, |s| {
+        // Checked before anything is touched: a refusal changes nothing.
+        if !s.is_exempt(&mac) && s.exempt_is_full() {
+            return Err(ActionErr::new(
+                "full",
+                format!(
+                    "the exempt list holds {} devices already",
+                    wdstore::MAX_EXEMPT
+                ),
+            ));
+        }
+        let seeded = inv.as_ref().map_or(0, |inv| seed_from_pi(s, inv, now));
+        let was_known = s.is_known(&mac);
+        if !s.know(&mac, label, first_seen) && !was_known {
+            return Err(ActionErr::new(
+                "full",
+                format!(
+                    "the known list holds {} devices already, so this one cannot be marked known",
+                    wdstore::MAX_ENTRIES
+                ),
+            ));
+        }
+        s.add_exempt(&mac, label, first_seen);
+        let label = s
+            .known
+            .iter()
+            .find(|k| k.mac == mac)
+            .and_then(|k| k.label.clone());
+        Ok((Snapshot::of(s), ExemptSnapshot::of(s), label, seeded))
+    })
+    .map_err(exempt_store_err)??;
+    let (known, exempt, label, seeded) = edit;
+    let mut out = json!({
+        "ok": true, "mac": mac, "known": known.macs.len(), "exempt": exempt.macs.len(),
+    });
+    if let Some(l) = label {
+        out["label"] = json!(l);
+    }
+    if seeded > 0 {
+        out["seeded"] = json!(seeded);
+    }
+    push(api, store_path, &known).add_to(&mut out);
+    push_exempt(api, store_path, &exempt).add_as(&mut out, "exemptPushed", "exemptPushError");
+    Ok(out)
+}
+
+/// `watchdog unexempt <mac>`: take the device off this PC's exempt list, then
+/// push that list (an emptied list is pushed too: this is an explicit edit).
+/// The device stays on the known list, which is not touched or pushed.
+pub fn unexempt(api: &mut Pihole, store_path: &Path, mac: &str) -> ActionResult {
+    let mac =
+        normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
+    let snap = wdstore::update(store_path, |s| {
+        s.remove_exempt(&mac).then(|| ExemptSnapshot::of(s))
+    })
+    .map_err(exempt_store_err)?
+    .ok_or_else(|| ActionErr::new("not-found", "that device is not on the exempt list"))?;
+    let mut out = json!({ "ok": true, "mac": mac, "exempt": snap.macs.len() });
+    push_exempt(api, store_path, &snap).add_as(&mut out, "exemptPushed", "exemptPushError");
     Ok(out)
 }
 
@@ -656,18 +842,23 @@ mod tests {
                 "devices": [
                     { "mac": mac(3), "ipv4": ["192.0.2.3"], "hostname": "",
                       "firstUnix": T0, "lastUnix": T0 + 102,
-                      "knownOnPi": false, "known": false, "label": "" },
+                      "knownOnPi": false, "known": false, "label": "",
+                      "exemptOnPi": false, "exempt": false },
                     { "mac": mac(2), "ipv4": ["192.0.2.2"], "hostname": "",
                       "firstUnix": T0, "lastUnix": T0 + 101,
-                      "knownOnPi": true, "known": false, "label": "" },
+                      "knownOnPi": true, "known": false, "label": "",
+                      "exemptOnPi": false, "exempt": false },
                     { "mac": mac(1), "ipv4": ["192.0.2.1"], "hostname": "",
                       "firstUnix": T0, "lastUnix": T0 + 100,
-                      "knownOnPi": false, "known": true, "label": "Printer" },
+                      "knownOnPi": false, "known": true, "label": "Printer",
+                      "exemptOnPi": false, "exempt": false },
                 ],
                 "knownOffline": [
                     { "mac": mac(9), "label": "Old NAS", "firstSeen": 50 },
                     { "mac": mac(10), "label": "", "firstSeen": 60 },
-                ]
+                ],
+                "exemptOffline": [],
+                "exemptOnPiOnly": [],
             })
         );
         assert_eq!(rig.store().known_gen, 3, "looking changes nothing");
@@ -680,6 +871,7 @@ mod tests {
         let v = rig.devices().unwrap();
         assert_eq!(v["devices"].as_array().unwrap().len(), 300);
         assert_eq!(v["knownOffline"], json!([]));
+        assert_eq!(v["exemptOffline"], json!([]));
     }
 
     // -- know -----------------------------------------------------------------
@@ -1125,6 +1317,436 @@ mod tests {
         );
     }
 
+    // -- exempt and unexempt ---------------------------------------------------
+
+    const UNSUPPORTED: &str = "the Pi's software does not support exempt devices yet";
+
+    impl Rig {
+        fn exempt(&mut self, mac: &str, label: Option<&str>) -> ActionResult {
+            let path = self.path();
+            exempt(&mut self.api, &path, T0 + 999, mac, label)
+        }
+        fn unexempt(&mut self, mac: &str) -> ActionResult {
+            let path = self.path();
+            unexempt(&mut self.api, &path, mac)
+        }
+        fn exempt_puts(&self) -> Vec<Value> {
+            self.pi.with(|s| s.exempt_puts.clone())
+        }
+        fn pi_exempt(&self) -> Vec<String> {
+            self.pi.with(|s| s.exempt.clone())
+        }
+    }
+
+    #[test]
+    fn exempt_adds_the_device_to_both_lists_and_pushes_the_known_list_then_the_exempt_list() {
+        let mut rig = Rig::new();
+        let v = rig.exempt(&mac(2), Some("Smart TV")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "label": "Smart TV", "known": 1,
+                   "exempt": 1, "pushed": true, "exemptPushed": true})
+        );
+        let store = rig.store();
+        // Named by the owner, so it is known and the Pi raises no alert.
+        assert_eq!(store.known_macs(), vec![mac(2)]);
+        assert_eq!(store.known[0].label.as_deref(), Some("Smart TV"));
+        assert_eq!(store.known[0].first_seen, T0, "when the Pi first saw it");
+        assert_eq!(store.exempt_macs(), vec![mac(2)]);
+        assert_eq!(store.exempt[0].label.as_deref(), Some("Smart TV"));
+        assert_eq!(store.exempt[0].first_seen, T0);
+        assert!(!store.push_due() && !store.exempt_push_due());
+        assert_eq!(
+            rig.known_puts(),
+            vec![json!({"known": [mac(2)], "append": false, "complete": true})]
+        );
+        assert_eq!(rig.exempt_puts(), vec![json!({"exempt": [mac(2)]})]);
+        assert_eq!(rig.pi_known(), vec![mac(2)]);
+        assert_eq!(rig.pi_exempt(), vec![mac(2)]);
+        let at = |p: &str| rig.pi.with(|s| s.log.iter().position(|l| l.starts_with(p)));
+        assert!(at("PUT /api/qbp/devices/known") < at("PUT /api/qbp/devices/exempt"));
+        // The edit of the known list is the same as `know` makes.
+        let mut plain = Rig::new();
+        plain.know(&mac(2), Some("Smart TV")).unwrap();
+        assert_eq!(plain.store().known, store.known);
+    }
+
+    #[test]
+    fn exempt_of_a_device_the_pi_has_not_seen_starts_now_and_may_have_no_label() {
+        let mut rig = Rig::new();
+        let v = rig.exempt(&mac(50), None).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(50), "known": 1, "exempt": 1,
+                   "pushed": true, "exemptPushed": true}),
+            "no label, no label key"
+        );
+        let store = rig.store();
+        assert_eq!(store.known[0].first_seen, T0 + 999);
+        assert_eq!(store.exempt[0].first_seen, T0 + 999);
+    }
+
+    #[test]
+    fn exempt_keeps_a_label_that_was_there_and_replaces_it_when_given_a_new_one() {
+        let mut rig = Rig::new();
+        rig.know(&mac(2), Some("Phone")).unwrap();
+        let v = rig.exempt(&mac(2), None).unwrap();
+        assert_eq!(v["label"], "Phone", "the known label stays");
+        assert_eq!(rig.store().exempt[0].label, None);
+        assert_eq!(rig.store().known_gen, 1, "no change of the known list");
+        let v = rig.exempt(&mac(2), Some("Work phone")).unwrap();
+        assert_eq!(v["label"], "Work phone");
+        let store = rig.store();
+        assert_eq!(store.known[0].label.as_deref(), Some("Work phone"));
+        assert_eq!(store.exempt[0].label.as_deref(), Some("Work phone"));
+        assert_eq!((store.known.len(), store.exempt.len()), (1, 1));
+        assert_eq!(store.exempt_gen, 2);
+        // Asking again changes nothing and still pushes (as `know` does).
+        let before = rig.exempt_puts().len();
+        rig.exempt(&mac(2), Some("Work phone")).unwrap();
+        assert_eq!(rig.store().exempt_gen, 2);
+        assert_eq!(rig.exempt_puts().len(), before + 1);
+    }
+
+    #[test]
+    fn exempt_cuts_a_long_label_at_64_characters() {
+        let mut rig = Rig::new();
+        let v = rig.exempt(&mac(1), Some(&"é".repeat(100))).unwrap();
+        assert_eq!(v["label"].as_str().unwrap().chars().count(), 64);
+        assert_eq!(
+            rig.store().exempt[0]
+                .label
+                .as_deref()
+                .unwrap()
+                .chars()
+                .count(),
+            64
+        );
+    }
+
+    #[test]
+    fn the_first_exempt_on_an_empty_known_list_seeds_it_from_a_list_the_pi_learned() {
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "learned", 31, 30);
+        let v = rig.exempt(&mac(31), Some("Tablet")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(31), "label": "Tablet", "known": 31,
+                   "exempt": 1, "seeded": 30, "pushed": true, "exemptPushed": true})
+        );
+        let sent: Vec<String> = (1..=31).map(mac).collect();
+        assert_eq!(rig.pi_known(), sent, "nothing the Pi learned is lost");
+        assert_eq!(rig.pi_exempt(), vec![mac(31)]);
+    }
+
+    #[test]
+    fn more_than_64_exempt_devices_are_refused_and_nothing_is_changed_or_pushed() {
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            for i in 1..=wdstore::MAX_EXEMPT {
+                s.know(&mac(i), None, T0);
+                s.add_exempt(&mac(i), None, T0);
+            }
+        });
+        let before = rig.store();
+        let e = err(rig.exempt(&mac(5000), Some("One too many")));
+        assert_eq!(e.code, "full");
+        assert!(
+            e.detail.contains("exempt") && e.detail.contains("64"),
+            "{}",
+            e.detail
+        );
+        assert_eq!(rig.store(), before, "not even the known list was touched");
+        assert!(rig.known_puts().is_empty() && rig.exempt_puts().is_empty());
+        // A device that is there can still get a label.
+        let v = rig.exempt(&mac(7), Some("Seventh")).unwrap();
+        assert_eq!(
+            (v["exempt"].clone(), v["exemptPushed"].clone()),
+            (json!(64), json!(true))
+        );
+        // And a place frees up when one is taken off.
+        rig.unexempt(&mac(1)).unwrap();
+        assert_eq!(rig.exempt(&mac(5000), None).unwrap()["exempt"], 64);
+    }
+
+    #[test]
+    fn a_device_cannot_be_exempt_without_being_known() {
+        // The known list is full and the device is not on it: it cannot be
+        // marked known, so the exempt list is not changed either.
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            for i in 1..=wdstore::MAX_ENTRIES {
+                s.know(&mac(i), None, T0);
+            }
+        });
+        let before = rig.store();
+        let e = err(rig.exempt(&mac(5000), None));
+        assert_eq!(e.code, "full");
+        assert!(e.detail.contains("known"), "{}", e.detail);
+        assert_eq!(rig.store(), before);
+        assert!(rig.known_puts().is_empty() && rig.exempt_puts().is_empty());
+        // One that is known already goes on the exempt list.
+        let v = rig.exempt(&mac(7), None).unwrap();
+        assert_eq!(
+            (v["known"].clone(), v["exempt"].clone()),
+            (json!(1024), json!(1))
+        );
+    }
+
+    #[test]
+    fn on_an_older_pi_exempt_is_saved_and_reported_as_not_supported() {
+        let mut rig = Rig::on(FakePi::without_exempt(20));
+        let v = rig.exempt(&mac(2), Some("Smart TV")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "label": "Smart TV", "known": 1, "exempt": 1,
+                   "pushed": true, "exemptPushed": false, "exemptPushError": UNSUPPORTED})
+        );
+        let store = rig.store();
+        assert_eq!(store.exempt_macs(), vec![mac(2)]);
+        assert_eq!(store.known_macs(), vec![mac(2)]);
+        assert!(!store.push_due(), "the known list went out");
+        assert!(
+            store.exempt_push_due(),
+            "the watcher tries again in a session"
+        );
+        assert_eq!(rig.pi_known(), vec![mac(2)]);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 1);
+        // The same for taking it off again.
+        let v = rig.unexempt(&mac(2)).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "exempt": 0,
+                   "exemptPushed": false, "exemptPushError": UNSUPPORTED})
+        );
+        assert!(rig.store().exempt.is_empty());
+    }
+
+    #[test]
+    fn on_a_real_pihole_exempt_still_edits_this_pcs_lists() {
+        let mut rig = Rig::on(FakePi::pihole_only(20));
+        let v = rig.exempt(&mac(2), Some("TV")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "label": "TV", "known": 1, "exempt": 1,
+                   "pushed": false, "pushError": "absent",
+                   "exemptPushed": false, "exemptPushError": UNSUPPORTED})
+        );
+        let store = rig.store();
+        assert_eq!(store.known_macs(), vec![mac(2)]);
+        assert_eq!(store.exempt_macs(), vec![mac(2)]);
+        assert!(store.push_due() && store.exempt_push_due());
+        let v = rig.unexempt(&mac(2)).unwrap();
+        assert_eq!(
+            (v["exemptPushed"].clone(), v["exempt"].clone()),
+            (json!(false), json!(0))
+        );
+        assert!(rig.store().exempt.is_empty());
+    }
+
+    #[test]
+    fn a_failed_exempt_push_leaves_the_edit_and_the_known_push_is_unaffected() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| s.fail_exempt = true);
+        let v = rig.exempt(&mac(2), None).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["pushed"], true, "the known list went out");
+        assert_eq!(v["exemptPushed"], false);
+        assert!(
+            v["exemptPushError"].as_str().unwrap().contains("500"),
+            "{v}"
+        );
+        let store = rig.store();
+        assert_eq!(store.exempt_macs(), vec![mac(2)]);
+        assert!(!store.push_due() && store.exempt_push_due());
+
+        rig.pi.with(|s| s.fail_exempt = false);
+        let v = rig.exempt(&mac(3), None).unwrap();
+        assert_eq!(v["exemptPushed"], true);
+        assert!(v.get("exemptPushError").is_none());
+        assert_eq!(
+            rig.pi_exempt(),
+            vec![mac(2), mac(3)],
+            "both edits went out together"
+        );
+        assert!(!rig.store().exempt_push_due());
+    }
+
+    #[test]
+    fn a_failed_known_push_does_not_keep_the_exempt_list_from_going_out() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| s.fail_known = true);
+        let v = rig.exempt(&mac(2), None).unwrap();
+        assert_eq!(v["pushed"], false);
+        assert!(v["pushError"].as_str().unwrap().contains("500"));
+        assert_eq!(v["exemptPushed"], true);
+        assert_eq!(rig.pi_exempt(), vec![mac(2)]);
+        let store = rig.store();
+        assert!(store.push_due() && !store.exempt_push_due());
+        rig.pi.with(|s| s.fail_known = false);
+        let v = rig.exempt(&mac(2), None).unwrap();
+        assert_eq!(
+            (v["pushed"].clone(), v["exemptPushed"].clone()),
+            (json!(true), json!(true))
+        );
+        assert!(!rig.store().push_due() && !rig.store().exempt_push_due());
+    }
+
+    #[test]
+    fn unexempt_removes_the_device_pushes_the_list_and_leaves_it_known() {
+        let mut rig = Rig::new();
+        rig.exempt(&mac(1), Some("A")).unwrap();
+        rig.exempt(&mac(2), None).unwrap();
+        let known_pushes = rig.known_puts().len();
+        let v = rig.unexempt(&mac(1)).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(1), "exempt": 1, "exemptPushed": true})
+        );
+        assert_eq!(rig.pi_exempt(), vec![mac(2)]);
+        let v = rig.unexempt(&mac(2)).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "exempt": 0, "exemptPushed": true})
+        );
+        let body = |m: &[String]| json!({ "exempt": m });
+        assert_eq!(
+            rig.exempt_puts(),
+            vec![
+                body(&[mac(1)]),
+                body(&[mac(1), mac(2)]),
+                body(&[mac(2)]),
+                body(&[]),
+            ],
+            "the emptied list is pushed too"
+        );
+        assert!(rig.pi_exempt().is_empty());
+        let store = rig.store();
+        assert!(store.exempt.is_empty() && !store.exempt_push_due());
+        assert_eq!(store.known_macs(), vec![mac(1), mac(2)], "still known");
+        assert_eq!(
+            rig.known_puts().len(),
+            known_pushes,
+            "the known list is not pushed"
+        );
+        assert_eq!(rig.pi_known(), vec![mac(1), mac(2)]);
+    }
+
+    #[test]
+    fn unexempt_of_a_device_that_is_not_listed_is_not_found_and_makes_no_request() {
+        let mut rig = Rig::new();
+        rig.exempt(&mac(1), None).unwrap();
+        let before = rig.pi.with(|s| s.log.len());
+        let e = err(rig.unexempt(&mac(2)));
+        assert_eq!(e.code, "not-found");
+        assert!(e.detail.contains("exempt"), "{}", e.detail);
+        assert_eq!(rig.pi.with(|s| s.log.len()), before);
+        assert_eq!(rig.store().exempt_macs(), vec![mac(1)]);
+        // Known but not exempt is just as not found.
+        rig.know(&mac(3), None).unwrap();
+        assert_eq!(err(rig.unexempt(&mac(3))).code, "not-found");
+    }
+
+    #[test]
+    fn exempt_and_unexempt_need_a_writable_store_and_push_nothing_without_one() {
+        let mut rig = Rig::new();
+        let bad = unwritable(rig.dir.path());
+        let e = exempt(&mut rig.api, &bad, T0, &mac(1), None).unwrap_err();
+        assert_eq!(e.code, "store");
+        assert!(e.detail.contains("exempt list"), "{}", e.detail);
+        let e = unexempt(&mut rig.api, &bad, &mac(1)).unwrap_err();
+        assert_eq!(e.code, "store");
+        assert!(rig.known_puts().is_empty() && rig.exempt_puts().is_empty());
+    }
+
+    #[test]
+    fn exempt_without_an_answer_from_devices_still_works_like_know() {
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "learned", 10, 8);
+        rig.pi.with(|s| s.fail_qbp = true);
+        let v = rig.exempt(&mac(10), None).unwrap();
+        assert_eq!(v["known"], 1, "it cannot know what to seed from");
+        assert!(v.get("seeded").is_none());
+        assert_eq!(
+            (v["pushed"].clone(), v["exemptPushed"].clone()),
+            (json!(false), json!(false))
+        );
+        assert_eq!(rig.store().exempt_macs(), vec![mac(10)]);
+    }
+
+    #[test]
+    fn devices_marks_exempt_devices_on_both_sides_and_lists_the_rest() {
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            s.know(&mac(1), Some("TV"), 40);
+            s.add_exempt(&mac(1), Some("TV"), 40);
+            s.know(&mac(9), Some("Console"), 50);
+            s.add_exempt(&mac(9), Some("Console"), 50);
+            s.add_exempt(&mac(10), None, 60);
+        });
+        rig.pi.with(|s| {
+            // What the Pi has: this PC's list as pushed earlier (mac 1 only)
+            // and two addresses of its own config file.
+            s.exempt = vec![mac(1)];
+            s.exempt_config = vec![mac(3), mac(40)];
+        });
+        let v = rig.devices().unwrap();
+        let by_mac = |m: String| {
+            v["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["mac"] == json!(m))
+                .unwrap()
+                .clone()
+        };
+        let flags = |m: String| {
+            let d = by_mac(m);
+            (d["exempt"].clone(), d["exemptOnPi"].clone())
+        };
+        assert_eq!(flags(mac(1)), (json!(true), json!(true)));
+        assert_eq!(
+            flags(mac(3)),
+            (json!(false), json!(true)),
+            "from the Pi's config"
+        );
+        assert_eq!(flags(mac(2)), (json!(false), json!(false)));
+        assert_eq!(
+            v["exemptOffline"],
+            json!([
+                { "mac": mac(9), "label": "Console", "firstSeen": 50 },
+                { "mac": mac(10), "label": "", "firstSeen": 60 },
+            ]),
+            "on this PC's list, not among the Pi's devices"
+        );
+        assert_eq!(
+            v["exemptOnPiOnly"],
+            json!([mac(3), mac(40)]),
+            "on the Pi's list, not on this PC's"
+        );
+        assert_eq!(rig.store().exempt_gen, 3, "looking changes nothing");
+    }
+
+    #[test]
+    fn devices_from_an_older_pi_has_no_exempt_flags_and_nothing_only_on_the_pi() {
+        let mut rig = Rig::on(FakePi::without_exempt(20));
+        rig.edit(|s| {
+            s.know(&mac(1), None, 40);
+            s.add_exempt(&mac(1), None, 40);
+            s.add_exempt(&mac(9), Some("Gone"), 50);
+        });
+        let v = rig.devices().unwrap();
+        for d in v["devices"].as_array().unwrap() {
+            assert_eq!(d["exemptOnPi"], false, "{d}");
+            assert_eq!(d["exempt"], d["mac"] == json!(mac(1)), "{d}");
+        }
+        assert_eq!(v["exemptOnPiOnly"], json!([]));
+        assert_eq!(
+            v["exemptOffline"],
+            json!([{ "mac": mac(9), "label": "Gone", "firstSeen": 50 }])
+        );
+    }
+
     // -- errors and dispatch --------------------------------------------------
 
     #[test]
@@ -1189,5 +1811,11 @@ mod tests {
         assert_eq!(go(know_cmd)["label"], "Nine");
         assert_eq!(go(WdCmd::KnowAll)["added"], 3);
         assert_eq!(go(WdCmd::Forget { mac: mac(9) })["known"], 3);
+        let exempt_cmd = WdCmd::Exempt {
+            mac: mac(8),
+            label: Some("Eight".into()),
+        };
+        assert_eq!(go(exempt_cmd)["exempt"], 1);
+        assert_eq!(go(WdCmd::Unexempt { mac: mac(8) })["exempt"], 0);
     }
 }

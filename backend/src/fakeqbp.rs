@@ -1,11 +1,13 @@
 //! A fake Pi for the watchdog tests: the Pi-hole login and stats endpoints
-//! plus qberrypi's `/api/qbp/` watchdog (alerts, ack, acked, devices, known),
-//! behind the throwaway TLS server of `https::testutil`.
+//! plus qberrypi's `/api/qbp/` watchdog (alerts, ack, acked, devices, known,
+//! exempt), behind the throwaway TLS server of `https::testutil`.
 //!
 //! The model lives in [`PiState`], shared with the test through [`FakePi`], so
 //! a test can raise alerts, invalidate the session ("the Pi forgot it") or
 //! "reboot" the Pi (rev and ids restart, the known list is back to `waiting`,
-//! every session is gone) while a poller is running. Test data uses
+//! the pushed exempt list is gone, every session is gone) while a poller is
+//! running. An older Pi that has no exempt support (404 on its route, none of
+//! its fields in the devices answer) is [`FakePi::without_exempt`]. Test data uses
 //! documentation addresses (192.0.2.x) and locally administered MACs
 //! (02:00:00:...) only.
 
@@ -25,6 +27,10 @@ const NO_CONTENT: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
 const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}";
 const UNAUTHORIZED: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}";
 const SERVER_ERROR: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\n\r\n{}";
+const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}";
+
+/// The most addresses the Pi takes in one `PUT devices/exempt`.
+pub const EXEMPT_MAX: usize = 64;
 
 /// The `n`-th alert key: 16 lower-case hex digits, stable across "reboots".
 pub fn key(n: usize) -> String {
@@ -74,6 +80,13 @@ pub struct PiState {
     pub fail_qbp: bool,
     /// True: every `PUT` under `/api/qbp/` fails with HTTP 500.
     pub fail_puts: bool,
+    /// False: an older Pi. `PUT devices/exempt` is answered 404 and the
+    /// devices answer has neither `exempt` nor `exempt_macs`.
+    pub exempt_support: bool,
+    /// True: `PUT devices/exempt` fails with HTTP 500 (the other routes work).
+    pub fail_exempt: bool,
+    /// True: `PUT devices/known` fails with HTTP 500 (the other routes work).
+    pub fail_known: bool,
     pub rev: u64,
     next_id: u64,
     /// Moves 10 s with every alert raised.
@@ -84,6 +97,11 @@ pub struct PiState {
     /// The known list in effect.
     pub known: Vec<String>,
     staged: Vec<String>,
+    /// The exempt list that was pushed (memory only: a reboot clears it).
+    pub exempt: Vec<String>,
+    /// The exempt list from the Pi's own config file: it survives a reboot
+    /// and is never touched by a push.
+    pub exempt_config: Vec<String>,
     /// (mac, ipv4) of the devices `GET devices` lists. Each is seen later than
     /// the one before it, so the list comes oldest first: the poller must
     /// sort, not trust the Pi's order.
@@ -101,6 +119,9 @@ pub struct PiState {
     pub acked_puts: Vec<Value>,
     /// The bodies of `PUT devices/known`.
     pub known_puts: Vec<Value>,
+    /// The bodies of `PUT devices/exempt`, every one that reached the route
+    /// (also the ones answered 400 or 500).
+    pub exempt_puts: Vec<Value>,
     /// The `since` of every `GET alerts`.
     pub since: Vec<u64>,
 }
@@ -111,6 +132,9 @@ impl PiState {
             watchdog,
             fail_qbp: false,
             fail_puts: false,
+            exempt_support: true,
+            fail_exempt: false,
+            fail_known: false,
             rev: 0,
             next_id: 1,
             clock: T0,
@@ -118,6 +142,8 @@ impl PiState {
             known_list: "waiting",
             known: Vec::new(),
             staged: Vec::new(),
+            exempt: Vec::new(),
+            exempt_config: Vec::new(),
             devices: (1..=3).map(|i| (mac(i), format!("192.0.2.{i}"))).collect(),
             sid: None,
             logins: 0,
@@ -126,6 +152,7 @@ impl PiState {
             rejected: 0,
             acked_puts: Vec::new(),
             known_puts: Vec::new(),
+            exempt_puts: Vec::new(),
             since: Vec::new(),
         }
     }
@@ -146,20 +173,41 @@ impl PiState {
         json!({ "rev": self.rev, "suppressed": 0, "alerts": alerts })
     }
 
+    /// The Pi's effective exempt list: its config file's, then the pushed
+    /// one (each address once).
+    pub fn exempt_macs(&self) -> Vec<String> {
+        let mut all = self.exempt_config.clone();
+        for m in &self.exempt {
+            if !all.contains(m) {
+                all.push(m.clone());
+            }
+        }
+        all
+    }
+
     fn devices_json(&self) -> Value {
+        let effective = self.exempt_macs();
         let devices: Vec<Value> = self
             .devices
             .iter()
             .enumerate()
             .map(|(i, (m, ip))| {
-                json!({
+                let mut d = json!({
                     "mac": m, "ipv4": [ip], "hostname": "",
                     "first_unix": T0, "last_unix": T0 + 100 + i as u64,
                     "known": self.known.contains(m)
-                })
+                });
+                if self.exempt_support {
+                    d["exempt"] = json!(effective.contains(m));
+                }
+                d
             })
             .collect();
-        json!({ "known_list": self.known_list, "devices": devices })
+        let mut v = json!({ "known_list": self.known_list, "devices": devices });
+        if self.exempt_support {
+            v["exempt_macs"] = json!(effective);
+        }
+        v
     }
 }
 
@@ -274,6 +322,9 @@ fn respond(st: &mut PiState, req: &str) -> Vec<u8> {
         return ok_json(&st.devices_json().to_string());
     }
     if method == "PUT" && path == "/api/qbp/devices/known" {
+        if st.fail_known {
+            return SERVER_ERROR.to_vec();
+        }
         let macs: Vec<String> = body["known"]
             .as_array()
             .map(|a| {
@@ -298,6 +349,31 @@ fn respond(st: &mut PiState, req: &str) -> Vec<u8> {
         st.known_puts.push(body);
         return ok_json(&format!(r#"{{"known":{n}}}"#));
     }
+    if method == "PUT" && path == "/api/qbp/devices/exempt" {
+        if !st.exempt_support {
+            return NOT_FOUND.to_vec();
+        }
+        st.exempt_puts.push(body.clone());
+        if st.fail_exempt {
+            return SERVER_ERROR.to_vec();
+        }
+        // The Pi refuses a body that is not `{"exempt": [<mac>, ...]}` with
+        // at most 64 lower-case colon-separated addresses.
+        let list = body["exempt"].as_array().filter(|a| a.len() <= EXEMPT_MAX);
+        let macs: Option<Vec<String>> = list.and_then(|a| {
+            a.iter()
+                .map(|m| {
+                    let m = m.as_str()?;
+                    (crate::watchdog::normalize_mac(m).as_deref() == Some(m)).then(|| m.to_string())
+                })
+                .collect()
+        });
+        let Some(macs) = macs else {
+            return BAD_REQUEST.to_vec();
+        };
+        st.exempt = macs;
+        return ok_json(&format!(r#"{{"exempt":{}}}"#, st.exempt.len()));
+    }
     NOT_FOUND.to_vec()
 }
 
@@ -315,6 +391,13 @@ impl FakePi {
     /// A real Pi-hole: 404 on every `/api/qbp/` path.
     pub fn pihole_only(conns: usize) -> Self {
         Self::build(conns, false)
+    }
+
+    /// An older qberrypi: a watchdog without exempt support.
+    pub fn without_exempt(conns: usize) -> Self {
+        let pi = Self::build(conns, true);
+        pi.with(|s| s.exempt_support = false);
+        pi
     }
 
     fn build(conns: usize, watchdog: bool) -> Self {
@@ -394,7 +477,8 @@ impl FakePi {
     }
 
     /// A reboot: rev and ids restart, the alerts and the known list are gone
-    /// (the list is `waiting` again), and so is every session.
+    /// (the list is `waiting` again), the pushed exempt list is gone (the one
+    /// from the Pi's config file stays), and so is every session.
     pub fn reboot(&self) {
         self.reboot_inner(false);
     }
@@ -412,6 +496,7 @@ impl FakePi {
             s.alerts.clear();
             s.known.clear();
             s.staged.clear();
+            s.exempt.clear();
             s.known_list = "waiting";
             if !keep_session {
                 s.sid = None;

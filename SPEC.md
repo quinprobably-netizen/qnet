@@ -91,8 +91,9 @@ wiped the Pi-hole pin from every profile.
     `partial`, `unconfigured`, `enterprise`, `badpass`, `auth`, `nolink`,
     `radio`, `rfkill`. The `watchdog` verbs add `absent` (the Pi-hole has no
     watchdog), `not-found` (no such alert, or the device is not on the known
-    list), `full` (the known list already holds 1024 devices) and `store` (the
-    PC-side watchdog store could not be written).
+    or exempt list), `full` (the known list already holds 1024 devices, or the
+    exempt list 64) and `store` (the PC-side watchdog store could not be
+    written).
   - **One-shot verbs and signals:** except the interactive `pihole setup`,
     they catch SIGTERM/SIGINT/SIGHUP. The step in progress finishes (a
     profile that was written is applied, a half-made Wi-Fi profile is
@@ -107,10 +108,15 @@ wiped the Pi-hole pin from every profile.
     has), `notified` (the alert instances that already got a desktop
     notification, so a restart repeats none), `absentFor` (only while set:
     `"<address>|<pin>"` of the Pi-hole that was found to have no watchdog, see
-    the API thread above) and `version`. Each list keeps at most 1024 entries.
+    the API thread above), `exempt` (the exempt-device list: the devices that
+    skip ad blocking, same entries as `known`), `exemptGen` and
+    `pushedExemptGen` (which edit of it the Pi has) and `version`. `acked`,
+    `known` and `notified` keep at most 1024 entries each, `exempt` at most
+    64 (the Pi takes the list in one body of that size). A file from before
+    the exempt list has none of its keys and loads with an empty list.
   - **Writers:** the watcher (keys the Pi reports as acknowledged,
     `notified`, `pushedKnownGen` after a push) and the one-shot verbs
-    `watchdog ack|know|forget|know-all`. Two processes can write it, so every
+    `watchdog ack|know|forget|know-all|exempt|unexempt`. Two processes can write it, so every
     change is a read-modify-write under an exclusive `flock` on
     `watchdog.lock` and replaces the file atomically. Unlike the DNS lock this
     one waits, up to 2 s: a blocking `flock` queued in the kernel (on a helper
@@ -272,7 +278,8 @@ subtracts it from `today` and from each `history` bucket.
     "knownList": "waiting|learned|received|",
     "devices": [
       { "mac": "02:00:00:00:00:07", "ipv4": ["192.0.2.7"], "hostname": "", "firstUnix": 1794000000,
-        "lastUnix": 1794000050, "knownOnPi": false, "known": true, "label": "Printer" }
+        "lastUnix": 1794000050, "knownOnPi": false, "known": true, "label": "Printer",
+        "exemptOnPi": false, "exempt": true }
     ],
     "knownCount": 12,
     "pushedAt": 1794000001,
@@ -413,6 +420,12 @@ Field rules:
     have learned a device on its own, or a list edit may not have been pushed
     yet.
   - `label`: this PC's label for the device, `""` when there is none.
+  - `exemptOnPi`: the Pi skips ad blocking for the device (threat blocking
+    stays); `false` when the Pi does not say, as an older Pi does not.
+    `exempt`: it is on this PC's exempt list, the one pushed to the Pi. As
+    with the known flags the two can differ: the Pi's own config file can
+    exempt a device, an edit may not have been pushed yet, or the Pi's
+    software may not support exempt devices.
   - `ipv4` holds at most 4 addresses; `hostname` is cut to 64 bytes.
 - **`watchdog.knownList`:** the Pi's list state: `waiting` (it has no list and
   wants one; qnet pushes the PC's list if it has one), `learned` (it built its
@@ -443,9 +456,11 @@ Field rules:
 | `qnet portal` | Opens `link.portalUrl`, or `http://neverssl.com`, in a normal **incognito window with a throwaway profile**: `chromium --user-data-dir=<new 0700 temp dir> --incognito <url>` (not `--app`: a portal page is untrusted web content). The temp dir is removed when the browser exits. |
 | `qnet watchdog alerts` | Every alert the Pi holds, newest change first, in the shape of `watchdog.alerts` (not cut at 50): `{"ok":true,"rev","suppressed","alerts":[…]}`. Error: `absent`. |
 | `qnet watchdog ack <id>` | Looks the alert up by `id` (`GET alerts`), `POST alerts/<id>/ack`, then records its key in the store so the Pi gets it again after a reboot. Result `{"ok":true,"id","key","saved":bool}`; `saved:false` means the Pi took it but this PC could not record it.<br>• Errors: `invalid` (not a whole number), `not-found` (no alert with that id, also when it vanished before the POST; nothing is written), `absent`. |
-| `qnet watchdog devices` | Result `{"ok":true,"knownList","devices":[…],"knownOffline":[{mac,label,firstSeen}]}`.<br>• `devices`: everything the Pi reports (not cut at 128), last seen first, each as in `watchdog.devices`.<br>• `knownOffline`: devices on this PC's known list that the Pi did not report (`label` is `""` without one).<br>• Error: `absent`. |
+| `qnet watchdog devices` | Result `{"ok":true,"knownList","devices":[…],"knownOffline":[{mac,label,firstSeen}],"exemptOffline":[{mac,label,firstSeen}],"exemptOnPiOnly":[mac,…]}`.<br>• `devices`: everything the Pi reports (not cut at 128), last seen first, each as in `watchdog.devices`.<br>• `knownOffline`: devices on this PC's known list that the Pi did not report (`label` is `""` without one). `exemptOffline`: the same for this PC's exempt list.<br>• `exemptOnPiOnly`: the addresses on the Pi's effective exempt list (`exempt_macs`) that are not on this PC's: they come from the Pi's own config file. `[]` for a Pi that does not say.<br>• Error: `absent`. |
 | `qnet watchdog know <mac> [label...]` | Puts the device on this PC's known list, or changes its label, then pushes the whole list. Without a label an existing one stays. A new entry's `firstSeen` is when the Pi first saw the device, or now if the Pi does not list it or cannot be asked. It pushes on every call, also when nothing changed.<br>• **Seeding:** the Pi raises a `new_device` alert for every device it has seen that is not on the list it is given, so replacing a list it made itself with one device would flood. When this PC's list is empty (and no edit that emptied it is still unpushed) and the Pi's `knownList` is `learned` or `received`, the Pi's devices that are `known` are put on this PC's list first (no label, `firstSeen` from the Pi), in the same locked edit, then the device is added and the whole list pushed. If the devices cannot be read, nothing is seeded. `forget` cannot reach that state: an empty list has nothing to forget.<br>• Result `{"ok":true,"mac","label"?,"known":n,"seeded"?:n,"pushed":bool,"pushError"?}`; `known` is the size of the list after the edit, `seeded` (only when more than 0) how many entries were taken over from the Pi.<br>• A failed push, or a Pi-hole with no watchdog (`"pushError":"absent"`), still leaves the edit: `pushed:false`, and the watcher pushes it later.<br>• Errors: `invalid`, `full` (a new device, the list holds 1024; nothing is pushed), `store`. |
 | `qnet watchdog forget <mac>` | Takes the device off this PC's known list, then pushes the list; an emptied list is pushed too. Result as for `know`, without `label`. Errors: `invalid`, `not-found` (not on this PC's list; the Pi's own `known` flag does not count; no request is made), `store`. |
+| `qnet watchdog exempt <mac> [label...]` | Puts the device on this PC's exempt list (or changes its label; without a label an existing one stays, a label is handled as for `know`) **and** on the known list exactly as `know` does (the owner named the device, so the Pi must not raise a new-device alert for it; the seeding of an empty known list applies too), in one locked edit. Then it pushes the known list, then the exempt list (`PUT /api/qbp/devices/exempt`, body `{"exempt":[…]}`, the whole list, at most 64 addresses; an emptied list is pushed too). It pushes on every call, also when nothing changed.<br>• Result `{"ok":true,"mac","label"?,"known":n,"exempt":n,"seeded"?:n,"pushed":bool,"pushError"?,"exemptPushed":bool,"exemptPushError"?}`: `known`, `seeded`, `pushed` and `pushError` are as for `know`; `exempt` is the size of the exempt list after the edit; `exemptPushed` and `exemptPushError` are the exempt push alone, so one failing never hides the other.<br>• A Pi (or a real Pi-hole) that answers 404 for the route has no exempt support: the edit stays and is saved, `exemptPushed:false` and `exemptPushError` says "the Pi's software does not support exempt devices yet". The watcher asks again once per login session. Any other failure leaves the edit too, and the watcher retries it on its next cycle.<br>• Errors: `invalid`, `full` (the exempt list holds 64 and this is a new device, or the known list holds 1024 and the device is not on it; nothing is changed or pushed), `store`. |
+| `qnet watchdog unexempt <mac>` | Takes the device off this PC's exempt list, then pushes that list (an emptied list is pushed too). The device stays on the known list, which is neither changed nor pushed. Result `{"ok":true,"mac","exempt":n,"exemptPushed":bool,"exemptPushError"?}`; a 404 is reported as for `exempt`. Errors: `invalid`, `not-found` (not on this PC's exempt list; the Pi's own config list does not count; no request is made), `store`. |
 | `qnet watchdog know-all` | Adds every device the Pi reports that is not on the list, in one edit (existing entries and labels are untouched; `firstSeen` comes from the Pi), then pushes. It pushes only if something was added or an earlier edit is still waiting to go.<br>• Result `{"ok":true,"added":n,"known":n,"pushed":bool,"skipped"?:n,"pushError"?}`; `skipped` counts devices that did not fit on a full list.<br>• Errors: `absent`, `store`. |
 
 The `watchdog` verbs share these rules:
@@ -453,7 +468,7 @@ The `watchdog` verbs share these rules:
 - A `<mac>` is six hex pairs with `:` or `-` between them, in either case; it is stored in lower-case colon form. Anything else is `invalid`, as is an `<id>` that is not a whole number.
 - A `label` is the rest of the line, words joined by single spaces and taken as typed (even words that look like flags). Control characters are removed, the ends trimmed and it is cut at 64 characters (cut, not refused); nothing left means no label.
 - A wrong shape of command is `usage`. Besides the errors above they can fail with `unconfigured`, `auth`, `tls`, `unreachable`, `api` (an answer qnet cannot use) and `interrupted`. The exit code matches `ok`, as for every verb.
-- `know` and `forget` need no watchdog to edit the list; `alerts`, `ack`, `devices` and `know-all` answer `absent` without one.
+- `know`, `forget`, `exempt` and `unexempt` need no watchdog to edit the lists; `alerts`, `ack`, `devices` and `know-all` answer `absent` without one.
 
 ## Failover (in `qnet watch`)
 

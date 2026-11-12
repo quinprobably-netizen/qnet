@@ -25,6 +25,10 @@ knows about the Pi-hole on the LAN. It is a thin QML panel over a Rust binary,
     desktop notifications (3 a minute, then "N more alerts").
   - The acknowledged alerts and the known devices are kept on this PC and
     pushed back after a Pi reboot.
+  - Devices can be exempt from ad blocking (threat blocking stays): the list
+    is kept on this PC and pushed to the Pi like the known list. A Pi that
+    does not support it yet is told so by the commands, and nothing else is
+    affected.
   - Against a real Pi-hole nothing changes. There is no panel for it yet.
 
 Details: `SPEC.md`.
@@ -40,6 +44,8 @@ qnet watchdog ack <id>       # acknowledge an alert
 qnet watchdog devices        # its devices, and what this PC knows of them
 qnet watchdog know <mac> [label...]   # add to the known list; pushed to the Pi
 qnet watchdog forget <mac>   # take a device off the list
+qnet watchdog exempt <mac> [label...]   # skip ad blocking for it (also marks it known); pushed to the Pi
+qnet watchdog unexempt <mac> # ad blocking again; the device stays known
 qnet watchdog know-all       # add every device the Pi has seen
 ```
 
