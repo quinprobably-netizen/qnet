@@ -166,7 +166,7 @@ wiped the Pi-hole pin from every profile.
 | Pi-hole stats | HTTPS API on 443 with the **pinned cert SHA-256**: `/api/stats/summary`, `/api/dns/blocking` | only while open, every 10 s; `/api/history` and `/api/stats/upstreams` every 60 s and on open |
 | Watchdog alerts (qberrypi only) | `GET /api/qbp/alerts?since=<rev>` on the same pinned HTTPS session | open: after every good stats poll (10 s). Closed: 30 s after start, then every 60 s, while the watchdog is present; while the Pi-hole has not answered yet, a failing poll waits 60 s, 120 s, … up to 30 min. Never again once it is absent, until a new login session or a new config, and not at all while closed once the store says this Pi-hole is absent (`absentFor`) |
 | Watchdog devices (qberrypi only) | `GET /api/qbp/devices` | open only: on open, then every 60 s. Never while closed |
-| Watchdog pushes | `PUT /api/qbp/alerts/acked`, `PUT /api/qbp/devices/known` and `PUT /api/qbp/devices/exempt` | only when due (see "Watchdog (qberrypi)"): the first cycle of a session, a new login (in the same cycle), a Pi restart, a Pi that is `waiting` for its list, an edit of the known list (of the exempt list for its own call). Each body is at most 4000 bytes (the Pi's cap is 4096), so the known list goes in chunks; the exempt list is one body of at most 64 addresses. An empty known or exempt list is pushed only when an edit emptied it |
+| Watchdog pushes | `PUT /api/qbp/alerts/acked`, `PUT /api/qbp/devices/known` and `PUT /api/qbp/devices/exempt` | only when due (see "Watchdog (qberrypi)"): the first cycle of a session, a new login (in the same cycle), a Pi restart, a Pi that is `waiting` for its list, an edit of the known list (of the exempt list for its own call). Each body is at most 4000 bytes (the Pi's cap is 4096), so the known list goes in chunks; the exempt list is one body of at most 64 addresses. An empty known list is pushed only when an edit emptied it; the exempt list is pushed empty too, see "Watchdog (qberrypi)" |
 
 ### Pi-hole API sessions
 
@@ -645,9 +645,16 @@ answer that does not parse is an error, never "absent".
     first cycle of a client, a new login session, a restart, a `waiting` Pi),
     and after an edit of its own (`exemptGen` differs from `pushedExemptGen`),
     right after the known list: `PUT devices/exempt` with the whole list in one
-    body of at most 64 addresses (none is sent for an empty list that nobody
-    edited, and it is never sent to a Pi-hole that has no watchdog, whose
-    lists answer 404 first). Its push is kept apart from the known list's:
+    body of at most 64 addresses. Unlike the known list it is pushed when it
+    is empty as well, on every such push and not only after an edit: this PC's
+    list is the master, so a Pi that still holds exemptions from a store that
+    was lost or reset hears that there are none. It is not sent before the
+    watchdog has been seen (the first cycle of a client with an empty list
+    waits for the next one), so a real Pi-hole is never asked for it, and it
+    is left out when the lists answered 404 or the Pi cannot be reached. Its
+    push is kept apart from the known list's:
+    - a known list or acks that keep failing (the Pi answers, with an
+      error) do not hold it back: it is sent in the same cycle, after them;
     - a failure of it (any status but 404, or no answer) never stops or
       delays the known list's push or the alerts; the list stays due, is tried
       again on the next cycle as a failed known push would be, and its message

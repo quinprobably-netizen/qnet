@@ -1064,13 +1064,24 @@ impl Poller {
     ) -> Result<Qbp<()>, ApiError> {
         let store = Store::load(store_path);
         let due = self.pushed_logins != Some(api.logins()) || self.push_due || store.push_due();
-        if due && self.push_lists(api, store_path, &store, now)? == Qbp::Absent {
-            return Ok(Qbp::Absent);
+        let lists = if due {
+            self.push_lists(api, store_path, &store, now)
+        } else {
+            Ok(Qbp::Present(()))
+        };
+        // The exempt list goes after the other lists, but not behind them: a
+        // known list or acks that keep failing (the Pi answered, with an
+        // error) must not keep the exempt devices ad-blocked. It is left out
+        // only when there is nothing to talk to: no watchdog (a real
+        // Pi-hole, which answered 404 to the lists) or a Pi that cannot be
+        // reached at all (the same failure, slowly, a second time). Its own
+        // trouble never fails the cycle: see `push_exempt`.
+        match &lists {
+            Ok(Qbp::Absent)
+            | Err(ApiError::Auth(_) | ApiError::Tls(_) | ApiError::Unreachable(_)) => {}
+            _ => self.push_exempt(api, store_path, &store, now),
         }
-        // After the other lists, and whatever happens to it, no failure of
-        // the cycle: see `push_exempt`.
-        self.push_exempt(api, store_path, &store, now);
-        Ok(Qbp::Present(()))
+        lists
     }
 
     /// The acknowledged keys and the known list, which are due: `store` is
@@ -1126,8 +1137,8 @@ impl Poller {
     /// schedule as a failed known list), and a 404 (a Pi without exempt
     /// support) is a verdict for the session, not an error. (A real Pi-hole
     /// has answered 404 to the lists above, as a rule, and to the alerts at
-    /// the latest.) As for the known list, an empty list is sent only when an
-    /// edit emptied it.
+    /// the latest.) Unlike the known list, an empty list is sent too: see
+    /// the comment where it is decided.
     fn push_exempt(&mut self, api: &mut Pihole, store_path: &Path, store: &Store, now: u64) {
         if self.exempt_absent_logins == Some(api.logins()) {
             return;
@@ -1139,30 +1150,35 @@ impl Poller {
             return;
         }
         let macs = store.exempt_macs();
-        let send = !macs.is_empty() || store.exempt_push_due();
-        if send {
-            match put_exempt(api, &macs) {
-                Ok(Qbp::Present(_)) => {}
-                Ok(Qbp::Absent) => {
-                    self.exempt_absent_logins = Some(api.logins());
-                    self.exempt_pushed_logins = Some(api.logins());
-                    self.exempt_due = false;
-                    self.exempt_error.clear();
-                    return;
-                }
-                Err(e) => {
-                    self.exempt_error = e.message().to_string();
-                    self.exempt_due = true;
-                    return;
-                }
+        // An empty list is pushed too, not only after an edit: this PC's list
+        // is the master, so a Pi that still holds exemptions from a store
+        // that was lost or reset must hear that there are none. Only once the
+        // watchdog has been seen, so that a real Pi-hole is never asked for
+        // it; until then it is asked again at the next cycle.
+        if macs.is_empty() && !store.exempt_push_due() && self.presence != Presence::Present {
+            return;
+        }
+        match put_exempt(api, &macs) {
+            Ok(Qbp::Present(_)) => {}
+            Ok(Qbp::Absent) => {
+                self.exempt_absent_logins = Some(api.logins());
+                self.exempt_pushed_logins = Some(api.logins());
+                self.exempt_due = false;
+                self.exempt_error.clear();
+                return;
+            }
+            Err(e) => {
+                self.exempt_error = e.message().to_string();
+                self.exempt_due = true;
+                return;
             }
         }
         // Read after the call: a re-login during the push is this session.
         self.exempt_pushed_logins = Some(api.logins());
         self.exempt_due = false;
         self.exempt_error.clear();
-        if send {
-            self.pushed_at = now;
+        self.pushed_at = now;
+        if store.exempt_push_due() {
             // `store` was read before the push: an edit made while it was on
             // the wire stays due.
             let generation = store.exempt_gen;
@@ -3029,32 +3045,92 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_exempt_list_is_pushed_only_when_an_edit_emptied_it() {
+    fn an_empty_exempt_list_is_pushed_with_every_session_push_not_only_after_an_edit() {
         let mut rig = Rig::new();
         rig.prepare(3);
-        // A known list and no exempt list: no exempt request, not at a
-        // first cycle, a new client, a new session or a waiting Pi.
+        // The first cycle does not know yet that there is a watchdog (a
+        // real Pi-hole is never asked for an exempt list), so it sends none.
         rig.cycle(T0);
-        rig.poller.client_replaced();
-        rig.cycle(T0 + 1);
-        rig.pi.invalidate();
-        rig.cycle(T0 + 2);
-        rig.pi.set_known_list("waiting");
-        rig.cycle_with_devices(T0 + 3);
-        assert_eq!(rig.pi.count("PUT /api/qbp/devices/known"), 4);
         assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 0);
+        // The next one has seen it: the empty list goes, once.
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.exempt_puts(), vec![json!({"exempt": []})]);
+        assert!(!rig.store().exempt_push_due(), "it was no edit");
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.exempt_puts().len(), 1, "and not at every cycle");
 
-        // An edit that emptied the list is a change the Pi has to hear.
+        // Again for a new login session, a new client and a waiting Pi.
+        rig.pi.invalidate();
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.exempt_puts().len(), 2);
+        rig.poller.client_replaced();
+        rig.cycle(T0 + 4);
+        assert_eq!(rig.exempt_puts().len(), 3);
+        rig.pi.set_known_list("waiting");
+        rig.cycle_with_devices(T0 + 5);
+        assert_eq!(rig.exempt_puts().len(), 4);
+        rig.cycle_with_devices(T0 + 6);
+        assert_eq!(rig.exempt_puts().len(), 4);
+        assert!(rig
+            .exempt_puts()
+            .iter()
+            .all(|b| *b == json!({"exempt": []})));
+
+        // An edit that emptied the list is pushed at the next cycle too.
         rig.edit(|s| {
             s.add_exempt(&fakeqbp::mac(1), None, T0);
             s.remove_exempt(&fakeqbp::mac(1));
         });
         assert!(rig.store().exempt_push_due() && rig.store().exempt.is_empty());
-        rig.cycle(T0 + 4);
-        assert_eq!(rig.exempt_puts(), vec![json!({"exempt": []})]);
+        rig.cycle(T0 + 7);
+        assert_eq!(rig.exempt_puts().len(), 5);
         assert!(!rig.store().exempt_push_due());
+        rig.cycle(T0 + 8);
+        assert_eq!(rig.exempt_puts().len(), 5);
+    }
+
+    #[test]
+    fn a_lost_store_does_not_leave_old_exemptions_on_the_pi() {
+        // The Pi was given exemptions by an earlier store. This PC's store is
+        // new (lost, reset): its session push clears what is stale.
+        let mut rig = Rig::new();
+        rig.pi
+            .with(|s| s.exempt = vec![fakeqbp::mac(1), fakeqbp::mac(2)]);
+        rig.prepare(3);
+        rig.cycle(T0);
+        rig.cycle(T0 + 1);
+        assert!(rig.pi.with(|s| s.exempt.is_empty()), "cleared");
+        // The same whenever a new session begins: the list this PC holds is
+        // the master.
+        rig.pi.with(|s| s.exempt = vec![fakeqbp::mac(3)]);
+        rig.pi.invalidate();
+        rig.cycle(T0 + 2);
+        assert!(rig.pi.with(|s| s.exempt.is_empty()));
+    }
+
+    #[test]
+    fn an_empty_exempt_list_is_asked_of_an_older_pi_once_per_session_and_never_of_a_real_pihole() {
+        let mut rig = Rig::on(FakePi::without_exempt(200));
+        rig.prepare(3);
+        for i in 0..4 {
+            rig.cycle(T0 + i);
+        }
+        assert_eq!(
+            rig.pi.count("PUT /api/qbp/devices/exempt"),
+            1,
+            "404, remembered"
+        );
+        rig.pi.invalidate();
         rig.cycle(T0 + 5);
-        assert_eq!(rig.exempt_puts().len(), 1, "and only once");
+        rig.cycle(T0 + 6);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 2);
+        assert_eq!(rig.report().push_error, "");
+
+        let mut real = Rig::on(FakePi::pihole_only(50));
+        for i in 0..4 {
+            real.cycle_with_devices(T0 + i);
+        }
+        assert_eq!(real.pi.qbp_requests(), 1, "just the alerts, as before");
     }
 
     #[test]
@@ -3209,6 +3285,52 @@ mod tests {
         assert!(!rig.store().exempt_push_due());
         rig.cycle(T0 + 4);
         assert_eq!(rig.exempt_puts().len(), 3);
+    }
+
+    #[test]
+    fn a_failing_known_push_does_not_keep_the_exempt_list_from_reaching_the_pi() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 2);
+        rig.pi.with(|s| s.fail_known = true);
+        rig.pi.raise("beacon", "x.example", None, 1);
+        let out = rig.cycle(T0 + 1);
+        // The known list keeps failing, the exempt list and the alert came.
+        assert_eq!(rig.known_puts().len(), 0, "refused with 500");
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/known"), 1);
+        assert_eq!(rig.exempt_puts(), vec![Rig::exempt_body(2)]);
+        assert_eq!(rig.pi.with(|s| s.exempt.len()), 2);
+        assert_eq!(out.notifications.len(), 1);
+        let store = rig.store();
+        assert!(store.push_due(), "the known list stays due");
+        assert!(!store.exempt_push_due(), "the exempt list is recorded");
+        let r = rig.report();
+        assert!(
+            r.push_error.contains("500") && !r.push_error.starts_with("exempt list"),
+            "the known list's failure is the one shown: {}",
+            r.push_error
+        );
+
+        // Later cycles: the known list is retried, the exempt list is not
+        // sent again while it keeps its place.
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/known"), 2);
+        assert_eq!(rig.exempt_puts().len(), 1);
+
+        // A Pi restart while the known list still fails: the exempt list
+        // goes to the new Pi anyway.
+        rig.pi.reboot();
+        assert!(rig.pi.with(|s| s.exempt.is_empty()));
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.exempt_puts().len(), 2);
+        assert_eq!(rig.pi.with(|s| s.exempt.len()), 2);
+        assert!(rig.store().push_due());
+
+        // The known list comes through once it works again.
+        rig.pi.with(|s| s.fail_known = false);
+        rig.cycle(T0 + 4);
+        assert_eq!(rig.pi.with(|s| s.known.len()), 5);
+        assert!(!rig.store().push_due());
+        assert_eq!(rig.report().push_error, "");
     }
 
     #[test]
