@@ -1,17 +1,27 @@
 //! The PC-side watchdog store (`~/.local/state/qnet/watchdog.json`, mode
 //! 0600): which alerts were acknowledged here, the known-device list (with
-//! labels) that is pushed to the Pi, the exempt-device list (the devices that
-//! skip ad blocking; also with labels, also pushed to the Pi, at most
-//! [`MAX_EXEMPT`] long) and which alert instances already got a desktop
-//! notification. A file from before the exempt list has none: it loads with
-//! an empty one.
+//! labels) that is pushed to the Pi, and which alert instances already got a
+//! desktop notification.
+//!
+//! The exempt-device list (the devices that skip ad blocking; also with
+//! labels, also pushed to the Pi, at most [`MAX_EXEMPT`] long) is part of the
+//! [`Store`] value but lives in a file of its own, `watchdog-exempt.json`
+//! beside it. A qnet from before the exempt list ignores fields it does not
+//! know and writes `watchdog.json` back without them whenever it saves, so
+//! one file for both would let an older watcher still running after an
+//! upgrade erase the list; no older qnet knows the second file, so none can
+//! touch it. The two files are always read and written together, under the
+//! one lock. A store from before the split has the exempt list in
+//! `watchdog.json`: it is read from there while the new file is absent, and
+//! the next [`update`] moves it (the new file wins from then on, and
+//! `watchdog.json` is written without it).
 //!
 //! The watcher and the CLI both write it, so every change goes through
 //! [`update`], a read-modify-write under an exclusive lock on
 //! `watchdog.lock` next to the file. A file that cannot be read or parsed is
-//! never overwritten: [`update`] moves it aside first. Every function takes
-//! the path, so tests use temporary directories and never the real state
-//! directory.
+//! never overwritten: [`update`] moves it aside first (each of the two
+//! files on its own). Every function takes the path of `watchdog.json`, so
+//! tests use temporary directories and never the real state directory.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -83,12 +93,69 @@ pub struct Store {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub absent_for: Option<String>,
     /// The devices that skip ad blocking, at most [`MAX_EXEMPT`]. Pushed to
-    /// the Pi like the known list; the Pi holds it in memory only.
+    /// the Pi like the known list; the Pi holds it in memory only. Kept in
+    /// `watchdog-exempt.json`, not in this file (see the module docs): these
+    /// three fields are only ever read from `watchdog.json`, as the old home
+    /// of the list, and never written to it.
+    #[serde(skip_serializing)]
     pub exempt: Vec<Exempt>,
     /// Bumped by every edit of the exempt list.
+    #[serde(skip_serializing)]
     pub exempt_gen: u64,
     /// The `exempt_gen` that was last pushed to the Pi successfully.
+    #[serde(skip_serializing)]
     pub pushed_exempt_gen: u64,
+}
+
+/// The content of `watchdog-exempt.json`: the exempt list and its counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ExemptFile {
+    version: u32,
+    exempt: Vec<Exempt>,
+    /// Bumped by every edit of the list.
+    generation: u64,
+    /// The `generation` that was last pushed to the Pi successfully.
+    pushed_generation: u64,
+}
+
+impl Default for ExemptFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            exempt: Vec::new(),
+            generation: 0,
+            pushed_generation: 0,
+        }
+    }
+}
+
+/// What [`read_exempt`] found.
+enum ExemptRead {
+    /// No such file (the list never had one, or still lives in
+    /// `watchdog.json`).
+    Absent,
+    /// A file that cannot be read or parsed.
+    Unusable,
+    File(ExemptFile),
+}
+
+/// The path of the exempt list's file for the store at `path`:
+/// `<stem>-exempt.json` beside it (`watchdog-exempt.json`).
+pub fn exempt_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "watchdog".to_string());
+    path.with_file_name(format!("{stem}-exempt.json"))
+}
+
+fn read_exempt(epath: &Path) -> ExemptRead {
+    match std::fs::read(epath) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_or(ExemptRead::Unusable, ExemptRead::File),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => ExemptRead::Absent,
+        Err(_) => ExemptRead::Unusable,
+    }
 }
 
 impl Default for Store {
@@ -167,22 +234,70 @@ impl Store {
     /// the default (empty) store. Never write what this returns back; changes
     /// go through [`update`], which keeps an unreadable file instead of
     /// replacing it.
+    ///
+    /// The exempt list comes from `watchdog-exempt.json`; while that file is
+    /// absent, from the exempt fields an earlier `watchdog.json` may hold.
     pub fn load(path: &Path) -> Store {
-        std::fs::read_to_string(path)
+        let mut store: Store = std::fs::read_to_string(path)
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        match read_exempt(&exempt_path(path)) {
+            ExemptRead::File(f) => store.set_exempt(f),
+            ExemptRead::Unusable => store.set_exempt(ExemptFile::default()),
+            ExemptRead::Absent => {}
+        }
+        store
     }
 
-    /// Write the store to `path`: the directory is made 0700, the file is
-    /// replaced atomically with mode 0600. Prefer [`update`], which holds the
-    /// lock.
+    /// Write both files of the store (`path` and the exempt list's, see
+    /// [`exempt_path`]): the directory is made 0700, each file is replaced
+    /// atomically with mode 0600. Only for tests: the program writes through
+    /// [`update`], which holds the lock and writes only what changed.
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        self.save_exempt(&exempt_path(path))?;
+        self.save_store(path)
+    }
+
+    /// Write `watchdog.json` alone (without the exempt list, as every
+    /// writer that does not know the second file would).
+    fn save_store(&self, path: &Path) -> io::Result<()> {
         if let Some(dir) = path.parent() {
             crate::util::ensure_private_dir(dir)?;
         }
         let bytes = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         crate::util::atomic_write(path, &bytes, 0o600)
+    }
+
+    /// Write the exempt list's file alone.
+    fn save_exempt(&self, epath: &Path) -> io::Result<()> {
+        if let Some(dir) = epath.parent() {
+            crate::util::ensure_private_dir(dir)?;
+        }
+        let bytes = serde_json::to_vec_pretty(&self.exempt_file()).map_err(io::Error::other)?;
+        crate::util::atomic_write(epath, &bytes, 0o600)
+    }
+
+    fn exempt_file(&self) -> ExemptFile {
+        ExemptFile {
+            version: 1,
+            exempt: self.exempt.clone(),
+            generation: self.exempt_gen,
+            pushed_generation: self.pushed_exempt_gen,
+        }
+    }
+
+    fn set_exempt(&mut self, f: ExemptFile) {
+        self.exempt = f.exempt;
+        self.exempt_gen = f.generation;
+        self.pushed_exempt_gen = f.pushed_generation;
+    }
+
+    /// Whether the exempt fields hold anything (what an earlier
+    /// `watchdog.json` left there, as long as the new file is absent).
+    fn has_exempt_data(&self) -> bool {
+        !self.exempt.is_empty() || self.exempt_gen != 0 || self.pushed_exempt_gen != 0
     }
 
     // -- acknowledged alerts ---------------------------------------------------
@@ -402,7 +517,8 @@ fn set_aside(path: &Path) -> io::Result<PathBuf> {
 /// that cannot be read or parsed is moved aside (so the user's known list
 /// and acks are not lost to the next save) and the default store starts
 /// afresh. If it cannot be moved aside the error is returned and nothing is
-/// overwritten.
+/// overwritten. This is `watchdog.json` alone; the exempt list is
+/// [`load_exempt_for_update`].
 fn load_for_update(path: &Path) -> io::Result<Store> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -414,20 +530,60 @@ fn load_for_update(path: &Path) -> io::Result<Store> {
     }
 }
 
-/// Read-modify-write the store at `path` under its lock: load it, run `f`,
-/// write it back only when `f` changed it, release the lock. Fails with
-/// `TimedOut` when the lock stays taken for two seconds, or with whatever the
-/// write fails with. A file that is there but cannot be read or parsed is
-/// renamed to `<name>.bad-<unix secs>` first and `f` sees an empty store; it
-/// is never silently replaced.
+/// The exempt list's file for a read-modify-write, handled as
+/// [`load_for_update`] handles the store: a file that cannot be used is moved
+/// aside (the answer is still `Unusable`: the list starts empty).
+fn load_exempt_for_update(epath: &Path) -> io::Result<ExemptRead> {
+    match read_exempt(epath) {
+        ExemptRead::Unusable => set_aside(epath).map(|_| ExemptRead::Unusable),
+        other => Ok(other),
+    }
+}
+
+/// Read-modify-write the store at `path` under its lock: load it (both
+/// files), run `f`, write back only the file `f` changed, release the lock.
+/// Fails with `TimedOut` when the lock stays taken for two seconds, or with
+/// whatever the write fails with. A file that is there but cannot be read or
+/// parsed is renamed to `<name>.bad-<unix secs>` first and `f` sees an empty
+/// store (or exempt list); it is never silently replaced.
+///
+/// A store from before the exempt list had its own file holds it in
+/// `watchdog.json`. While `watchdog-exempt.json` is absent `f` sees that
+/// list, and the update writes it to the new file, whether `f` changed
+/// anything or not, and writes `watchdog.json` without it. Once the file is
+/// there it wins over whatever an older `watchdog.json` may still say.
 pub fn update<R>(path: &Path, f: impl FnOnce(&mut Store) -> R) -> io::Result<R> {
     let _lock = lock_for(path)?;
+    let epath = exempt_path(path);
     let mut store = load_for_update(path)?;
+    let moved = match load_exempt_for_update(&epath)? {
+        ExemptRead::File(file) => {
+            store.set_exempt(file);
+            false
+        }
+        // Moved aside, so the list starts empty: an empty file is written at
+        // once, so that what an old `watchdog.json` still says is not read
+        // as the list.
+        ExemptRead::Unusable => {
+            store.set_exempt(ExemptFile::default());
+            true
+        }
+        // Never had a file: what an earlier `watchdog.json` holds (if
+        // anything) moves.
+        ExemptRead::Absent => store.has_exempt_data(),
+    };
     let before = serde_json::to_vec(&store).map_err(io::Error::other)?;
+    let before_exempt = serde_json::to_vec(&store.exempt_file()).map_err(io::Error::other)?;
     let result = f(&mut store);
     let after = serde_json::to_vec(&store).map_err(io::Error::other)?;
-    if after != before {
-        store.save(path)?;
+    let after_exempt = serde_json::to_vec(&store.exempt_file()).map_err(io::Error::other)?;
+    // The exempt file first: if the second write fails the list is in both
+    // places rather than in none.
+    if moved || after_exempt != before_exempt {
+        store.save_exempt(&epath)?;
+    }
+    if moved || after != before {
+        store.save_store(path)?;
     }
     Ok(result)
 }
@@ -848,9 +1004,11 @@ mod tests {
     // -- the exempt list -------------------------------------------------------
 
     #[test]
-    fn the_exempt_list_survives_a_save_and_load_in_camel_case() {
+    fn the_exempt_list_survives_a_save_and_load_in_a_file_of_its_own() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("qnet").join("watchdog.json");
+        let ep = exempt_path(&p);
+        assert_eq!(ep, dir.path().join("qnet").join("watchdog-exempt.json"));
         let mut s = Store::default();
         assert!(s.add_exempt("02:00:00:00:00:AA", Some(" Smart TV "), 70));
         assert!(s.add_exempt(&mac(2), None, 80));
@@ -862,13 +1020,22 @@ mod tests {
         assert_eq!(back.exempt[0].label.as_deref(), Some("Smart TV"));
         assert_eq!(back.exempt[1].label, None);
         assert_eq!((back.exempt_gen, back.pushed_exempt_gen), (2, 1));
+        // The list is in its own file, in camel case ...
         let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&ep).unwrap()).unwrap();
+        assert_eq!(v["version"], 1);
         assert_eq!(v["exempt"][0]["mac"], "02:00:00:00:00:aa");
         assert_eq!(v["exempt"][0]["firstSeen"], 70);
         assert_eq!(v["exempt"][1].get("label"), None, "no label, no key");
-        assert_eq!(v["exemptGen"], 2);
-        assert_eq!(v["pushedExemptGen"], 1);
+        assert_eq!(v["generation"], 2);
+        assert_eq!(v["pushedGeneration"], 1);
+        assert_eq!(mode(&ep), 0o600);
+        // ... and not in the store's.
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        for key in ["exempt", "exemptGen", "pushedExemptGen"] {
+            assert!(v.get(key).is_none(), "{key} is written to watchdog.json");
+        }
         assert_eq!(v["knownGen"], 0, "the known list is not touched");
         assert!(v["known"].as_array().unwrap().is_empty());
     }
@@ -891,16 +1058,221 @@ mod tests {
         assert_eq!(s.acked_keys(), [key(1)]);
         assert_eq!(s.absent_for.as_deref(), Some("192.0.2.9|ab"));
 
-        // A no-op update neither rewrites the file nor loses anything.
+        // A no-op update neither rewrites the file nor creates the new one.
         update(&p, |s| s.exempt.len()).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), old);
-        // A change adds the exempt keys and keeps the old data.
+        assert!(!exempt_path(&p).exists());
+        // An exempt edit creates the new file and leaves the old one alone.
         update(&p, |s| s.add_exempt(&mac(1), None, 1)).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), old);
         let s = Store::load(&p);
         assert_eq!(s.exempt_macs(), [mac(1)]);
         assert_eq!(s.known[0].label.as_deref(), Some("Printer"));
         assert_eq!(s.absent_for.as_deref(), Some("192.0.2.9|ab"));
         assert!(bad_files(&p).is_empty(), "an old file is not corrupt");
+        // A store edit leaves the exempt file alone in turn.
+        let before = std::fs::read(exempt_path(&p)).unwrap();
+        update(&p, |s| s.add_acked(&key(2), 7)).unwrap();
+        assert_eq!(std::fs::read(exempt_path(&p)).unwrap(), before);
+    }
+
+    /// What a qnet from before the exempt list writes to `watchdog.json`
+    /// whenever it saves: the store without the fields it does not know.
+    fn rewrite_as_an_old_qnet(p: &Path, f: impl FnOnce(&mut Store)) {
+        let mut s = Store::load(p);
+        s.exempt.clear();
+        s.exempt_gen = 0;
+        s.pushed_exempt_gen = 0;
+        f(&mut s);
+        s.save_store(p).unwrap();
+    }
+
+    #[test]
+    fn a_rewrite_of_the_store_by_a_qnet_that_does_not_know_the_exempt_list_leaves_it_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        update(&p, |s| {
+            s.know(&mac(1), Some("TV"), 5);
+            s.add_exempt(&mac(1), Some("TV"), 5);
+            s.add_exempt(&mac(2), None, 6);
+            s.mark_exempt_pushed(1);
+        })
+        .unwrap();
+        let want = Store::load(&p);
+        assert_eq!(want.exempt_macs(), [mac(1), mac(2)]);
+
+        // A whole rewrite of watchdog.json, as an older watcher saving an
+        // acknowledgement would make it (it carries no exempt field).
+        rewrite_as_an_old_qnet(&p, |s| {
+            s.add_acked(&key(9), 99);
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(v.get("exempt").is_none() && v.get("exemptGen").is_none());
+        let got = Store::load(&p);
+        assert_eq!(got.exempt, want.exempt, "entries and labels");
+        assert_eq!(
+            (got.exempt_gen, got.pushed_exempt_gen),
+            (want.exempt_gen, want.pushed_exempt_gen),
+            "and the counters"
+        );
+        assert!(got.exempt_push_due());
+        assert_eq!(got.acked_keys(), [key(9)]);
+        assert_eq!(got.known_macs(), [mac(1)]);
+
+        // The same as plain JSON of the old shape, and for the next update
+        // of this qnet.
+        std::fs::write(
+            &p,
+            r#"{"version":1,"acked":[],"known":[],"knownGen":0,"pushedKnownGen":0,"notified":[]}"#,
+        )
+        .unwrap();
+        update(&p, |s| s.add_acked(&key(3), 1)).unwrap();
+        assert_eq!(Store::load(&p).exempt, want.exempt);
+        assert!(bad_files(&p).is_empty());
+    }
+
+    #[test]
+    fn an_exempt_list_in_an_old_watchdog_json_is_moved_to_the_new_file_by_the_next_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        let ep = exempt_path(&p);
+        // The first builds kept the list in watchdog.json.
+        let first_builds = r#"{"version":1,"acked":[],
+            "known":[{"mac":"02:00:00:00:00:01","label":"TV","firstSeen":9}],
+            "knownGen":1,"pushedKnownGen":1,"notified":[],
+            "exempt":[{"mac":"02:00:00:00:00:01","label":"TV","firstSeen":9},
+                      {"mac":"02:00:00:00:00:02","firstSeen":10}],
+            "exemptGen":3,"pushedExemptGen":2}"#;
+        std::fs::write(&p, first_builds).unwrap();
+        // Read as it is, while there is no new file ...
+        let s = Store::load(&p);
+        assert_eq!(s.exempt_macs(), [mac(1), mac(2)]);
+        assert_eq!(s.exempt[0].label.as_deref(), Some("TV"));
+        assert_eq!((s.exempt_gen, s.pushed_exempt_gen), (3, 2));
+        assert!(s.exempt_push_due());
+        assert!(!ep.exists());
+
+        // ... and moved by an update that does not touch it at all.
+        let seen = update(&p, |s| s.exempt_macs()).unwrap();
+        assert_eq!(seen, [mac(1), mac(2)], "the update sees the list");
+        assert!(ep.exists());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ep).unwrap()).unwrap();
+        assert_eq!(v["generation"], 3);
+        assert_eq!(v["pushedGeneration"], 2);
+        assert_eq!(v["exempt"].as_array().unwrap().len(), 2);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        for key in ["exempt", "exemptGen", "pushedExemptGen"] {
+            assert!(v.get(key).is_none(), "{key} is still in watchdog.json");
+        }
+        assert_eq!(v["known"][0]["label"], "TV", "the rest is as it was");
+        let s = Store::load(&p);
+        assert_eq!(s.exempt_macs(), [mac(1), mac(2)]);
+        assert_eq!((s.exempt_gen, s.pushed_exempt_gen), (3, 2));
+        assert!(bad_files(&p).is_empty());
+
+        // From then on the new file wins over a stale watchdog.json (an
+        // older qnet cannot bring one back, but a restored backup could).
+        std::fs::write(
+            &p,
+            first_builds.replace("\"exemptGen\":3", "\"exemptGen\":9"),
+        )
+        .unwrap();
+        update(&p, |s| s.remove_exempt(&mac(2))).unwrap();
+        let s = Store::load(&p);
+        assert_eq!(s.exempt_macs(), [mac(1)]);
+        assert_eq!(s.exempt_gen, 4, "the new file's counter, not the stale one");
+    }
+
+    #[test]
+    fn an_exempt_list_in_an_old_watchdog_json_is_moved_by_an_update_that_edits_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        std::fs::write(
+            &p,
+            r#"{"version":1,"exempt":[{"mac":"02:00:00:00:00:07","firstSeen":1}],"exemptGen":1}"#,
+        )
+        .unwrap();
+        update(&p, |s| s.add_acked(&key(1), 1)).unwrap();
+        assert_eq!(Store::load(&p).exempt_macs(), [mac(7)]);
+        assert!(exempt_path(&p).exists());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(v.get("exempt").is_none());
+        assert_eq!(v["acked"][0]["key"], key(1));
+    }
+
+    #[test]
+    fn a_corrupt_exempt_file_is_kept_aside_on_its_own_and_the_store_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        let ep = exempt_path(&p);
+        update(&p, |s| {
+            s.know(&mac(1), Some("TV"), 5);
+            s.add_exempt(&mac(1), None, 5);
+        })
+        .unwrap();
+        let store_bytes = std::fs::read(&p).unwrap();
+        let original = br#"{"version":1,"exempt":[{"mac":"02:00:00:00:00:01"#;
+        std::fs::write(&ep, original).unwrap();
+        // Reading treats it as an empty list and writes nothing.
+        let s = Store::load(&p);
+        assert!(s.exempt.is_empty());
+        assert_eq!(s.known_macs(), [mac(1)]);
+        assert!(bad_files(&p).is_empty());
+
+        // An update that does not touch the list still keeps the file aside
+        // and starts from an empty list.
+        let seen = update(&p, |s| s.exempt.len()).unwrap();
+        assert_eq!(seen, 0);
+        let bad = bad_files(&p);
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(
+            bad[0].0.starts_with("watchdog-exempt.json.bad-"),
+            "{}",
+            bad[0].0
+        );
+        assert_eq!(bad[0].1, original, "the original bytes");
+        assert_eq!(mode(&p.parent().unwrap().join(&bad[0].0)), 0o600);
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            store_bytes,
+            "watchdog.json untouched"
+        );
+        assert!(ep.exists(), "an empty list is written in its place");
+        assert!(Store::load(&p).exempt.is_empty());
+        update(&p, |s| s.add_exempt(&mac(2), None, 1)).unwrap();
+        assert_eq!(
+            bad_files(&p).len(),
+            1,
+            "a healthy file is not touched again"
+        );
+        assert_eq!(Store::load(&p).exempt_macs(), [mac(2)]);
+    }
+
+    #[test]
+    fn a_corrupt_store_does_not_take_the_exempt_list_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        update(&p, |s| {
+            s.know(&mac(1), None, 5);
+            s.add_exempt(&mac(1), Some("TV"), 5);
+        })
+        .unwrap();
+        std::fs::write(&p, b"{broken").unwrap();
+        // Read-only: an empty store, the list as it is.
+        let s = Store::load(&p);
+        assert!(s.known.is_empty());
+        assert_eq!(s.exempt_macs(), [mac(1)]);
+        update(&p, |s| s.add_acked(&key(1), 1)).unwrap();
+        let bad = bad_files(&p);
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].0.starts_with("watchdog.json.bad-"));
+        let s = Store::load(&p);
+        assert_eq!(s.exempt[0].label.as_deref(), Some("TV"));
+        assert_eq!(s.acked_keys(), [key(1)]);
     }
 
     #[test]

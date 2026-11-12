@@ -11,7 +11,7 @@
 //! The known list is edited on this PC first and pushed second: when the push
 //! fails, or the Pi has no watchdog, the edit stays and the watcher pushes it
 //! later (the store's `knownGen` says it is due). The exempt list works the
-//! same way (`exemptGen`), with its own push and its own result keys
+//! same way (its `generation`), with its own push and its own result keys
 //! (`exemptPushed`, `exemptPushError`), so one failing never hides the other.
 //! A Pi that answers 404 for the exempt route has no exempt support: the edit
 //! is saved here and reported as "not pushed: not supported yet".

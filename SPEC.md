@@ -109,14 +109,25 @@ wiped the Pi-hole pin from every profile.
     has), `notified` (the alert instances that already got a desktop
     notification, so a restart repeats none), `absentFor` (only while set:
     `"<address>|<pin>"` of the Pi-hole that was found to have no watchdog, see
-    the API thread above), `exempt` (the exempt-device list: the devices that
-    skip ad blocking, same entries as `known`), `exemptGen` and
-    `pushedExemptGen` (which edit of it the Pi has) and `version`. `acked`,
-    `known` and `notified` keep at most 1024 entries each, `exempt` at most
-    64 (the Pi takes the list in one body of that size). A file from before
-    the exempt list has none of its keys and loads with an empty list.
+    the API thread above) and `version`. Each list keeps at most 1024 entries.
+  - **The exempt list has a file of its own,** `watchdog-exempt.json` in the
+    same directory (mode 0600): `exempt` (the devices that skip ad blocking,
+    entries as in `known`, at most 64: the Pi takes the list in one body of
+    that size), `generation` and `pushedGeneration` (which edit of it the Pi
+    has) and `version`. Why: a qnet from before the exempt list ignores
+    fields it does not know and writes `watchdog.json` back without them, so
+    an older watcher that is still running after an upgrade would erase a
+    list kept there; it never touches a file it does not know. The two files
+    are one store: read together, written together under the one lock, and
+    only the file that changed is written. A `watchdog.json` from before the
+    split may hold the list (`exempt`, `exemptGen`, `pushedExemptGen`): while
+    the new file is absent it is read from there, and the next update moves it
+    and writes `watchdog.json` without it; from then on the new file wins. A
+    store without any exempt list loads with an empty one and no new file is
+    made until it is edited.
   - **Writers:** the watcher (keys the Pi reports as acknowledged,
-    `notified`, `pushedKnownGen` after a push) and the one-shot verbs
+    `notified`, `pushedKnownGen` after a push, `pushedGeneration` of the
+    exempt list) and the one-shot verbs
     `watchdog ack|know|forget|know-all|exempt|unexempt`. Two processes can write it, so every
     change is a read-modify-write under an exclusive `flock` on
     `watchdog.lock` and replaces the file atomically. Unlike the DNS lock this
@@ -132,7 +143,10 @@ wiped the Pi-hole pin from every profile.
     store: the labelled known list and the acks are never silently
     overwritten. If it cannot be moved aside the change fails (`store`).
     Reading (the state JSON, `watchdog devices`) treats such a file as empty
-    and writes nothing.
+    and writes nothing. The exempt list's file is kept the same way, as
+    `watchdog-exempt.json.bad-<unix seconds>`, and independently: a damaged
+    `watchdog.json` does not take the exempt list with it, nor the other way
+    round.
 - Secrets never go on argv: Wi-Fi passphrases and the Pi-hole web password
   arrive on stdin (one line; the reader never waits for EOF). Untrusted
   strings reach processes only as argv elements. There is no shell anywhere
@@ -643,7 +657,7 @@ answer that does not parse is an error, never "absent".
     push, so an edit made while it was on the wire stays due.
   - **The exempt list** is pushed wherever the known list is pushed again (the
     first cycle of a client, a new login session, a restart, a `waiting` Pi),
-    and after an edit of its own (`exemptGen` differs from `pushedExemptGen`),
+    and after an edit of its own (`generation` differs from `pushedGeneration`),
     right after the known list: `PUT devices/exempt` with the whole list in one
     body of at most 64 addresses. Unlike the known list it is pushed when it
     is empty as well, on every such push and not only after an edit: this PC's
@@ -667,7 +681,7 @@ answer that does not parse is an error, never "absent".
       cursor, or a new client gives it one more look, so a Pi that was
       upgraded gets the list. Nothing of this is kept in the store (a closed
       qnet whose Pi has a watchdog polls alerts either way);
-    - success records `pushedExemptGen` as the generation read before the
+    - success records `pushedGeneration` as the generation read before the
       push.
 - **Notifications:**
   - An alert is new when it is not acknowledged and its key is not in
@@ -717,9 +731,11 @@ answer that does not parse is an error, never "absent".
   - `knownGen` goes up on every edit of the list, `pushedKnownGen` is set to
     the generation that was pushed by whoever pushes it successfully, the
     watcher or a verb. `push due` means they differ.
-  - `exempt`: at most 64 entries of the same shape as `known`, edited by
+  - `exempt` (in `watchdog-exempt.json`, see the Process model): at most 64
+    entries of the same shape as `known`, edited by
     `watchdog exempt|unexempt` (a new device is refused when the list is full,
-    `full`). `exemptGen` and `pushedExemptGen` work as the known list's pair.
+    `full`). `generation` and `pushedGeneration` work as the known list's
+    `knownGen` and `pushedKnownGen`.
     `exempt` puts the device on `known` as well; `unexempt` leaves it
     known, and `forget` leaves it on the exempt list.
   - `notified`: at most 1024 `{key, firstUnix, at}`; when full the oldest `at`
