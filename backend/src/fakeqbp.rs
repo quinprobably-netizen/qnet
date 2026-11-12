@@ -1,13 +1,15 @@
 //! A fake Pi for the watchdog tests: the Pi-hole login and stats endpoints
 //! plus qberrypi's `/api/qbp/` watchdog (alerts, ack, acked, devices, known,
-//! exempt), behind the throwaway TLS server of `https::testutil`.
+//! exempt, policy), behind the throwaway TLS server of `https::testutil`.
 //!
 //! The model lives in [`PiState`], shared with the test through [`FakePi`], so
 //! a test can raise alerts, invalidate the session ("the Pi forgot it") or
 //! "reboot" the Pi (rev and ids restart, the known list is back to `waiting`,
-//! the pushed exempt list is gone, every session is gone) while a poller is
-//! running. An older Pi that has no exempt support (404 on its route, none of
-//! its fields in the devices answer) is [`FakePi::without_exempt`]. Test data uses
+//! the pushed exempt list and policy are gone, every session is gone) while a
+//! poller is running. An older Pi that has no exempt support (404 on its
+//! route, none of its fields in the devices answer) is
+//! [`FakePi::without_exempt`]; one that has the exempt list but not the
+//! exempt-by-default policy is [`FakePi::without_policy`]. Test data uses
 //! documentation addresses (192.0.2.x) and locally administered MACs
 //! (02:00:00:...) only.
 
@@ -31,6 +33,8 @@ const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r
 
 /// The most addresses the Pi takes in one `PUT devices/exempt`.
 pub const EXEMPT_MAX: usize = 64;
+/// The most addresses the Pi takes in the block list of `PUT devices/policy`.
+pub const BLOCK_MAX: usize = 64;
 
 /// The `n`-th alert key: 16 lower-case hex digits, stable across "reboots".
 pub fn key(n: usize) -> String {
@@ -87,6 +91,12 @@ pub struct PiState {
     pub fail_exempt: bool,
     /// True: `PUT devices/known` fails with HTTP 500 (the other routes work).
     pub fail_known: bool,
+    /// False: a Pi from before the exempt-by-default policy. `PUT
+    /// devices/policy` is answered 404 and the devices answer has neither
+    /// `exempt_default`, `block_macs` nor a per-device `blocked`.
+    pub policy_support: bool,
+    /// True: `PUT devices/policy` fails with HTTP 500 (the other routes work).
+    pub fail_policy: bool,
     pub rev: u64,
     next_id: u64,
     /// Moves 10 s with every alert raised.
@@ -102,6 +112,11 @@ pub struct PiState {
     /// The exempt list from the Pi's own config file: it survives a reboot
     /// and is never touched by a push.
     pub exempt_config: Vec<String>,
+    /// The mode that was pushed with the policy (memory only: a reboot clears
+    /// it): every device skips ad blocking except the ones on `policy_block`.
+    pub exempt_default: bool,
+    /// The block list that was pushed with the policy (memory only).
+    pub policy_block: Vec<String>,
     /// (mac, ipv4) of the devices `GET devices` lists. Each is seen later than
     /// the one before it, so the list comes oldest first: the poller must
     /// sort, not trust the Pi's order.
@@ -122,6 +137,9 @@ pub struct PiState {
     /// The bodies of `PUT devices/exempt`, every one that reached the route
     /// (also the ones answered 400 or 500).
     pub exempt_puts: Vec<Value>,
+    /// The bodies of `PUT devices/policy`, every one that reached the route
+    /// (also the ones answered 400 or 500).
+    pub policy_puts: Vec<Value>,
     /// The `since` of every `GET alerts`.
     pub since: Vec<u64>,
 }
@@ -135,6 +153,8 @@ impl PiState {
             exempt_support: true,
             fail_exempt: false,
             fail_known: false,
+            policy_support: true,
+            fail_policy: false,
             rev: 0,
             next_id: 1,
             clock: T0,
@@ -144,6 +164,8 @@ impl PiState {
             staged: Vec::new(),
             exempt: Vec::new(),
             exempt_config: Vec::new(),
+            exempt_default: false,
+            policy_block: Vec::new(),
             devices: (1..=3).map(|i| (mac(i), format!("192.0.2.{i}"))).collect(),
             sid: None,
             logins: 0,
@@ -153,6 +175,7 @@ impl PiState {
             acked_puts: Vec::new(),
             known_puts: Vec::new(),
             exempt_puts: Vec::new(),
+            policy_puts: Vec::new(),
             since: Vec::new(),
         }
     }
@@ -185,6 +208,17 @@ impl PiState {
         all
     }
 
+    /// Whether the Pi skips ad blocking for `mac`: in the exempt-by-default
+    /// mode every device but the blocked ones, otherwise the ones on the
+    /// effective exempt list.
+    pub fn is_exempt(&self, mac: &str) -> bool {
+        if self.policy_support && self.exempt_default {
+            !self.policy_block.iter().any(|b| b == mac)
+        } else {
+            self.exempt_macs().iter().any(|m| m == mac)
+        }
+    }
+
     fn devices_json(&self) -> Value {
         let effective = self.exempt_macs();
         let devices: Vec<Value> = self
@@ -198,7 +232,10 @@ impl PiState {
                     "known": self.known.contains(m)
                 });
                 if self.exempt_support {
-                    d["exempt"] = json!(effective.contains(m));
+                    d["exempt"] = json!(self.is_exempt(m));
+                }
+                if self.policy_support {
+                    d["blocked"] = json!(self.policy_block.contains(m));
                 }
                 d
             })
@@ -206,6 +243,10 @@ impl PiState {
         let mut v = json!({ "known_list": self.known_list, "devices": devices });
         if self.exempt_support {
             v["exempt_macs"] = json!(effective);
+        }
+        if self.policy_support {
+            v["exempt_default"] = json!(self.exempt_default);
+            v["block_macs"] = json!(self.policy_block);
         }
         v
     }
@@ -374,6 +415,38 @@ fn respond(st: &mut PiState, req: &str) -> Vec<u8> {
         st.exempt = macs;
         return ok_json(&format!(r#"{{"exempt":{}}}"#, st.exempt.len()));
     }
+    if method == "PUT" && path == "/api/qbp/devices/policy" {
+        if !st.policy_support {
+            return NOT_FOUND.to_vec();
+        }
+        st.policy_puts.push(body.clone());
+        if st.fail_policy {
+            return SERVER_ERROR.to_vec();
+        }
+        // The Pi refuses a body that is not exactly `{"exempt_default": <bool>,
+        // "block": [<mac>, ...]}` (both keys, at most 64 lower-case
+        // colon-separated addresses).
+        let mode = body["exempt_default"].as_bool();
+        let list = body["block"].as_array().filter(|a| a.len() <= BLOCK_MAX);
+        let macs: Option<Vec<String>> = list.and_then(|a| {
+            a.iter()
+                .map(|m| {
+                    let m = m.as_str()?;
+                    (crate::watchdog::normalize_mac(m).as_deref() == Some(m)).then(|| m.to_string())
+                })
+                .collect()
+        });
+        let (Some(mode), Some(macs)) = (mode, macs) else {
+            return BAD_REQUEST.to_vec();
+        };
+        st.exempt_default = mode;
+        st.policy_block = macs;
+        return ok_json(&format!(
+            r#"{{"exempt_default":{},"block":{}}}"#,
+            st.exempt_default,
+            st.policy_block.len()
+        ));
+    }
     NOT_FOUND.to_vec()
 }
 
@@ -393,10 +466,22 @@ impl FakePi {
         Self::build(conns, false)
     }
 
-    /// An older qberrypi: a watchdog without exempt support.
+    /// An older qberrypi: a watchdog without exempt support (and so without
+    /// the exempt-by-default policy).
     pub fn without_exempt(conns: usize) -> Self {
         let pi = Self::build(conns, true);
-        pi.with(|s| s.exempt_support = false);
+        pi.with(|s| {
+            s.exempt_support = false;
+            s.policy_support = false;
+        });
+        pi
+    }
+
+    /// A qberrypi that has the exempt list but not the exempt-by-default
+    /// policy yet.
+    pub fn without_policy(conns: usize) -> Self {
+        let pi = Self::build(conns, true);
+        pi.with(|s| s.policy_support = false);
         pi
     }
 
@@ -477,8 +562,9 @@ impl FakePi {
     }
 
     /// A reboot: rev and ids restart, the alerts and the known list are gone
-    /// (the list is `waiting` again), the pushed exempt list is gone (the one
-    /// from the Pi's config file stays), and so is every session.
+    /// (the list is `waiting` again), the pushed exempt list and policy are
+    /// gone (the exempt list from the Pi's config file stays), and so is
+    /// every session.
     pub fn reboot(&self) {
         self.reboot_inner(false);
     }
@@ -497,6 +583,8 @@ impl FakePi {
             s.known.clear();
             s.staged.clear();
             s.exempt.clear();
+            s.exempt_default = false;
+            s.policy_block.clear();
             s.known_list = "waiting";
             if !keep_session {
                 s.sid = None;

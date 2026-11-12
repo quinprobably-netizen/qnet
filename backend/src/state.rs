@@ -334,6 +334,12 @@ pub struct WatchdogDeviceOut {
     pub exempt_on_pi: bool,
     /// It is on this PC's exempt list.
     pub exempt: bool,
+    /// The Pi keeps it fully blocked, as a device on its block list (false
+    /// when the Pi does not say).
+    pub blocked_on_pi: bool,
+    /// It is on this PC's block list (the one pushed to the Pi with the
+    /// exempt-by-default mode).
+    pub blocked: bool,
 }
 
 impl WatchdogDeviceOut {
@@ -349,6 +355,8 @@ impl WatchdogDeviceOut {
             label: d.label.clone(),
             exempt_on_pi: d.device.exempt,
             exempt: d.exempt,
+            blocked_on_pi: d.device.blocked,
+            blocked: d.blocked,
         }
     }
 }
@@ -1040,10 +1048,12 @@ mod tests {
                     last_unix: 1_794_000_050,
                     known: false,
                     exempt: true,
+                    blocked: false,
                 },
                 known: true,
                 label: "Printer".into(),
                 exempt: false,
+                blocked: true,
             }],
             known_count: 12,
             pushed_at: 1_794_000_001,
@@ -1239,7 +1249,8 @@ mod tests {
                     "mac": "02:00:00:00:00:07", "ipv4": ["192.0.2.7"], "hostname": "",
                     "firstUnix": 1794000000, "lastUnix": 1794000050,
                     "knownOnPi": false, "known": true, "label": "Printer",
-                    "exemptOnPi": true, "exempt": false
+                    "exemptOnPi": true, "exempt": false,
+                    "blockedOnPi": false, "blocked": true
                 }],
                 "knownCount": 12, "pushedAt": 1794000001, "pushError": "",
                 "polledAt": 1794000005
@@ -1383,6 +1394,10 @@ mod tests {
         assert_eq!(
             (w.devices[0].exempt, w.devices[0].exempt_on_pi),
             (false, true)
+        );
+        assert_eq!(
+            (w.devices[0].blocked, w.devices[0].blocked_on_pi),
+            (true, false)
         );
         assert_eq!((w.pushed_at, w.polled_at), (1_794_000_001, 1_794_000_005));
     }

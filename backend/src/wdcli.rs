@@ -1,7 +1,9 @@
 //! The `qnet watchdog …` verbs: look at the Pi's alerts and devices, acknowledge
-//! an alert, and edit the known-device list and the exempt-device list (the
-//! devices that skip ad blocking; threat blocking stays) of this PC, which are
-//! then pushed to the Pi.
+//! an alert, and edit the known-device list, the exempt-device list (the
+//! devices that skip ad blocking; threat blocking stays) and the
+//! exempt-by-default policy (the mode in which every device skips ad blocking
+//! except the ones on a block list) of this PC, which are then pushed to the
+//! Pi.
 //!
 //! Each verb is a function of the API client, the path of the PC-side store
 //! and the time (unix seconds), so tests run against the fake Pi and a
@@ -14,10 +16,19 @@
 //! same way (its `generation`), with its own push and its own result keys
 //! (`exemptPushed`, `exemptPushError`), so one failing never hides the other.
 //! A Pi that answers 404 for the exempt route has no exempt support: the edit
-//! is saved here and reported as "not pushed: not supported yet".
+//! is saved here and reported as "not pushed: not supported yet". The policy
+//! works the same way (the mode and the block list are one push, with
+//! `policyPushed`/`policyPushError` in the result), and `block` pushes the
+//! lists it changed in order: known list, exempt list (a device that is
+//! blocked is taken off it), policy.
+//!
+//! `block-this` finds this computer's own hardware address without running
+//! anything: the interface of the default IPv4 route from `/proc/net/route`,
+//! its address from `/sys/class/net/<interface>/address` and the hostname for
+//! the label (see [`HostFiles`], which tests point at a fake tree).
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -28,11 +39,21 @@ use crate::watchdog::{self, normalize_mac, Inventory, Qbp};
 use crate::wdstore::{self, clean_label, Store};
 
 const USAGE: &str = "usage: qnet watchdog alerts | devices | know-all | ack <id> | \
-know <mac> [label...] | forget <mac> | exempt <mac> [label...] | unexempt <mac>";
+know <mac> [label...] | forget <mac> | exempt <mac> [label...] | unexempt <mac> | \
+exempt-default on|off | block <mac> [label...] | unblock <mac> | block-this";
 
 /// What an exempt push says when the Pi answered 404 for the route (an older
 /// Pi, or a Pi-hole that is not a qberrypi at all).
 const UNSUPPORTED: &str = "the Pi's software does not support exempt devices yet";
+
+/// What a policy push says when the Pi answered 404 for the route (an older
+/// Pi, or a Pi-hole that is not a qberrypi at all).
+const UNSUPPORTED_POLICY: &str =
+    "the Pi's software does not support exempt-by-default blocking yet";
+
+/// The warning that goes with turning the exempt-by-default mode on.
+const EXEMPT_DEFAULT_NOTE: &str = "every device that is not on the block list now skips ad \
+blocking (threat blocking stays); keep a device blocked with `qnet watchdog block <mac>`";
 
 /// One `qnet watchdog` verb, validated.
 #[derive(Debug, PartialEq, Eq)]
@@ -61,6 +82,22 @@ pub enum WdCmd {
     Unexempt {
         mac: String,
     },
+    /// Turn the exempt-by-default mode on or off.
+    ExemptDefault {
+        on: bool,
+    },
+    /// As `Know`, and the device is put on the block list as well (and taken
+    /// off the exempt list).
+    Block {
+        mac: String,
+        label: Option<String>,
+    },
+    Unblock {
+        mac: String,
+    },
+    /// `Block` for this computer (its address and hostname are found by
+    /// [`block_this`]).
+    BlockThis,
 }
 
 fn usage() -> ActionErr {
@@ -113,12 +150,33 @@ pub fn parse(args: &[String]) -> Result<WdCmd, ActionErr> {
             mac: parse_mac(mac)?,
             label: clean_label(&label.join(" ")),
         }),
+        ["exempt-default", "on"] => Ok(WdCmd::ExemptDefault { on: true }),
+        ["exempt-default", "off"] => Ok(WdCmd::ExemptDefault { on: false }),
+        ["unblock", mac] => Ok(WdCmd::Unblock {
+            mac: parse_mac(mac)?,
+        }),
+        ["block", mac, label @ ..] => Ok(WdCmd::Block {
+            mac: parse_mac(mac)?,
+            label: clean_label(&label.join(" ")),
+        }),
+        ["block-this"] => Ok(WdCmd::BlockThis),
         _ => Err(usage()),
     }
 }
 
 /// Run one verb.
 pub fn run(api: &mut Pihole, store_path: &Path, now: u64, cmd: &WdCmd) -> ActionResult {
+    run_with(api, store_path, now, cmd, &HostFiles::system())
+}
+
+/// Run one verb, with `host` as the files `block-this` reads.
+pub fn run_with(
+    api: &mut Pihole,
+    store_path: &Path,
+    now: u64,
+    cmd: &WdCmd,
+    host: &HostFiles,
+) -> ActionResult {
     match cmd {
         WdCmd::Alerts => alerts(api),
         WdCmd::Ack { id } => ack(api, store_path, now, *id),
@@ -128,6 +186,10 @@ pub fn run(api: &mut Pihole, store_path: &Path, now: u64, cmd: &WdCmd) -> Action
         WdCmd::KnowAll => know_all(api, store_path, now),
         WdCmd::Exempt { mac, label } => exempt(api, store_path, now, mac, label.as_deref()),
         WdCmd::Unexempt { mac } => unexempt(api, store_path, mac),
+        WdCmd::ExemptDefault { on } => exempt_default(api, store_path, *on),
+        WdCmd::Block { mac, label } => block(api, store_path, now, mac, label.as_deref()),
+        WdCmd::Unblock { mac } => unblock(api, store_path, mac),
+        WdCmd::BlockThis => block_this(api, store_path, now, host),
     }
 }
 
@@ -143,6 +205,13 @@ fn store_err(e: std::io::Error) -> ActionErr {
 
 fn exempt_store_err(e: std::io::Error) -> ActionErr {
     ActionErr::new("store", format!("could not save the exempt list: {e}"))
+}
+
+fn policy_store_err(e: std::io::Error) -> ActionErr {
+    ActionErr::new(
+        "store",
+        format!("could not save the exempt-by-default policy: {e}"),
+    )
 }
 
 /// How pushing the PC list to the Pi ended.
@@ -238,6 +307,41 @@ fn push_exempt(api: &mut Pihole, store_path: &Path, snap: &ExemptSnapshot) -> Pu
     }
 }
 
+/// The policy as it was after an edit: the mode and the block list to push,
+/// and which generation that was (like [`Snapshot`]).
+struct PolicySnapshot {
+    generation: u64,
+    exempt_default: bool,
+    macs: Vec<String>,
+}
+
+impl PolicySnapshot {
+    fn of(s: &Store) -> Self {
+        Self {
+            generation: s.policy_gen,
+            exempt_default: s.exempt_default,
+            macs: s.block_macs(),
+        }
+    }
+}
+
+/// Push the PC's policy to the Pi and record the push. The default policy is
+/// pushed as it is (it clears the Pi's): these verbs are explicit edits. A 404
+/// is "not supported", whatever the reason: the edit stays on this PC and the
+/// watcher asks again once per login session.
+fn push_policy(api: &mut Pihole, store_path: &Path, snap: &PolicySnapshot) -> Pushed {
+    match watchdog::put_policy(api, snap.exempt_default, &snap.macs) {
+        Ok(Qbp::Present(_)) => {
+            // If this cannot be recorded the policy stays due and the watcher
+            // pushes it once more: harmless.
+            let _ = wdstore::update(store_path, |s| s.mark_policy_pushed(snap.generation));
+            Pushed::Sent
+        }
+        Ok(Qbp::Absent) => Pushed::Failed(UNSUPPORTED_POLICY.to_string()),
+        Err(e) => Pushed::Failed(e.message().to_string()),
+    }
+}
+
 // -- alerts -------------------------------------------------------------------
 
 /// `watchdog alerts`: every alert the Pi holds, newest change first, in the
@@ -290,7 +394,10 @@ pub fn ack(api: &mut Pihole, store_path: &Path, now: u64, id: u64) -> ActionResu
 /// exempt), the PC's known and exempt devices the Pi did not report
 /// (`knownOffline`, `exemptOffline`), and the addresses only the Pi exempts
 /// (`exemptOnPiOnly`: they come from its config file, not from this PC's
-/// list).
+/// list). The exempt-by-default policy has the same two views: `exemptDefault`
+/// (this PC's mode) and `exemptDefaultOnPi` (the Pi's), `blockOffline` (this
+/// PC's block list minus the reported devices) and `blockOnPiOnly` (the Pi's
+/// block list minus this PC's), and `blocked`/`blockedOnPi` on every device.
 pub fn devices(api: &mut Pihole, store_path: &Path) -> ActionResult {
     let inv = match watchdog::get_devices(api)? {
         Qbp::Absent => return Err(absent()),
@@ -328,6 +435,24 @@ pub fn devices(api: &mut Pihole, store_path: &Path) -> ActionResult {
         .iter()
         .filter(|m| !mine.contains(m.as_str()))
         .collect();
+    let block_offline: Vec<Value> = store
+        .block
+        .iter()
+        .filter(|b| !reported.contains(b.mac.as_str()))
+        .map(|b| {
+            json!({
+                "mac": b.mac,
+                "label": b.label.as_deref().unwrap_or(""),
+                "firstSeen": b.first_seen,
+            })
+        })
+        .collect();
+    let my_block: HashSet<&str> = store.block.iter().map(|b| b.mac.as_str()).collect();
+    let block_on_pi_only: Vec<&String> = inv
+        .block_macs
+        .iter()
+        .filter(|m| !my_block.contains(m.as_str()))
+        .collect();
     let mut list = inv.devices.clone();
     list.sort_by_key(|d| std::cmp::Reverse(d.last_unix));
     let devices: Vec<WatchdogDeviceOut> = watchdog::annotate(list, &store)
@@ -341,6 +466,10 @@ pub fn devices(api: &mut Pihole, store_path: &Path) -> ActionResult {
         "knownOffline": offline,
         "exemptOffline": exempt_offline,
         "exemptOnPiOnly": exempt_on_pi_only,
+        "exemptDefault": store.exempt_default,
+        "exemptDefaultOnPi": inv.exempt_default,
+        "blockOffline": block_offline,
+        "blockOnPiOnly": block_on_pi_only,
     }))
 }
 
@@ -536,6 +665,255 @@ pub fn unexempt(api: &mut Pihole, store_path: &Path, mac: &str) -> ActionResult 
     .ok_or_else(|| ActionErr::new("not-found", "that device is not on the exempt list"))?;
     let mut out = json!({ "ok": true, "mac": mac, "exempt": snap.macs.len() });
     push_exempt(api, store_path, &snap).add_as(&mut out, "exemptPushed", "exemptPushError");
+    Ok(out)
+}
+
+// -- the exempt-by-default policy ---------------------------------------------
+
+/// `watchdog exempt-default on|off`: set the mode on this PC, then push the
+/// policy (the mode and the block list). It pushes on every call, also when
+/// nothing changed (so a Pi that lost the policy gets it, and a PC that wants
+/// the default policy on the Pi can say so). Turning it on warns, in `note`,
+/// that every device that is not on the block list skips ad blocking from
+/// then on (threat blocking stays). The block list is not touched: it is kept
+/// while the mode is off, for the next time. The result is `{"ok":true,
+/// "exemptDefault":bool,"block":n,"policyPushed":bool,"policyPushError"?,
+/// "note"?}`; a 404 is reported as not supported (the edit stays and the
+/// watcher asks again once per login session).
+pub fn exempt_default(api: &mut Pihole, store_path: &Path, on: bool) -> ActionResult {
+    let snap = wdstore::update(store_path, |s| {
+        s.set_exempt_default(on);
+        PolicySnapshot::of(s)
+    })
+    .map_err(policy_store_err)?;
+    let mut out = json!({ "ok": true, "exemptDefault": on, "block": snap.macs.len() });
+    if on {
+        out["note"] = json!(EXEMPT_DEFAULT_NOTE);
+    }
+    push_policy(api, store_path, &snap).add_as(&mut out, "policyPushed", "policyPushError");
+    Ok(out)
+}
+
+/// `watchdog block <mac> [label]`: put the device on this PC's block list (or
+/// change its label; without a label an existing one stays) and on the known
+/// list exactly as [`know`] does (the owner named it, so the Pi must not raise
+/// a new-device alert for it; the first edit on an empty known list seeds it
+/// from the Pi's, see [`seed_from_pi`]), and take it off the exempt list if it
+/// is there (a device is not both), in one locked edit. Then push the known
+/// list, the exempt list (only when the device was taken off it) and the
+/// policy. Pushes on every call, also when nothing changed. Refused (`full`,
+/// nothing changed, nothing pushed) when the block list holds
+/// [`wdstore::MAX_BLOCK`] devices already and this is a new one, or when the
+/// known list is full and the device is not on it. The result carries `known`
+/// and `pushed`/`pushError` as `know` does, `block` (the size of the block list
+/// after the edit) and `policyPushed`/`policyPushError`, and when the device
+/// was exempt `unexempted: true`, `exempt` and `exemptPushed`/`exemptPushError`.
+/// Every push has its own keys, so one failing never hides another.
+pub fn block(
+    api: &mut Pihole,
+    store_path: &Path,
+    now: u64,
+    mac: &str,
+    label: Option<&str>,
+) -> ActionResult {
+    let mac =
+        normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
+    let (inv, first_seen) = look_up(api, &mac, now);
+    let edit = wdstore::update(store_path, |s| {
+        // Checked before anything is touched: a refusal changes nothing.
+        if !s.is_blocked(&mac) && s.block_is_full() {
+            return Err(ActionErr::new(
+                "full",
+                format!(
+                    "the block list holds {} devices already",
+                    wdstore::MAX_BLOCK
+                ),
+            ));
+        }
+        let seeded = inv.as_ref().map_or(0, |inv| seed_from_pi(s, inv, now));
+        let was_known = s.is_known(&mac);
+        if !s.know(&mac, label, first_seen) && !was_known {
+            return Err(ActionErr::new(
+                "full",
+                format!(
+                    "the known list holds {} devices already, so this one cannot be marked known",
+                    wdstore::MAX_ENTRIES
+                ),
+            ));
+        }
+        s.add_block(&mac, label, first_seen);
+        let unexempted = s.remove_exempt(&mac);
+        let label = s
+            .known
+            .iter()
+            .find(|k| k.mac == mac)
+            .and_then(|k| k.label.clone());
+        Ok(BlockEdit {
+            known: Snapshot::of(s),
+            exempt: unexempted.then(|| ExemptSnapshot::of(s)),
+            policy: PolicySnapshot::of(s),
+            label,
+            seeded,
+        })
+    })
+    .map_err(policy_store_err)??;
+    let mut out = json!({
+        "ok": true, "mac": mac, "known": edit.known.macs.len(), "block": edit.policy.macs.len(),
+    });
+    if let Some(l) = edit.label {
+        out["label"] = json!(l);
+    }
+    if edit.seeded > 0 {
+        out["seeded"] = json!(edit.seeded);
+    }
+    if let Some(e) = &edit.exempt {
+        out["unexempted"] = json!(true);
+        out["exempt"] = json!(e.macs.len());
+    }
+    push(api, store_path, &edit.known).add_to(&mut out);
+    if let Some(e) = &edit.exempt {
+        push_exempt(api, store_path, e).add_as(&mut out, "exemptPushed", "exemptPushError");
+    }
+    push_policy(api, store_path, &edit.policy).add_as(&mut out, "policyPushed", "policyPushError");
+    Ok(out)
+}
+
+/// What one locked edit of [`block`] leaves to push and to report.
+struct BlockEdit {
+    known: Snapshot,
+    /// Set when the device was taken off the exempt list.
+    exempt: Option<ExemptSnapshot>,
+    policy: PolicySnapshot,
+    label: Option<String>,
+    seeded: u64,
+}
+
+/// `watchdog unblock <mac>`: take the device off this PC's block list, then
+/// push the policy (an emptied list is pushed too: this is an explicit edit).
+/// The device stays on the known list, which is neither changed nor pushed.
+pub fn unblock(api: &mut Pihole, store_path: &Path, mac: &str) -> ActionResult {
+    let mac =
+        normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
+    let snap = wdstore::update(store_path, |s| {
+        s.remove_block(&mac).then(|| PolicySnapshot::of(s))
+    })
+    .map_err(policy_store_err)?
+    .ok_or_else(|| ActionErr::new("not-found", "that device is not on the block list"))?;
+    let mut out = json!({ "ok": true, "mac": mac, "block": snap.macs.len() });
+    push_policy(api, store_path, &snap).add_as(&mut out, "policyPushed", "policyPushError");
+    Ok(out)
+}
+
+/// Where [`block_this`] looks for what it needs to know about this computer.
+/// [`system`](Self::system) is the real thing; tests point the paths at a fake
+/// tree.
+pub struct HostFiles {
+    /// The IPv4 routing table (`/proc/net/route`).
+    pub route: PathBuf,
+    /// The folder of the network interfaces (`/sys/class/net`), each with an
+    /// `address` file.
+    pub sys_class_net: PathBuf,
+    /// The hostname (`/proc/sys/kernel/hostname`).
+    pub hostname: PathBuf,
+}
+
+impl HostFiles {
+    pub fn system() -> Self {
+        Self {
+            route: PathBuf::from("/proc/net/route"),
+            sys_class_net: PathBuf::from("/sys/class/net"),
+            hostname: PathBuf::from("/proc/sys/kernel/hostname"),
+        }
+    }
+}
+
+/// This computer as the Pi sees it.
+struct ThisComputer {
+    interface: String,
+    mac: String,
+    label: Option<String>,
+}
+
+/// The interface that carries the IPv4 default route in a `/proc/net/route`
+/// table: of the routes that are up (not rejecting) with destination and mask
+/// 0.0.0.0, the one with the lowest metric (the first listed among equals), as
+/// the kernel would pick it.
+fn default_route_interface(table: &str) -> Option<String> {
+    const RTF_UP: u32 = 0x0001;
+    const RTF_REJECT: u32 = 0x0200;
+    table
+        .lines()
+        .filter(|l| !l.starts_with("Iface"))
+        .filter_map(|line| {
+            // Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [iface, dest, _gateway, flags, _refs, _use, metric, mask, ..] = f.as_slice() else {
+                return None;
+            };
+            if *dest != "00000000" || *mask != "00000000" {
+                return None;
+            }
+            let flags = u32::from_str_radix(flags, 16).ok()?;
+            if flags & RTF_UP == 0 || flags & RTF_REJECT != 0 {
+                return None;
+            }
+            Some((metric.parse::<u32>().ok()?, iface.to_string()))
+        })
+        .min_by_key(|(metric, _)| *metric)
+        .map(|(_, iface)| iface)
+}
+
+/// This computer's hardware address (of the interface that carries the
+/// default IPv4 route) and hostname, read from `host`. Refused with
+/// `no-route` when there is no such route (or the table cannot be read) and
+/// `no-address` when the interface has no usable Ethernet address (a tunnel, a
+/// VPN: the Pi never sees an address like that anyway).
+fn this_computer(host: &HostFiles) -> Result<ThisComputer, ActionErr> {
+    let table = std::fs::read_to_string(&host.route).map_err(|e| {
+        ActionErr::new("no-route", format!("could not read the routing table: {e}"))
+    })?;
+    let interface = default_route_interface(&table).ok_or_else(|| {
+        ActionErr::new(
+            "no-route",
+            "this computer has no default route for IPv4 (is it online?), so there is no \
+             interface to block",
+        )
+    })?;
+    // The name comes from the kernel, but it is joined to a path: keep it
+    // inside the interfaces' folder.
+    let mac = (!interface.contains('/'))
+        .then(|| host.sys_class_net.join(&interface).join("address"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|a| normalize_mac(a.trim()))
+        .filter(|m| m != "00:00:00:00:00:00")
+        .ok_or_else(|| {
+            ActionErr::new(
+                "no-address",
+                format!(
+                    "the interface {interface} that carries the default route has no Ethernet \
+                     address (a tunnel or VPN?); block this computer by its own address with \
+                     `qnet watchdog block <mac>`"
+                ),
+            )
+        })?;
+    let label = std::fs::read_to_string(&host.hostname)
+        .ok()
+        .and_then(|h| clean_label(&h));
+    Ok(ThisComputer {
+        interface,
+        mac,
+        label,
+    })
+}
+
+/// `watchdog block-this`: [`block`] for this computer: the address of the
+/// interface that carries the default IPv4 route, labelled with the hostname.
+/// The result is that of `block` plus `interface`. Refused (`no-route`,
+/// `no-address`) before anything is asked of the Pi or changed.
+pub fn block_this(api: &mut Pihole, store_path: &Path, now: u64, host: &HostFiles) -> ActionResult {
+    let me = this_computer(host)?;
+    let mut out = block(api, store_path, now, &me.mac, me.label.as_deref())?;
+    out["interface"] = json!(me.interface);
     Ok(out)
 }
 
@@ -843,15 +1221,18 @@ mod tests {
                     { "mac": mac(3), "ipv4": ["192.0.2.3"], "hostname": "",
                       "firstUnix": T0, "lastUnix": T0 + 102,
                       "knownOnPi": false, "known": false, "label": "",
-                      "exemptOnPi": false, "exempt": false },
+                      "exemptOnPi": false, "exempt": false,
+                      "blockedOnPi": false, "blocked": false },
                     { "mac": mac(2), "ipv4": ["192.0.2.2"], "hostname": "",
                       "firstUnix": T0, "lastUnix": T0 + 101,
                       "knownOnPi": true, "known": false, "label": "",
-                      "exemptOnPi": false, "exempt": false },
+                      "exemptOnPi": false, "exempt": false,
+                      "blockedOnPi": false, "blocked": false },
                     { "mac": mac(1), "ipv4": ["192.0.2.1"], "hostname": "",
                       "firstUnix": T0, "lastUnix": T0 + 100,
                       "knownOnPi": false, "known": true, "label": "Printer",
-                      "exemptOnPi": false, "exempt": false },
+                      "exemptOnPi": false, "exempt": false,
+                      "blockedOnPi": false, "blocked": false },
                 ],
                 "knownOffline": [
                     { "mac": mac(9), "label": "Old NAS", "firstSeen": 50 },
@@ -859,6 +1240,10 @@ mod tests {
                 ],
                 "exemptOffline": [],
                 "exemptOnPiOnly": [],
+                "exemptDefault": false,
+                "exemptDefaultOnPi": false,
+                "blockOffline": [],
+                "blockOnPiOnly": [],
             })
         );
         assert_eq!(rig.store().known_gen, 3, "looking changes nothing");
@@ -1747,6 +2132,771 @@ mod tests {
         );
     }
 
+    // -- exempt by default, block, unblock and block-this -----------------------
+
+    const UNSUPPORTED_POLICY: &str =
+        "the Pi's software does not support exempt-by-default blocking yet";
+
+    impl Rig {
+        fn exempt_default(&mut self, on: bool) -> ActionResult {
+            let path = self.path();
+            exempt_default(&mut self.api, &path, on)
+        }
+        fn block(&mut self, mac: &str, label: Option<&str>) -> ActionResult {
+            let path = self.path();
+            block(&mut self.api, &path, T0 + 999, mac, label)
+        }
+        fn unblock(&mut self, mac: &str) -> ActionResult {
+            let path = self.path();
+            unblock(&mut self.api, &path, mac)
+        }
+        fn policy_puts(&self) -> Vec<Value> {
+            self.pi.with(|s| s.policy_puts.clone())
+        }
+        fn pi_block(&self) -> Vec<String> {
+            self.pi.with(|s| s.policy_block.clone())
+        }
+        fn at(&self, prefix: &str) -> Option<usize> {
+            self.pi
+                .with(|s| s.log.iter().position(|l| l.starts_with(prefix)))
+        }
+    }
+
+    fn policy_body(on: bool, macs: &[String]) -> Value {
+        json!({ "exempt_default": on, "block": macs })
+    }
+
+    #[test]
+    fn exempt_default_on_sets_the_mode_pushes_the_policy_and_warns() {
+        let mut rig = Rig::new();
+        let v = rig.exempt_default(true).unwrap();
+        let note = v["note"].as_str().expect("a note").to_string();
+        assert!(
+            note.contains("block list") && note.contains("ad blocking") && note.contains("threat"),
+            "{note}"
+        );
+        assert_eq!(
+            v,
+            json!({"ok": true, "exemptDefault": true, "block": 0,
+                   "policyPushed": true, "note": note})
+        );
+        assert_eq!(rig.policy_puts(), vec![policy_body(true, &[])]);
+        assert!(rig.pi.with(|s| s.exempt_default));
+        let store = rig.store();
+        assert!(store.exempt_default && !store.policy_push_due());
+        // Neither list was touched or pushed.
+        assert!(rig.known_puts().is_empty() && rig.exempt_puts().is_empty());
+    }
+
+    #[test]
+    fn exempt_default_off_turns_the_mode_off_keeps_the_block_list_and_has_no_note() {
+        let mut rig = Rig::new();
+        rig.block(&mac(1), Some("PC")).unwrap();
+        rig.exempt_default(true).unwrap();
+        let v = rig.exempt_default(false).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "exemptDefault": false, "block": 1, "policyPushed": true})
+        );
+        // The block list goes with it: it is part of the policy.
+        assert_eq!(
+            rig.policy_puts().last().unwrap(),
+            &policy_body(false, &[mac(1)])
+        );
+        assert!(!rig.pi.with(|s| s.exempt_default));
+        assert_eq!(rig.pi_block(), vec![mac(1)]);
+        let store = rig.store();
+        assert!(!store.exempt_default);
+        assert_eq!(store.block_macs(), vec![mac(1)], "kept for later");
+    }
+
+    #[test]
+    fn exempt_default_pushes_on_every_call_also_when_nothing_changed() {
+        let mut rig = Rig::new();
+        rig.exempt_default(true).unwrap();
+        let gen = rig.store().policy_gen;
+        let v = rig.exempt_default(true).unwrap();
+        assert_eq!(v["policyPushed"], true);
+        assert!(v["note"].is_string(), "the warning is not shown only once");
+        assert_eq!(rig.policy_puts().len(), 2);
+        assert_eq!(rig.store().policy_gen, gen, "nothing was edited");
+        // Off when it is off already: the default policy goes too (it clears
+        // what a Pi may still hold).
+        let mut rig = Rig::new();
+        let v = rig.exempt_default(false).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "exemptDefault": false, "block": 0, "policyPushed": true})
+        );
+        assert_eq!(rig.policy_puts(), vec![policy_body(false, &[])]);
+    }
+
+    #[test]
+    fn on_a_pi_without_the_policy_exempt_default_is_saved_and_reported_as_not_supported() {
+        let mut rig = Rig::on(FakePi::without_policy(20));
+        let v = rig.exempt_default(true).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["exemptDefault"], true);
+        assert_eq!(v["policyPushed"], false);
+        assert_eq!(v["policyPushError"], UNSUPPORTED_POLICY);
+        assert!(v["note"].is_string());
+        let store = rig.store();
+        assert!(store.exempt_default);
+        assert!(
+            store.policy_push_due(),
+            "the watcher tries again in a session"
+        );
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/policy"), 1);
+        // The same for taking a device off the block list again.
+        rig.edit(|s| s.add_block(&mac(1), None, T0));
+        let v = rig.unblock(&mac(1)).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(1), "block": 0,
+                   "policyPushed": false, "policyPushError": UNSUPPORTED_POLICY})
+        );
+    }
+
+    #[test]
+    fn on_a_real_pihole_the_policy_verbs_still_edit_this_pcs_store() {
+        let mut rig = Rig::on(FakePi::pihole_only(20));
+        let v = rig.exempt_default(true).unwrap();
+        assert_eq!(
+            (v["policyPushed"].clone(), v["policyPushError"].clone()),
+            (json!(false), json!(UNSUPPORTED_POLICY))
+        );
+        let v = rig.block(&mac(2), Some("PC")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "label": "PC", "known": 1, "block": 1,
+                   "pushed": false, "pushError": "absent",
+                   "policyPushed": false, "policyPushError": UNSUPPORTED_POLICY})
+        );
+        let store = rig.store();
+        assert!(store.exempt_default);
+        assert_eq!(store.block_macs(), vec![mac(2)]);
+        assert_eq!(store.known_macs(), vec![mac(2)]);
+        assert!(store.push_due() && store.policy_push_due());
+        let v = rig.unblock(&mac(2)).unwrap();
+        assert_eq!(v["block"], 0);
+        assert!(rig.store().block.is_empty());
+    }
+
+    #[test]
+    fn a_failed_policy_push_leaves_the_edit_and_the_other_pushes_are_unaffected() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| s.fail_policy = true);
+        let v = rig.block(&mac(2), None).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["pushed"], true, "the known list went out");
+        assert_eq!(v["policyPushed"], false);
+        assert!(
+            v["policyPushError"].as_str().unwrap().contains("500"),
+            "{v}"
+        );
+        let store = rig.store();
+        assert_eq!(store.block_macs(), vec![mac(2)]);
+        assert!(!store.push_due() && store.policy_push_due());
+
+        rig.pi.with(|s| s.fail_policy = false);
+        let v = rig.block(&mac(3), None).unwrap();
+        assert_eq!(v["policyPushed"], true);
+        assert!(v.get("policyPushError").is_none());
+        assert_eq!(
+            rig.pi_block(),
+            vec![mac(2), mac(3)],
+            "both edits went out together"
+        );
+        assert!(!rig.store().policy_push_due());
+    }
+
+    #[test]
+    fn a_failed_known_push_does_not_keep_the_policy_from_going_out() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| s.fail_known = true);
+        let v = rig.block(&mac(2), None).unwrap();
+        assert_eq!(v["pushed"], false);
+        assert!(v["pushError"].as_str().unwrap().contains("500"));
+        assert_eq!(v["policyPushed"], true);
+        assert_eq!(rig.pi_block(), vec![mac(2)]);
+        let store = rig.store();
+        assert!(store.push_due() && !store.policy_push_due());
+        // And a failed exempt push (the device was exempt) does not either.
+        let mut rig = Rig::new();
+        rig.exempt(&mac(2), None).unwrap();
+        rig.pi.with(|s| s.fail_exempt = true);
+        let v = rig.block(&mac(2), None).unwrap();
+        assert_eq!(v["exemptPushed"], false);
+        assert!(v["exemptPushError"].as_str().unwrap().contains("500"));
+        assert_eq!(v["policyPushed"], true);
+        assert_eq!(rig.pi_block(), vec![mac(2)]);
+        assert!(rig.store().exempt_push_due() && !rig.store().policy_push_due());
+    }
+
+    #[test]
+    fn block_adds_the_device_to_both_lists_and_pushes_the_known_list_then_the_policy() {
+        let mut rig = Rig::new();
+        let v = rig.block(&mac(2), Some("Work laptop")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "label": "Work laptop", "known": 1,
+                   "block": 1, "pushed": true, "policyPushed": true})
+        );
+        let store = rig.store();
+        // Named by the owner, so it is known and the Pi raises no alert.
+        assert_eq!(store.known_macs(), vec![mac(2)]);
+        assert_eq!(store.known[0].label.as_deref(), Some("Work laptop"));
+        assert_eq!(store.known[0].first_seen, T0, "when the Pi first saw it");
+        assert_eq!(store.block_macs(), vec![mac(2)]);
+        assert_eq!(store.block[0].label.as_deref(), Some("Work laptop"));
+        assert_eq!(store.block[0].first_seen, T0);
+        assert!(!store.push_due() && !store.policy_push_due());
+        assert!(!store.exempt_push_due(), "the exempt list was not touched");
+        assert_eq!(
+            rig.known_puts(),
+            vec![json!({"known": [mac(2)], "append": false, "complete": true})]
+        );
+        // The mode is not changed by blocking a device.
+        assert_eq!(rig.policy_puts(), vec![policy_body(false, &[mac(2)])]);
+        assert_eq!(rig.pi_known(), vec![mac(2)]);
+        assert_eq!(rig.pi_block(), vec![mac(2)]);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 0);
+        assert!(rig.at("PUT /api/qbp/devices/known") < rig.at("PUT /api/qbp/devices/policy"));
+        // The edit of the known list is the same as `know` makes.
+        let mut plain = Rig::new();
+        plain.know(&mac(2), Some("Work laptop")).unwrap();
+        assert_eq!(plain.store().known, store.known);
+        // It follows the mode that is set.
+        rig.exempt_default(true).unwrap();
+        rig.block(&mac(3), None).unwrap();
+        assert_eq!(
+            rig.policy_puts().last().unwrap(),
+            &policy_body(true, &[mac(2), mac(3)])
+        );
+    }
+
+    #[test]
+    fn block_of_an_exempt_device_takes_it_off_the_exempt_list_and_pushes_that_list_too() {
+        let mut rig = Rig::new();
+        rig.exempt(&mac(1), Some("TV")).unwrap();
+        rig.exempt(&mac(2), None).unwrap();
+        let exempt_pushes = rig.exempt_puts().len();
+        let v = rig.block(&mac(1), None).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(1), "label": "TV", "known": 2, "block": 1,
+                   "unexempted": true, "exempt": 1,
+                   "pushed": true, "exemptPushed": true, "policyPushed": true})
+        );
+        let store = rig.store();
+        assert_eq!(store.exempt_macs(), vec![mac(2)]);
+        assert_eq!(store.block_macs(), vec![mac(1)]);
+        assert!(!store.exempt_push_due() && !store.policy_push_due());
+        // The known list keeps the label it had; the block entry has none,
+        // as none was given (the same rule as for an exempt entry).
+        assert_eq!(store.block[0].label, None);
+        assert_eq!(store.known[0].label.as_deref(), Some("TV"));
+        assert_eq!(rig.exempt_puts().len(), exempt_pushes + 1);
+        assert_eq!(rig.pi_exempt(), vec![mac(2)]);
+        assert_eq!(rig.pi_block(), vec![mac(1)]);
+        // Known list, then the exempt list, then the policy.
+        let known = rig.pi.with(|s| {
+            s.log
+                .iter()
+                .rposition(|l| l.starts_with("PUT /api/qbp/devices/known"))
+        });
+        let exempt = rig.pi.with(|s| {
+            s.log
+                .iter()
+                .rposition(|l| l.starts_with("PUT /api/qbp/devices/exempt"))
+        });
+        let policy = rig.at("PUT /api/qbp/devices/policy");
+        assert!(known < exempt && exempt < policy);
+
+        // A device that is not exempt: nothing about the exempt list.
+        let v = rig.block(&mac(5), None).unwrap();
+        for key in ["unexempted", "exempt", "exemptPushed", "exemptPushError"] {
+            assert!(v.get(key).is_none(), "{key} in {v}");
+        }
+        assert_eq!(rig.exempt_puts().len(), exempt_pushes + 1);
+        // Blocking the same device again is no change of the exempt list.
+        let v = rig.block(&mac(1), None).unwrap();
+        assert!(v.get("unexempted").is_none());
+    }
+
+    #[test]
+    fn block_keeps_a_label_that_was_there_and_replaces_it_when_given_a_new_one() {
+        let mut rig = Rig::new();
+        rig.block(&mac(1), Some("First")).unwrap();
+        let v = rig.block(&mac(1), None).unwrap();
+        assert_eq!(v["label"], "First");
+        let v = rig.block(&mac(1), Some("Second")).unwrap();
+        assert_eq!(v["label"], "Second");
+        let store = rig.store();
+        assert_eq!(store.block[0].label.as_deref(), Some("Second"));
+        assert_eq!(store.known[0].label.as_deref(), Some("Second"));
+        assert_eq!(store.block.len(), 1);
+        // A long label is cut at 64 characters, as for the other lists.
+        let v = rig.block(&mac(2), Some(&"x".repeat(100))).unwrap();
+        assert_eq!(v["label"].as_str().unwrap().chars().count(), 64);
+    }
+
+    #[test]
+    fn the_first_block_on_an_empty_known_list_seeds_it_from_a_list_the_pi_learned() {
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "learned", 31, 30);
+        let v = rig.block(&mac(31), Some("Tablet")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(31), "label": "Tablet", "known": 31, "block": 1,
+                   "seeded": 30, "pushed": true, "policyPushed": true})
+        );
+        let sent: Vec<String> = (1..=31).map(mac).collect();
+        assert_eq!(rig.pi_known(), sent, "nothing the Pi learned is lost");
+        assert_eq!(rig.pi_block(), vec![mac(31)]);
+    }
+
+    #[test]
+    fn more_than_64_blocked_devices_are_refused_and_nothing_is_changed_or_pushed() {
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            for i in 1..=wdstore::MAX_BLOCK {
+                s.know(&mac(i), None, T0);
+                s.add_block(&mac(i), None, T0);
+            }
+        });
+        let before = rig.store();
+        let e = err(rig.block(&mac(5000), Some("One too many")));
+        assert_eq!(e.code, "full");
+        assert!(
+            e.detail.contains("block") && e.detail.contains("64"),
+            "{}",
+            e.detail
+        );
+        assert_eq!(rig.store(), before, "not even the known list was touched");
+        assert!(rig.known_puts().is_empty() && rig.policy_puts().is_empty());
+        // A device that is there can still get a label.
+        let v = rig.block(&mac(7), Some("Seventh")).unwrap();
+        assert_eq!(
+            (v["block"].clone(), v["policyPushed"].clone()),
+            (json!(64), json!(true))
+        );
+        // And a place frees up when one is taken off.
+        rig.unblock(&mac(1)).unwrap();
+        assert_eq!(rig.block(&mac(5000), None).unwrap()["block"], 64);
+    }
+
+    #[test]
+    fn a_device_cannot_be_blocked_without_being_known() {
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            for i in 1..=wdstore::MAX_ENTRIES {
+                s.know(&mac(i), None, T0);
+            }
+        });
+        let before = rig.store();
+        let e = err(rig.block(&mac(5000), None));
+        assert_eq!(e.code, "full");
+        assert!(e.detail.contains("known"), "{}", e.detail);
+        assert_eq!(rig.store(), before);
+        assert!(rig.known_puts().is_empty() && rig.policy_puts().is_empty());
+        // One that is known already goes on the block list.
+        let v = rig.block(&mac(7), None).unwrap();
+        assert_eq!(
+            (v["known"].clone(), v["block"].clone()),
+            (json!(1024), json!(1))
+        );
+    }
+
+    #[test]
+    fn unblock_removes_the_device_pushes_the_policy_and_leaves_it_known() {
+        let mut rig = Rig::new();
+        rig.block(&mac(1), Some("A")).unwrap();
+        rig.block(&mac(2), None).unwrap();
+        let known_pushes = rig.known_puts().len();
+        let v = rig.unblock(&mac(1)).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(1), "block": 1, "policyPushed": true})
+        );
+        assert_eq!(rig.pi_block(), vec![mac(2)]);
+        let v = rig.unblock(&mac(2)).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "block": 0, "policyPushed": true})
+        );
+        assert_eq!(
+            rig.policy_puts(),
+            vec![
+                policy_body(false, &[mac(1)]),
+                policy_body(false, &[mac(1), mac(2)]),
+                policy_body(false, &[mac(2)]),
+                policy_body(false, &[]),
+            ],
+            "the emptied list is pushed too"
+        );
+        let store = rig.store();
+        assert!(store.block.is_empty() && !store.policy_push_due());
+        assert_eq!(store.known_macs(), vec![mac(1), mac(2)], "still known");
+        assert_eq!(rig.known_puts().len(), known_pushes, "not pushed");
+    }
+
+    #[test]
+    fn unblock_of_a_device_that_is_not_listed_is_not_found_and_makes_no_request() {
+        let mut rig = Rig::new();
+        rig.block(&mac(1), None).unwrap();
+        let before = rig.pi.with(|s| s.log.len());
+        let e = err(rig.unblock(&mac(2)));
+        assert_eq!(e.code, "not-found");
+        assert!(e.detail.contains("block"), "{}", e.detail);
+        assert_eq!(rig.pi.with(|s| s.log.len()), before);
+        assert_eq!(rig.store().block_macs(), vec![mac(1)]);
+        // Known (or exempt) but not blocked is just as not found.
+        rig.exempt(&mac(3), None).unwrap();
+        assert_eq!(err(rig.unblock(&mac(3))).code, "not-found");
+    }
+
+    #[test]
+    fn the_policy_verbs_need_a_writable_store_and_push_nothing_without_one() {
+        let mut rig = Rig::new();
+        let bad = unwritable(rig.dir.path());
+        let e = exempt_default(&mut rig.api, &bad, true).unwrap_err();
+        assert_eq!(e.code, "store");
+        assert!(e.detail.contains("policy"), "{}", e.detail);
+        let e = block(&mut rig.api, &bad, T0, &mac(1), None).unwrap_err();
+        assert_eq!(e.code, "store");
+        let e = unblock(&mut rig.api, &bad, &mac(1)).unwrap_err();
+        assert_eq!(e.code, "store");
+        assert!(rig.known_puts().is_empty() && rig.policy_puts().is_empty());
+    }
+
+    #[test]
+    fn block_without_an_answer_from_devices_still_works_like_know() {
+        let mut rig = Rig::new();
+        pi_with_list(&rig, "learned", 10, 8);
+        rig.pi.with(|s| s.fail_qbp = true);
+        let v = rig.block(&mac(10), None).unwrap();
+        assert_eq!(v["known"], 1, "it cannot know what to seed from");
+        assert!(v.get("seeded").is_none());
+        assert_eq!(
+            (v["pushed"].clone(), v["policyPushed"].clone()),
+            (json!(false), json!(false))
+        );
+        assert_eq!(rig.store().block_macs(), vec![mac(10)]);
+    }
+
+    // block-this
+
+    /// A fake `/proc/net/route` and `/sys/class/net`, in a temporary
+    /// directory of its own.
+    struct FakeHost {
+        dir: tempfile::TempDir,
+    }
+
+    const ROUTE_HEADER: &str =
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT";
+
+    impl FakeHost {
+        fn new(route_lines: &[&str]) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let h = Self { dir };
+            h.set_route(route_lines);
+            std::fs::create_dir_all(h.dir.path().join("net")).unwrap();
+            h.set_hostname("testbox\n");
+            h
+        }
+        fn set_route(&self, lines: &[&str]) {
+            let mut t = format!("{ROUTE_HEADER}\n");
+            for l in lines {
+                t.push_str(l);
+                t.push('\n');
+            }
+            std::fs::write(self.dir.path().join("route"), t).unwrap();
+        }
+        fn set_hostname(&self, h: &str) {
+            std::fs::write(self.dir.path().join("hostname"), h).unwrap();
+        }
+        /// An interface with `address` in its sysfs folder (`None`: no file).
+        fn iface(&self, name: &str, address: Option<&str>) {
+            let d = self.dir.path().join("net").join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            if let Some(a) = address {
+                std::fs::write(d.join("address"), a).unwrap();
+            }
+        }
+        fn files(&self) -> HostFiles {
+            HostFiles {
+                route: self.dir.path().join("route"),
+                sys_class_net: self.dir.path().join("net"),
+                hostname: self.dir.path().join("hostname"),
+            }
+        }
+    }
+
+    /// A route line as the kernel writes it: default (all zero) through
+    /// `gw`, flags `flags` (3 = up and gateway), metric `metric`.
+    fn default_via(iface: &str, flags: u32, metric: u32) -> String {
+        format!("{iface}\t00000000\t0100A8C0\t{flags:04X}\t0\t0\t{metric}\t00000000\t0\t0\t0")
+    }
+    fn lan(iface: &str) -> String {
+        format!("{iface}\t0000A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0")
+    }
+
+    impl Rig {
+        fn block_this(&mut self, host: &FakeHost) -> ActionResult {
+            let path = self.path();
+            block_this(&mut self.api, &path, T0 + 999, &host.files())
+        }
+    }
+
+    #[test]
+    fn block_this_blocks_the_interface_of_the_default_route_labelled_with_the_hostname() {
+        let host = FakeHost::new(&[&default_via("eth0", 3, 100), &lan("eth0")]);
+        host.iface("eth0", Some("02:00:00:AA:BB:CC\n"));
+        let mut rig = Rig::new();
+        let v = rig.block_this(&host).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": "02:00:00:aa:bb:cc", "label": "testbox",
+                   "interface": "eth0", "known": 1, "block": 1,
+                   "pushed": true, "policyPushed": true})
+        );
+        let store = rig.store();
+        assert_eq!(store.block_macs(), vec!["02:00:00:aa:bb:cc".to_string()]);
+        assert_eq!(store.block[0].label.as_deref(), Some("testbox"));
+        assert!(store.is_known("02:00:00:aa:bb:cc"));
+        assert_eq!(rig.pi_block(), vec!["02:00:00:aa:bb:cc".to_string()]);
+    }
+
+    #[test]
+    fn block_this_takes_the_default_route_that_is_used_and_not_the_first_listed() {
+        // Wi-Fi first in the table, but Ethernet has the lower metric.
+        let host = FakeHost::new(&[
+            &default_via("wlan0", 3, 600),
+            &lan("wlan0"),
+            &default_via("eth0", 3, 100),
+        ]);
+        host.iface("wlan0", Some("02:00:00:00:00:02\n"));
+        host.iface("eth0", Some("02:00:00:00:00:01\n"));
+        let mut rig = Rig::new();
+        let v = rig.block_this(&host).unwrap();
+        assert_eq!(
+            (v["mac"].clone(), v["interface"].clone()),
+            (json!(mac(1)), json!("eth0"))
+        );
+        // Equal metrics: the first one listed.
+        host.set_route(&[&default_via("wlan0", 3, 100), &default_via("eth0", 3, 100)]);
+        let v = rig.block_this(&host).unwrap();
+        assert_eq!(v["interface"], "wlan0");
+    }
+
+    #[test]
+    fn block_this_ignores_routes_that_are_not_up_or_not_default() {
+        let host = FakeHost::new(&[
+            // Not up (flags 2), a reject route (0x0203), a default route
+            // with a destination that is not 0.0.0.0, and one with a mask.
+            &default_via("down0", 2, 10),
+            &default_via("rej0", 0x0203, 20),
+            "net0\t0000A8C0\t0100A8C0\t0003\t0\t0\t30\t00000000\t0\t0\t0",
+            "net1\t00000000\t0100A8C0\t0003\t0\t0\t40\t00FFFFFF\t0\t0\t0",
+            // A point-to-point link: up, no gateway.
+            &default_via("ppp0", 1, 700),
+        ]);
+        for n in ["down0", "rej0", "net0", "net1"] {
+            host.iface(n, Some("02:00:00:00:00:09\n"));
+        }
+        host.iface("ppp0", Some("02:00:00:00:00:05\n"));
+        let mut rig = Rig::new();
+        let v = rig.block_this(&host).unwrap();
+        assert_eq!(v["interface"], "ppp0");
+        assert_eq!(v["mac"], mac(5));
+    }
+
+    #[test]
+    fn block_this_without_a_default_route_is_refused_and_changes_nothing() {
+        let mut rig = Rig::new();
+        let before = rig.store();
+        // Only the local network, and an empty table.
+        for lines in [vec![lan("eth0")], vec![]] {
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let host = FakeHost::new(&lines);
+            host.iface("eth0", Some("02:00:00:00:00:01\n"));
+            let e = err(rig.block_this(&host));
+            assert_eq!(e.code, "no-route");
+            assert!(e.detail.contains("default route"), "{}", e.detail);
+        }
+        // A routing table that cannot be read says so.
+        let host = FakeHost::new(&[]);
+        std::fs::remove_file(host.dir.path().join("route")).unwrap();
+        assert_eq!(err(rig.block_this(&host)).code, "no-route");
+        assert_eq!(rig.store(), before);
+        assert!(rig.known_puts().is_empty() && rig.policy_puts().is_empty());
+        assert_eq!(rig.pi.qbp_requests(), 0, "the Pi was not even asked");
+    }
+
+    #[test]
+    fn block_this_on_an_interface_without_an_ethernet_address_is_refused() {
+        let mut rig = Rig::new();
+        let before = rig.store();
+        let host = FakeHost::new(&[&default_via("wg0", 3, 50)]);
+        // No address file at all, an empty one (a tunnel), the all-zero
+        // address some virtual links have, and something that is no address.
+        host.iface("wg0", None);
+        for content in [
+            "",
+            "\n",
+            "00:00:00:00:00:00\n",
+            "garbage\n",
+            "02:00:00:00:00\n",
+        ] {
+            host.iface("wg0", Some(content));
+            let e = err(rig.block_this(&host));
+            assert_eq!(e.code, "no-address", "{content:?}");
+            assert!(e.detail.contains("wg0"), "{}", e.detail);
+            assert!(e.detail.contains("Ethernet"), "{}", e.detail);
+        }
+        let host = FakeHost::new(&[&default_via("tun0", 3, 50)]);
+        host.iface("tun0", None);
+        assert_eq!(err(rig.block_this(&host)).code, "no-address");
+        // No such interface in sysfs either.
+        let host = FakeHost::new(&[&default_via("gone0", 3, 50)]);
+        assert_eq!(err(rig.block_this(&host)).code, "no-address");
+        // A name that would leave the sysfs folder is not followed.
+        let host = FakeHost::new(&[&default_via("../x", 3, 50)]);
+        assert_eq!(err(rig.block_this(&host)).code, "no-address");
+        assert_eq!(rig.store(), before);
+        assert_eq!(rig.pi.qbp_requests(), 0);
+    }
+
+    #[test]
+    fn block_this_without_a_hostname_has_no_label_and_cleans_the_one_it_has() {
+        let host = FakeHost::new(&[&default_via("eth0", 3, 100)]);
+        host.iface("eth0", Some("02-00-00-AA-BB-CC\n"));
+        let mut rig = Rig::new();
+        host.set_hostname("\n");
+        let v = rig.block_this(&host).unwrap();
+        assert_eq!(v["mac"], "02:00:00:aa:bb:cc", "normalised");
+        assert!(v.get("label").is_none(), "{v}");
+        assert_eq!(rig.store().block[0].label, None);
+        // A missing file is no hostname either.
+        std::fs::remove_file(host.dir.path().join("hostname")).unwrap();
+        assert!(rig.block_this(&host).unwrap().get("label").is_none());
+        // Control characters go, a long name is cut at 64 characters.
+        host.set_hostname(&format!("  my\u{7}box{}\n", "x".repeat(100)));
+        let v = rig.block_this(&host).unwrap();
+        let label = v["label"].as_str().unwrap();
+        assert!(
+            label.starts_with("mybox") && label.chars().count() == 64,
+            "{label}"
+        );
+    }
+
+    #[test]
+    fn block_this_can_be_repeated_and_unblocked_by_its_address() {
+        let host = FakeHost::new(&[&default_via("eth0", 3, 100)]);
+        host.iface("eth0", Some("02:00:00:00:00:07\n"));
+        let mut rig = Rig::new();
+        rig.block_this(&host).unwrap();
+        let v = rig.block_this(&host).unwrap();
+        assert_eq!(v["block"], 1, "the same device, not a second entry");
+        let v = rig.unblock(&mac(7)).unwrap();
+        assert_eq!(v["block"], 0);
+    }
+
+    // devices
+
+    #[test]
+    fn devices_reports_the_policy_on_both_sides() {
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            s.set_exempt_default(true);
+            s.know(&mac(1), Some("PC"), 40);
+            s.add_block(&mac(1), Some("PC"), 40);
+            s.add_block(&mac(9), Some("Gone"), 50);
+            s.add_block(&mac(10), None, 60);
+        });
+        rig.pi.with(|s| {
+            // What the Pi has: the mode, this PC's block list as pushed
+            // earlier (mac 1 only) and one of its own (mac 3).
+            s.exempt_default = true;
+            s.policy_block = vec![mac(1), mac(3)];
+        });
+        let v = rig.devices().unwrap();
+        let by_mac = |m: String| {
+            v["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["mac"] == json!(m))
+                .unwrap()
+                .clone()
+        };
+        let flags = |m: String| {
+            let d = by_mac(m);
+            (d["blocked"].clone(), d["blockedOnPi"].clone())
+        };
+        assert_eq!(flags(mac(1)), (json!(true), json!(true)));
+        assert_eq!(flags(mac(3)), (json!(false), json!(true)), "only on the Pi");
+        assert_eq!(flags(mac(2)), (json!(false), json!(false)));
+        // `exemptOnPi` is the Pi's effective answer: everyone but the blocked.
+        let exempt_on_pi = |m: String| by_mac(m)["exemptOnPi"].clone();
+        assert_eq!(
+            (
+                exempt_on_pi(mac(1)),
+                exempt_on_pi(mac(2)),
+                exempt_on_pi(mac(3))
+            ),
+            (json!(false), json!(true), json!(false))
+        );
+        assert_eq!(by_mac(mac(2))["exempt"], false, "not on this PC's list");
+        assert_eq!(v["exemptDefault"], true);
+        assert_eq!(v["exemptDefaultOnPi"], true);
+        assert_eq!(
+            v["blockOffline"],
+            json!([
+                { "mac": mac(9), "label": "Gone", "firstSeen": 50 },
+                { "mac": mac(10), "label": "", "firstSeen": 60 },
+            ]),
+            "on this PC's list, not among the Pi's devices"
+        );
+        assert_eq!(
+            v["blockOnPiOnly"],
+            json!([mac(3)]),
+            "on the Pi's list, not on this PC's"
+        );
+        assert_eq!(rig.store().policy_gen, 4, "looking changes nothing");
+        // The Pi's mode and this PC's can differ.
+        rig.pi.with(|s| s.exempt_default = false);
+        let v = rig.devices().unwrap();
+        assert_eq!(
+            (v["exemptDefault"].clone(), v["exemptDefaultOnPi"].clone()),
+            (json!(true), json!(false))
+        );
+    }
+
+    #[test]
+    fn devices_from_a_pi_without_the_policy_has_no_policy_flags_and_nothing_only_on_the_pi() {
+        let mut rig = Rig::on(FakePi::without_policy(20));
+        rig.edit(|s| {
+            s.set_exempt_default(true);
+            s.know(&mac(1), None, 40);
+            s.add_block(&mac(1), None, 40);
+            s.add_block(&mac(9), Some("Gone"), 50);
+        });
+        let v = rig.devices().unwrap();
+        for d in v["devices"].as_array().unwrap() {
+            assert_eq!(d["blockedOnPi"], false, "{d}");
+            assert_eq!(d["blocked"], d["mac"] == json!(mac(1)), "{d}");
+        }
+        assert_eq!(v["exemptDefault"], true);
+        assert_eq!(v["exemptDefaultOnPi"], false);
+        assert_eq!(v["blockOnPiOnly"], json!([]));
+        assert_eq!(
+            v["blockOffline"],
+            json!([{ "mac": mac(9), "label": "Gone", "firstSeen": 50 }])
+        );
+    }
+
     // -- errors and dispatch --------------------------------------------------
 
     #[test]
@@ -1817,5 +2967,30 @@ mod tests {
         };
         assert_eq!(go(exempt_cmd)["exempt"], 1);
         assert_eq!(go(WdCmd::Unexempt { mac: mac(8) })["exempt"], 0);
+        assert_eq!(go(WdCmd::ExemptDefault { on: true })["exemptDefault"], true);
+        let block_cmd = WdCmd::Block {
+            mac: mac(7),
+            label: Some("Seven".into()),
+        };
+        assert_eq!(go(block_cmd)["block"], 1);
+        assert_eq!(go(WdCmd::Unblock { mac: mac(7) })["block"], 0);
+        assert_eq!(
+            go(WdCmd::ExemptDefault { on: false })["exemptDefault"],
+            false
+        );
+    }
+
+    #[test]
+    fn run_with_dispatches_block_this_to_the_host_it_is_given() {
+        let mut rig = Rig::new();
+        let host = FakeHost::new(&[&default_via("eth0", 3, 100)]);
+        host.iface("eth0", Some("02:00:00:00:00:07\n"));
+        let path = rig.path();
+        let v = run_with(&mut rig.api, &path, T0, &WdCmd::BlockThis, &host.files()).unwrap();
+        assert_eq!(
+            (v["mac"].clone(), v["interface"].clone()),
+            (json!(mac(7)), json!("eth0"))
+        );
+        assert_eq!(rig.pi_block(), vec![mac(7)]);
     }
 }

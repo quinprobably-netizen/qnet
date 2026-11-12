@@ -12,6 +12,8 @@
 //!   qnet watchdog ack <id>         acknowledge a watchdog alert on the Pi
 //!   qnet watchdog know <mac> [label...]|forget <mac>   known-device list
 //!   qnet watchdog exempt <mac> [label...]|unexempt <mac>   exempt-device list
+//!   qnet watchdog exempt-default on|off   every device skips ad blocking but the blocked
+//!   qnet watchdog block <mac> [label...]|unblock <mac>|block-this   block list
 //!
 //! One-shot verbs print one JSON line and exit 0 (`ok`) or 1.
 
@@ -51,7 +53,8 @@ use actions::{ActionErr, ActionResult, Ctx};
 const USAGE: &str = "usage: qnet watch | state | dns pihole|auto [--force] | dns pin <uuid> [--force] | \
 pihole pause [secs]|resume|setup <addr> | wifi connect <ap-path>|down|scan|forget <uuid>|radio on|off | portal | \
 watchdog alerts|devices|know-all | watchdog ack <id> | watchdog know <mac> [label...] | watchdog forget <mac> | \
-watchdog exempt <mac> [label...] | watchdog unexempt <mac>";
+watchdog exempt <mac> [label...] | watchdog unexempt <mac> | watchdog exempt-default on|off | \
+watchdog block <mac> [label...] | watchdog unblock <mac> | watchdog block-this";
 
 fn usage() -> ActionErr {
     ActionErr::new("usage", USAGE)
@@ -613,6 +616,13 @@ mod tests {
         })
     }
 
+    fn block(mac: &str, label: Option<&str>) -> Cmd {
+        Cmd::Watchdog(WdCmd::Block {
+            mac: mac.into(),
+            label: label.map(String::from),
+        })
+    }
+
     #[test]
     fn watchdog_verbs_parse() {
         assert_eq!(p(&["watchdog", "alerts"]), Ok(Cmd::Watchdog(WdCmd::Alerts)));
@@ -655,6 +665,27 @@ mod tests {
             p(&["watchdog", "exempt", M, "Smart", "TV"]),
             Ok(exempt(M, Some("Smart TV")))
         );
+        assert_eq!(
+            p(&["watchdog", "exempt-default", "on"]),
+            Ok(Cmd::Watchdog(WdCmd::ExemptDefault { on: true }))
+        );
+        assert_eq!(
+            p(&["watchdog", "exempt-default", "off"]),
+            Ok(Cmd::Watchdog(WdCmd::ExemptDefault { on: false }))
+        );
+        assert_eq!(p(&["watchdog", "block", M]), Ok(block(M, None)));
+        assert_eq!(
+            p(&["watchdog", "block", M, "Work", "laptop"]),
+            Ok(block(M, Some("Work laptop")))
+        );
+        assert_eq!(
+            p(&["watchdog", "unblock", M]),
+            Ok(Cmd::Watchdog(WdCmd::Unblock { mac: M.into() }))
+        );
+        assert_eq!(
+            p(&["watchdog", "block-this"]),
+            Ok(Cmd::Watchdog(WdCmd::BlockThis))
+        );
     }
 
     #[test]
@@ -670,6 +701,11 @@ mod tests {
         assert_eq!(
             p(&["watchdog", "unexempt", upper]),
             Ok(Cmd::Watchdog(WdCmd::Unexempt { mac: lower.into() }))
+        );
+        assert_eq!(p(&["watchdog", "block", upper]), Ok(block(lower, None)));
+        assert_eq!(
+            p(&["watchdog", "unblock", upper]),
+            Ok(Cmd::Watchdog(WdCmd::Unblock { mac: lower.into() }))
         );
     }
 
@@ -730,6 +766,28 @@ mod tests {
     }
 
     #[test]
+    fn a_block_label_is_handled_like_a_known_label() {
+        assert_eq!(
+            p(&["watchdog", "block", M, "Living", "room", "PC"]),
+            Ok(block(M, Some("Living room PC")))
+        );
+        assert_eq!(
+            p(&["watchdog", "block", M, "--force", "--if-stale", "x"]),
+            Ok(block(M, Some("--force --if-stale x")))
+        );
+        assert_eq!(
+            p(&["watchdog", "block", M, "  Hall\u{7}way", "pc\t"]),
+            Ok(block(M, Some("Hallway pc")))
+        );
+        assert_eq!(p(&["watchdog", "block", M, "", " "]), Ok(block(M, None)));
+        let long = "x".repeat(100);
+        assert_eq!(
+            p(&["watchdog", "block", M, &long]),
+            Ok(block(M, Some(&"x".repeat(64))))
+        );
+    }
+
+    #[test]
     fn bad_watchdog_input_is_rejected_before_anything_runs() {
         for id in [
             "x",
@@ -761,7 +819,7 @@ mod tests {
             "020000000001",
             "",
         ] {
-            for verb in ["know", "forget", "exempt", "unexempt"] {
+            for verb in ["know", "forget", "exempt", "unexempt", "block", "unblock"] {
                 let e = p(&["watchdog", verb, mac]).unwrap_err();
                 assert_eq!(e.code, "invalid", "{verb} {mac:?}");
             }
@@ -782,6 +840,16 @@ mod tests {
             &["watchdog", "unexempt"],
             &["watchdog", "unexempt", M, "Printer"],
             &["watchdog", "exempt-all"],
+            &["watchdog", "exempt-default"],
+            &["watchdog", "exempt-default", "maybe"],
+            &["watchdog", "exempt-default", "ON"],
+            &["watchdog", "exempt-default", "on", "off"],
+            &["watchdog", "block"],
+            &["watchdog", "unblock"],
+            &["watchdog", "unblock", M, "Printer"],
+            &["watchdog", "block-this", M],
+            &["watchdog", "block-this", "now"],
+            &["watchdog", "block-all"],
         ] {
             let e = p(bad).unwrap_err();
             assert_eq!(e.code, "usage", "{bad:?} -> {e:?}");

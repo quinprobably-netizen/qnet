@@ -30,6 +30,14 @@ knows about the Pi-hole on the LAN. It is a thin QML panel over a Rust binary,
     rewrite it away) and pushed to the Pi like the known list. A Pi that
     does not support it yet is told so by the commands and left alone by the
     watcher until the next login session, and nothing else is affected.
+  - **Exempt by default:** a mode in which every device skips ad blocking
+    (threat blocking stays) except the ones on a short block list, new
+    devices included. This PC owns the mode and the block list (in the same
+    file as the exempt list) and pushes them as one policy, with the same
+    rules: on every session push, after an edit or a Pi restart, and a Pi that
+    does not support it yet is told so by the commands and left alone by the
+    watcher. Turning the mode on says so: every device not on the block list
+    stops being ad-blocked.
   - Against a real Pi-hole nothing changes. There is no panel for it yet.
 
 Details: `SPEC.md`.
@@ -47,6 +55,10 @@ qnet watchdog know <mac> [label...]   # add to the known list; pushed to the Pi
 qnet watchdog forget <mac>   # take a device off the list
 qnet watchdog exempt <mac> [label...]   # skip ad blocking for it (also marks it known); pushed to the Pi
 qnet watchdog unexempt <mac> # ad blocking again; the device stays known
+qnet watchdog exempt-default on|off   # every device skips ad blocking but the blocked ones (threats stay blocked)
+qnet watchdog block <mac> [label...]  # keep it fully blocked in that mode (also marks it known, takes it off the exempt list)
+qnet watchdog unblock <mac>  # take it off the block list
+qnet watchdog block-this     # block this computer: the interface of the default route, labelled with the hostname
 qnet watchdog know-all       # add every device the Pi has seen
 ```
 

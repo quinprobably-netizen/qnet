@@ -16,6 +16,15 @@
 //! the next [`update`] moves it (the new file wins from then on, and
 //! `watchdog.json` is written without it).
 //!
+//! The exempt-by-default policy lives in that second file too: the mode
+//! (every device skips ad blocking, threat blocking stays) and the block
+//! list (the devices, at most [`MAX_BLOCK`], that stay fully blocked), pushed
+//! to the Pi as one policy with a generation counter pair of their own. A
+//! file from before the policy has none of those fields and loads as the mode
+//! off and an empty block list. (A qnet that has the exempt list but not the
+//! policy rewrites this file without the policy's fields when it saves the
+//! exempt list: only a watcher that outlives an upgrade can do that.)
+//!
 //! The watcher and the CLI both write it, so every change goes through
 //! [`update`], a read-modify-write under an exclusive lock on
 //! `watchdog.lock` next to the file. A file that cannot be read or parsed is
@@ -37,6 +46,9 @@ pub const MAX_ENTRIES: usize = 1024;
 /// At most this many addresses on the exempt list: the Pi takes the whole
 /// list in one body of at most this many.
 pub const MAX_EXEMPT: usize = 64;
+/// At most this many addresses on the block list of the exempt-by-default
+/// policy: the Pi takes the whole list in one body of at most this many.
+pub const MAX_BLOCK: usize = 64;
 /// Longest label, in characters.
 pub const LABEL_MAX: usize = 64;
 
@@ -63,6 +75,9 @@ pub struct Known {
 
 /// A device on the exempt list: the same shape as a known one.
 pub type Exempt = Known;
+
+/// A device on the block list: the same shape as a known one.
+pub type Blocked = Known;
 
 /// An alert instance that already got a notification: its key, the
 /// `first_unix` of that instance (a fresh instance after a Pi reboot has a
@@ -105,9 +120,27 @@ pub struct Store {
     /// The `exempt_gen` that was last pushed to the Pi successfully.
     #[serde(skip_serializing)]
     pub pushed_exempt_gen: u64,
+    /// The exempt-by-default mode: every device skips ad blocking (threat
+    /// blocking stays) except the ones on [`block`](Self::block). Kept in
+    /// `watchdog-exempt.json` only; the policy never lived in `watchdog.json`,
+    /// so it is neither read from it nor written to it.
+    #[serde(skip)]
+    pub exempt_default: bool,
+    /// The devices that stay fully blocked in that mode, at most
+    /// [`MAX_BLOCK`].
+    #[serde(skip)]
+    pub block: Vec<Blocked>,
+    /// Bumped by every edit of the policy (the mode or the block list).
+    #[serde(skip)]
+    pub policy_gen: u64,
+    /// The `policy_gen` that was last pushed to the Pi successfully.
+    #[serde(skip)]
+    pub pushed_policy_gen: u64,
 }
 
-/// The content of `watchdog-exempt.json`: the exempt list and its counters.
+/// The content of `watchdog-exempt.json`: the exempt list and its counters,
+/// and the exempt-by-default policy with its own (a file from before the
+/// policy has none of these fields and reads as the mode off, no block list).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct ExemptFile {
@@ -117,6 +150,12 @@ struct ExemptFile {
     generation: u64,
     /// The `generation` that was last pushed to the Pi successfully.
     pushed_generation: u64,
+    exempt_default: bool,
+    block: Vec<Blocked>,
+    /// Bumped by every edit of the mode or the block list.
+    policy_generation: u64,
+    /// The `policy_generation` that was last pushed to the Pi successfully.
+    pushed_policy_generation: u64,
 }
 
 impl Default for ExemptFile {
@@ -126,6 +165,10 @@ impl Default for ExemptFile {
             exempt: Vec::new(),
             generation: 0,
             pushed_generation: 0,
+            exempt_default: false,
+            block: Vec::new(),
+            policy_generation: 0,
+            pushed_policy_generation: 0,
         }
     }
 }
@@ -171,6 +214,10 @@ impl Default for Store {
             exempt: Vec::new(),
             exempt_gen: 0,
             pushed_exempt_gen: 0,
+            exempt_default: false,
+            block: Vec::new(),
+            policy_gen: 0,
+            pushed_policy_gen: 0,
         }
     }
 }
@@ -285,6 +332,10 @@ impl Store {
             exempt: self.exempt.clone(),
             generation: self.exempt_gen,
             pushed_generation: self.pushed_exempt_gen,
+            exempt_default: self.exempt_default,
+            block: self.block.clone(),
+            policy_generation: self.policy_gen,
+            pushed_policy_generation: self.pushed_policy_gen,
         }
     }
 
@@ -292,6 +343,10 @@ impl Store {
         self.exempt = f.exempt;
         self.exempt_gen = f.generation;
         self.pushed_exempt_gen = f.pushed_generation;
+        self.exempt_default = f.exempt_default;
+        self.block = f.block;
+        self.policy_gen = f.policy_generation;
+        self.pushed_policy_gen = f.pushed_policy_generation;
     }
 
     /// Whether the exempt fields hold anything (what an earlier
@@ -439,6 +494,85 @@ impl Store {
     /// [`mark_pushed`](Self::mark_pushed)).
     pub fn mark_exempt_pushed(&mut self, generation: u64) {
         self.pushed_exempt_gen = generation;
+    }
+
+    // -- the exempt-by-default policy ------------------------------------------
+
+    /// Set the exempt-by-default mode; true (and `policy_gen` up) when it
+    /// changed.
+    pub fn set_exempt_default(&mut self, on: bool) -> bool {
+        if self.exempt_default == on {
+            return false;
+        }
+        self.exempt_default = on;
+        self.bump_policy_gen();
+        true
+    }
+
+    fn bump_policy_gen(&mut self) {
+        self.policy_gen = self.policy_gen.wrapping_add(1);
+    }
+
+    /// Whether `mac` (any accepted spelling) is on the block list.
+    pub fn is_blocked(&self, mac: &str) -> bool {
+        normalize_mac(mac).is_some_and(|m| self.block.iter().any(|b| b.mac == m))
+    }
+
+    /// Whether the block list holds [`MAX_BLOCK`] entries already.
+    pub fn block_is_full(&self) -> bool {
+        self.block.len() >= MAX_BLOCK
+    }
+
+    /// Put `mac` on the block list or update its label, exactly as
+    /// [`add_exempt`](Self::add_exempt) does for the exempt list (same label
+    /// cleaning, same `first_seen` rule, same refusals with
+    /// [`MAX_BLOCK`]); `policy_gen` goes up only when something changed. The
+    /// device is neither put on the known list nor taken off the exempt list:
+    /// those are separate edits.
+    pub fn add_block(&mut self, mac: &str, label: Option<&str>, first_seen: u64) -> bool {
+        if !upsert(&mut self.block, MAX_BLOCK, mac, label, first_seen) {
+            return false;
+        }
+        self.bump_policy_gen();
+        true
+    }
+
+    /// Take `mac` off the block list; true (and `policy_gen` up) when it was
+    /// there.
+    pub fn remove_block(&mut self, mac: &str) -> bool {
+        let Some(mac) = normalize_mac(mac) else {
+            return false;
+        };
+        let before = self.block.len();
+        self.block.retain(|b| b.mac != mac);
+        if self.block.len() == before {
+            return false;
+        }
+        self.bump_policy_gen();
+        true
+    }
+
+    /// The blocked MACs, in list order.
+    pub fn block_macs(&self) -> Vec<String> {
+        self.block.iter().map(|b| b.mac.clone()).collect()
+    }
+
+    /// Whether the policy is the one a Pi has without ever being told: the
+    /// mode off and nothing on the block list.
+    pub fn policy_is_default(&self) -> bool {
+        !self.exempt_default && self.block.is_empty()
+    }
+
+    /// Whether the policy changed since it was last pushed to the Pi.
+    pub fn policy_push_due(&self) -> bool {
+        self.policy_gen != self.pushed_policy_gen
+    }
+
+    /// Record a successful push of policy generation `generation` (the
+    /// `policy_gen` that was read before the push, as for
+    /// [`mark_pushed`](Self::mark_pushed)).
+    pub fn mark_policy_pushed(&mut self, generation: u64) {
+        self.pushed_policy_gen = generation;
     }
 
     // -- notifications ---------------------------------------------------------
@@ -1382,6 +1516,269 @@ mod tests {
         assert!(s.exempt_push_due());
         s.mark_exempt_pushed(s.exempt_gen);
         assert!(!s.exempt_push_due());
+    }
+
+    // -- the exempt-by-default policy ------------------------------------------
+
+    #[test]
+    fn the_policy_survives_a_save_and_load_in_the_exempt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("qnet").join("watchdog.json");
+        let ep = exempt_path(&p);
+        let mut s = Store::default();
+        assert!(!s.exempt_default && s.block.is_empty());
+        assert!(s.set_exempt_default(true));
+        assert!(s.add_block("02:00:00:00:00:AA", Some(" Work laptop "), 70));
+        assert!(s.add_block(&mac(2), None, 80));
+        s.add_exempt(&mac(3), Some("TV"), 90);
+        s.mark_policy_pushed(2);
+        s.save(&p).unwrap();
+        let back = Store::load(&p);
+        assert_eq!(back, s);
+        assert!(back.exempt_default);
+        assert_eq!(back.block[0].mac, "02:00:00:00:00:aa");
+        assert_eq!(back.block[0].label.as_deref(), Some("Work laptop"));
+        assert_eq!(back.block[1].label, None);
+        assert_eq!((back.policy_gen, back.pushed_policy_gen), (3, 2));
+        // The same file as the exempt list, in camel case ...
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ep).unwrap()).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["exempt"][0]["mac"], mac(3));
+        assert_eq!(v["exemptDefault"], true);
+        assert_eq!(v["block"][0]["mac"], "02:00:00:00:00:aa");
+        assert_eq!(v["block"][0]["firstSeen"], 70);
+        assert_eq!(v["block"][1].get("label"), None, "no label, no key");
+        assert_eq!(v["policyGeneration"], 3);
+        assert_eq!(v["pushedPolicyGeneration"], 2);
+        assert_eq!(mode(&ep), 0o600);
+        // ... and never in the store's own.
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        for key in [
+            "exemptDefault",
+            "block",
+            "policyGen",
+            "pushedPolicyGen",
+            "policyGeneration",
+        ] {
+            assert!(v.get(key).is_none(), "{key} is written to watchdog.json");
+        }
+        // A store file that happens to carry such fields is not believed.
+        std::fs::write(
+            &p,
+            r#"{"version":1,"exemptDefault":true,"block":[{"mac":"02:00:00:00:00:09"}]}"#,
+        )
+        .unwrap();
+        std::fs::remove_file(&ep).unwrap();
+        let s = Store::load(&p);
+        assert!(!s.exempt_default && s.block.is_empty());
+    }
+
+    #[test]
+    fn an_exempt_file_from_before_the_policy_loads_as_off_with_an_empty_block_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        let ep = exempt_path(&p);
+        let old = r#"{"version":1,"exempt":[{"mac":"02:00:00:00:00:01","label":"TV","firstSeen":9}],
+            "generation":4,"pushedGeneration":3}"#;
+        std::fs::write(&ep, old).unwrap();
+        let s = Store::load(&p);
+        assert!(!s.exempt_default);
+        assert!(s.block.is_empty());
+        assert_eq!((s.policy_gen, s.pushed_policy_gen), (0, 0));
+        assert!(!s.policy_push_due());
+        // The exempt list is as it was.
+        assert_eq!(s.exempt_macs(), [mac(1)]);
+        assert_eq!((s.exempt_gen, s.pushed_exempt_gen), (4, 3));
+        // A no-op update leaves the file as it is, byte for byte.
+        update(&p, |s| s.exempt.len()).unwrap();
+        assert_eq!(std::fs::read_to_string(&ep).unwrap(), old);
+        // A policy edit writes the same file, keeping the exempt list; the
+        // store's own file is not touched (there is none to begin with).
+        update(&p, |s| s.set_exempt_default(true)).unwrap();
+        assert!(!p.exists());
+        let s = Store::load(&p);
+        assert!(s.exempt_default);
+        assert_eq!(s.exempt_macs(), [mac(1)]);
+        assert_eq!(s.exempt[0].label.as_deref(), Some("TV"));
+        assert_eq!((s.exempt_gen, s.pushed_exempt_gen), (4, 3));
+        assert_eq!((s.policy_gen, s.pushed_policy_gen), (1, 0));
+        assert!(bad_files(&p).is_empty(), "an old file is not corrupt");
+    }
+
+    #[test]
+    fn a_policy_that_never_existed_is_off_and_not_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        let s = Store::load(&p);
+        assert!(!s.exempt_default && s.block.is_empty() && !s.policy_push_due());
+        assert!(!exempt_path(&p).exists());
+        // An unusable exempt file is kept aside and the policy starts off.
+        std::fs::write(exempt_path(&p), "{broken").unwrap();
+        update(&p, |s| s.add_block(&mac(1), None, 1)).unwrap();
+        assert_eq!(Store::load(&p).block_macs(), [mac(1)]);
+        assert!(!Store::load(&p).exempt_default);
+        assert_eq!(bad_files(&p).len(), 1);
+    }
+
+    #[test]
+    fn the_mode_bumps_the_generation_only_when_it_changes() {
+        let mut s = Store::default();
+        assert!(!s.set_exempt_default(false), "already off");
+        assert_eq!(s.policy_gen, 0);
+        assert!(s.set_exempt_default(true));
+        assert_eq!((s.exempt_default, s.policy_gen), (true, 1));
+        assert!(!s.set_exempt_default(true));
+        assert_eq!(s.policy_gen, 1);
+        assert!(s.policy_push_due());
+        assert!(s.set_exempt_default(false));
+        assert_eq!((s.exempt_default, s.policy_gen), (false, 2));
+    }
+
+    #[test]
+    fn add_block_inserts_updates_labels_and_bumps_the_generation_only_on_change() {
+        let mut s = Store::default();
+        assert!(!s.policy_push_due());
+        assert!(s.add_block("02:00:00:00:00:AA", Some("  Work laptop\n"), 100));
+        assert_eq!(s.policy_gen, 1);
+        assert!(s.policy_push_due());
+        assert_eq!(s.block[0].mac, "02:00:00:00:00:aa", "normalised");
+        assert_eq!(s.block[0].label.as_deref(), Some("Work laptop"), "cleaned");
+        assert_eq!(s.block[0].first_seen, 100);
+        // The same entry again: nothing changes.
+        assert!(!s.add_block("02-00-00-00-00-aa", Some("Work laptop"), 999));
+        assert!(!s.add_block("02:00:00:00:00:aa", None, 999));
+        assert!(!s.add_block("02:00:00:00:00:aa", Some("  "), 999));
+        assert_eq!(s.policy_gen, 1);
+        // A new label changes it, first_seen stays.
+        assert!(s.add_block("02:00:00:00:00:aa", Some("Desk PC"), 999));
+        assert_eq!(s.policy_gen, 2);
+        assert_eq!(s.block[0].label.as_deref(), Some("Desk PC"));
+        assert_eq!(s.block[0].first_seen, 100);
+        // Bad MACs are refused.
+        assert!(!s.add_block("nonsense", Some("x"), 1));
+        assert!(!s.add_block("", None, 1));
+        assert_eq!(s.policy_gen, 2);
+        assert!(s.is_blocked("02:00:00:00:00:AA"));
+        assert!(!s.is_blocked("02:00:00:00:00:bb"));
+        assert!(!s.is_blocked("junk"));
+    }
+
+    #[test]
+    fn remove_block_bumps_the_generation_only_when_it_removes_something() {
+        let mut s = Store::default();
+        s.add_block(&mac(1), None, 1);
+        s.add_block(&mac(2), None, 1);
+        assert_eq!(s.policy_gen, 2);
+        assert!(!s.remove_block(&mac(3)));
+        assert!(!s.remove_block("junk"));
+        assert_eq!(s.policy_gen, 2);
+        assert!(s.remove_block(&mac(1).to_uppercase()));
+        assert_eq!(s.policy_gen, 3);
+        assert_eq!(s.block_macs(), [mac(2)]);
+        assert!(!s.remove_block(&mac(1)), "already gone");
+        assert_eq!(s.policy_gen, 3);
+    }
+
+    #[test]
+    fn the_block_list_holds_at_most_64() {
+        assert_eq!(MAX_BLOCK, 64);
+        let mut s = Store::default();
+        for i in 0..MAX_BLOCK {
+            assert!(!s.block_is_full(), "{i}");
+            assert!(s.add_block(&mac(i), None, 1), "{i}");
+        }
+        assert!(s.block_is_full());
+        let gen = s.policy_gen;
+        assert!(!s.add_block(&mac(5000), None, 1), "refused beyond 64");
+        assert_eq!(s.block.len(), 64);
+        assert_eq!(s.policy_gen, gen, "a refusal changes nothing");
+        // An existing entry can still be relabelled when the list is full.
+        assert!(s.add_block(&mac(0), Some("still editable"), 1));
+        assert!(s.remove_block(&mac(1)));
+        assert!(!s.block_is_full());
+        assert!(s.add_block(&mac(5000), None, 1), "room again");
+    }
+
+    #[test]
+    fn the_policy_and_the_other_lists_do_not_touch_each_other() {
+        let mut s = Store::default();
+        s.know(&mac(1), None, 1);
+        s.add_exempt(&mac(2), None, 1);
+        s.add_block(&mac(3), None, 1);
+        s.set_exempt_default(true);
+        assert_eq!((s.known_gen, s.exempt_gen, s.policy_gen), (1, 1, 2));
+        assert_eq!(s.known_macs(), [mac(1)]);
+        assert_eq!(s.exempt_macs(), [mac(2)]);
+        assert_eq!(s.block_macs(), [mac(3)]);
+        assert!(!s.is_blocked(&mac(1)) && !s.is_blocked(&mac(2)));
+        assert!(!s.is_known(&mac(3)) && !s.is_exempt(&mac(3)));
+        // Each has its own pushed generation.
+        let (k, e) = (s.known_gen, s.exempt_gen);
+        s.mark_pushed(k);
+        s.mark_exempt_pushed(e);
+        assert!(!s.push_due() && !s.exempt_push_due() && s.policy_push_due());
+        s.mark_policy_pushed(s.policy_gen);
+        assert!(!s.policy_push_due());
+        // Editing the exempt list does not make the policy due.
+        s.add_exempt(&mac(4), None, 1);
+        assert!(s.exempt_push_due() && !s.policy_push_due());
+    }
+
+    #[test]
+    fn policy_push_due_follows_the_generations() {
+        let mut s = Store::default();
+        assert!(!s.policy_push_due());
+        s.set_exempt_default(true);
+        assert!(s.policy_push_due());
+        let pushed = s.policy_gen;
+        // An edit while the push is on the wire stays due.
+        s.add_block(&mac(1), None, 1);
+        s.mark_policy_pushed(pushed);
+        assert!(s.policy_push_due());
+        s.mark_policy_pushed(s.policy_gen);
+        assert!(!s.policy_push_due());
+    }
+
+    #[test]
+    fn the_default_policy_is_recognised() {
+        let mut s = Store::default();
+        assert!(s.policy_is_default());
+        s.add_block(&mac(1), None, 1);
+        assert!(!s.policy_is_default());
+        s.remove_block(&mac(1));
+        assert!(
+            s.policy_is_default(),
+            "an emptied list is the default again"
+        );
+        s.set_exempt_default(true);
+        assert!(!s.policy_is_default());
+    }
+
+    #[test]
+    fn a_policy_edit_writes_only_the_exempt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("watchdog.json");
+        update(&p, |s| s.know(&mac(1), Some("Printer"), 5)).unwrap();
+        let store_bytes = std::fs::read(&p).unwrap();
+        update(&p, |s| {
+            s.set_exempt_default(true);
+            s.add_block(&mac(2), Some("PC"), 6);
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), store_bytes, "watchdog.json");
+        let s = Store::load(&p);
+        assert!(s.exempt_default);
+        assert_eq!(s.block_macs(), [mac(2)]);
+        assert_eq!(s.known_macs(), [mac(1)]);
+        // A store edit leaves the policy alone in turn.
+        let before = std::fs::read(exempt_path(&p)).unwrap();
+        update(&p, |s| s.add_acked(&key(2), 7)).unwrap();
+        assert_eq!(std::fs::read(exempt_path(&p)).unwrap(), before);
+        // A no-op update rewrites nothing.
+        update(&p, |s| s.block.len()).unwrap();
+        assert_eq!(std::fs::read(exempt_path(&p)).unwrap(), before);
     }
 
     #[test]
