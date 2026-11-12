@@ -25,19 +25,37 @@ knows about the Pi-hole on the LAN. It is a thin QML panel over a Rust binary,
     desktop notifications (3 a minute, then "N more alerts").
   - The acknowledged alerts and the known devices are kept on this PC and
     pushed back after a Pi reboot.
-  - Devices can be exempt from ad blocking (threat blocking stays): the list
-    is kept on this PC (in a file of its own, so that an older qnet cannot
-    rewrite it away) and pushed to the Pi like the known list. A Pi that
-    does not support it yet is told so by the commands and left alone by the
-    watcher until the next login session, and nothing else is affected.
-  - **Exempt by default:** a mode in which every device skips ad blocking
-    (threat blocking stays) except the ones on a short block list, new
-    devices included. This PC owns the mode and the block list (in the same
-    file as the exempt list) and pushes them as one policy, with the same
-    rules: on every session push, after an edit or a Pi restart, and a Pi that
-    does not support it yet is told so by the commands and left alone by the
-    watcher. Turning the mode on says so: every device not on the block list
-    stops being ad-blocked.
+  - A device can have **ADS PASS** (it is exempt from ad blocking; threat
+    blocking stays): the list is kept on this PC (in a file of its own, so
+    that an older qnet cannot rewrite it away) and pushed to the Pi like the
+    known list. A Pi that does not support it yet is told so by the commands
+    and left alone by the watcher until the next login session, and nothing
+    else is affected.
+  - **Exempt by default:** a mode in which every device has ADS PASS (threat
+    blocking stays) except the ones on a short block list, new devices
+    included. This PC owns the mode and the block list (in the same file as the
+    ADS PASS list) and pushes them as one policy, with the same rules: on every
+    session push, after an edit or a Pi restart, and a Pi that does not support
+    it yet is told so by the commands and left alone by the watcher. Turning the
+    mode on says so: every device not on the block list stops being ad-blocked.
+  - **The Pi's front panel** can give a device ADS PASS or take it away (in the
+    exempt-by-default mode: put it on the block list or take it off), and its
+    edit is newer than the list this PC pushed. Before it pushes either list,
+    and whenever it reads the devices, qnet looks at the Pi's lists and the
+    Pi's revision: when the panel changed a list, qnet **adopts** it instead of
+    pushing its older one over it. Every push carries the revision it was made
+    on (`if_rev`), so a push that the panel overtook is refused by the Pi, read
+    again and decided again. A list that was edited here and not pushed yet
+    wins over the panel's, and so does this PC's list when the Pi has just
+    restarted (its lists are empty then). The commands do the same: they edit
+    the panel's list, not an older one.
+  - **Names:** the labels given with `know`, `ads-pass` and `block` are pushed
+    to the Pi (in this PC's order, at most 64, plain ASCII, 24 characters) for
+    the panel to show, after each session push, a Pi restart and each edit.
+  - **Panel PIN:** `qnet watchdog pin set` asks for four digits (on stdin,
+    never on the command line, no echo on a terminal) and keeps only their
+    hash, which it pushes to the Pi after every login and restart so that the
+    panel's lock holds. `pin clear` takes the PIN off the running Pi.
   - Against a real Pi-hole nothing changes. There is no panel for it yet.
 
 Details: `SPEC.md`.
@@ -50,17 +68,24 @@ omarchy restart shell        # QML hot-reload is unreliable; restart to load edi
 qnet pihole setup [address]  # once, in a terminal: pins the cert, stores an app password in the keyring
 qnet watchdog alerts         # qberrypi only: its alerts, one JSON line
 qnet watchdog ack <id>       # acknowledge an alert
-qnet watchdog devices        # its devices, and what this PC knows of them
+qnet watchdog devices        # its devices (also its labels, gates, fixed/always, revision), and what this PC knows of them
 qnet watchdog know <mac> [label...]   # add to the known list; pushed to the Pi
 qnet watchdog forget <mac>   # take a device off the list
-qnet watchdog exempt <mac> [label...]   # skip ad blocking for it (also marks it known); pushed to the Pi
-qnet watchdog unexempt <mac> # ad blocking again; the device stays known
-qnet watchdog exempt-default on|off   # every device skips ad blocking but the blocked ones (threats stay blocked)
-qnet watchdog block <mac> [label...]  # keep it fully blocked in that mode (also marks it known, takes it off the exempt list)
+qnet watchdog exempt <mac> [label...]   # ADS PASS for it (also marks it known); pushed to the Pi. Alias: ads-pass
+qnet watchdog unexempt <mac> # ads blocked again; the device stays known. Alias: ads-block
+qnet watchdog exempt-default on|off   # every device has ADS PASS but the blocked ones (threats stay blocked)
+qnet watchdog block <mac> [label...]  # keep it fully blocked in that mode (also marks it known, takes it off the ADS PASS list)
 qnet watchdog unblock <mac>  # take it off the block list
 qnet watchdog block-this     # block this computer: the interface of the default route, labelled with the hostname
 qnet watchdog know-all       # add every device the Pi has seen
+qnet watchdog pin set        # the panel's PIN: four digits on stdin (no echo on a terminal); only the hash is kept
+qnet watchdog pin clear      # take the PIN off the running Pi
 ```
+
+`ads-pass` and `ads-block` are the panel's words for `exempt` and `unexempt`
+(the JSON field names keep `exempt`). `ads-block` takes ADS PASS away from a
+device; it is not `block`, which is the exempt-by-default mode's block list. In
+that mode the block list decides, so use `block` and `unblock` there.
 
 - IPC: `omarchy-shell qqq.qnet toggle | open | close | view <main|wifi|dns>`.
 - Keybinding: `SUPER + CTRL + N`, rebound in `~/.config/hypr/bindings.lua`.

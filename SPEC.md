@@ -23,8 +23,10 @@ wiped the Pi-hole pin from every profile.
    - Safe automatic failover, and recovery.
    - Watchdog: when the Pi-hole is a qberrypi, qnet also fronts its watchdog
      (alerts, devices, desktop notifications, and the acknowledged and known
-     lists kept on this PC, the exempt list, and the exempt-by-default policy
-     with its block list). Against a real Pi-hole nothing changes.
+     lists kept on this PC, the ADS PASS list, the exempt-by-default policy
+     with its block list, the device labels and the panel PIN's hash; what the
+     Pi's front panel changes of the two lists is adopted, not overwritten).
+     Against a real Pi-hole nothing changes.
 3. **Passive Wi-Fi.** NetworkManager over D-Bus, event-driven, using NM's
    cached access-point list. Scan only on an explicit request (`qnet wifi
    scan`, at most once per 15 s); opening the panel never scans. The AX210 is
@@ -92,10 +94,11 @@ wiped the Pi-hole pin from every profile.
     `partial`, `unconfigured`, `enterprise`, `badpass`, `auth`, `nolink`,
     `radio`, `rfkill`. The `watchdog` verbs add `absent` (the Pi-hole has no
     watchdog), `not-found` (no such alert, or the device is not on the known,
-    exempt or block list), `full` (the known list already holds 1024 devices,
-    or the exempt or block list 64), `no-route` and `no-address` (`block-this`
-    cannot tell which device this computer is) and `store` (the PC-side
-    watchdog store could not be written).
+    ADS PASS or block list), `full` (the known list already holds 1024 devices,
+    or the ADS PASS or block list 64), `no-route` and `no-address` (`block-this`
+    cannot tell which device this computer is), `invalid` (also: a PIN that is
+    not four digits) and `store` (the PC-side watchdog store could not be
+    written).
   - **One-shot verbs and signals:** except the interactive `pihole setup`,
     they catch SIGTERM/SIGINT/SIGHUP. The step in progress finishes (a
     profile that was written is applied, a half-made Wi-Fi profile is
@@ -111,8 +114,9 @@ wiped the Pi-hole pin from every profile.
     notification, so a restart repeats none), `absentFor` (only while set:
     `"<address>|<pin>"` of the Pi-hole that was found to have no watchdog, see
     the API thread above) and `version`. Each list keeps at most 1024 entries.
-  - **The exempt list has a file of its own,** `watchdog-exempt.json` in the
-    same directory (mode 0600): `exempt` (the devices that skip ad blocking,
+  - **The ADS PASS list has a file of its own,** `watchdog-exempt.json` in the
+    same directory (mode 0600): `exempt` (the devices with ADS PASS, which skip
+    ad blocking,
     entries as in `known`, at most 64: the Pi takes the list in one body of
     that size), `generation` and `pushedGeneration` (which edit of it the Pi
     has) and `version`. Why: a qnet from before the exempt list ignores
@@ -136,10 +140,19 @@ wiped the Pi-hole pin from every profile.
     exempt list but not the policy rewrites the file without these fields
     when it saves the exempt list; only a watcher that outlives an upgrade
     can do that, and the policy then has to be set again.)
+  - **The panel's PIN is in that file too:** `pinHash` (the line
+    `$pbkdf2-sha256$i=10000$<salt hex>$<hash hex>` that the Pi's panel takes,
+    or absent), `pinGeneration` and `pushedPinGeneration` (which set or clear
+    the Pi has). qnet hashes the four digits itself (PBKDF2-HMAC-SHA256, 10,000
+    rounds, a random 16-byte salt), so the digits are never stored, sent or
+    logged; the hash is no protection against someone who can read the file
+    (four digits), its job is that no PIN is in clear, and the file is 0600 as
+    the rest. A `pinHash` that is not exactly that shape is read as no PIN.
   - **Writers:** the watcher (keys the Pi reports as acknowledged,
     `notified`, `pushedKnownGen` after a push, `pushedGeneration` of the
-    exempt list, `pushedPolicyGeneration`) and the one-shot verbs
-    `watchdog ack|know|forget|know-all|exempt|unexempt|exempt-default|block|unblock|block-this`.
+    ADS PASS list, `pushedPolicyGeneration`, `pushedPinGeneration`, and the
+    lists that it adopts from the Pi's front panel) and the one-shot verbs
+    `watchdog ack|know|forget|know-all|exempt|unexempt|ads-pass|ads-block|exempt-default|block|unblock|block-this|pin`.
     Two processes can write it, so every
     change is a read-modify-write under an exclusive `flock` on
     `watchdog.lock` and replaces the file atomically. Unlike the DNS lock this
@@ -157,10 +170,11 @@ wiped the Pi-hole pin from every profile.
     Reading (the state JSON, `watchdog devices`) treats such a file as empty
     and writes nothing. The exempt list's file is kept the same way, as
     `watchdog-exempt.json.bad-<unix seconds>`, and independently: a damaged
-    `watchdog.json` does not take the exempt list with it, nor the other way
+    `watchdog.json` does not take the ADS PASS list with it, nor the other way
     round.
-- Secrets never go on argv: Wi-Fi passphrases and the Pi-hole web password
-  arrive on stdin (one line; the reader never waits for EOF). Untrusted
+- Secrets never go on argv: Wi-Fi passphrases, the Pi-hole web password and the
+  panel PIN (`watchdog pin set`: four digits, no echo on a terminal) arrive on
+  stdin (one line; the reader never waits for EOF). Untrusted
   strings reach processes only as argv elements. There is no shell anywhere
   (`sh -c` / `bash -c` are forbidden). Secrets are held in zeroizing buffers
   and the verbs that handle them (and `watch`) set `PR_SET_DUMPABLE=0`.
@@ -191,8 +205,8 @@ wiped the Pi-hole pin from every profile.
 | Gateway latency | In-process unprivileged ICMP echo (`SOCK_DGRAM`, `IPPROTO_ICMP`; needs `net.ipv4.ping_group_range`) to the gateway; no child process | only while open, every 5 s |
 | Pi-hole stats | HTTPS API on 443 with the **pinned cert SHA-256**: `/api/stats/summary`, `/api/dns/blocking` | only while open, every 10 s; `/api/history` and `/api/stats/upstreams` every 60 s and on open |
 | Watchdog alerts (qberrypi only) | `GET /api/qbp/alerts?since=<rev>` on the same pinned HTTPS session | open: after every good stats poll (10 s). Closed: 30 s after start, then every 60 s, while the watchdog is present; while the Pi-hole has not answered yet, a failing poll waits 60 s, 120 s, … up to 30 min. Never again once it is absent, until a new login session or a new config, and not at all while closed once the store says this Pi-hole is absent (`absentFor`) |
-| Watchdog devices (qberrypi only) | `GET /api/qbp/devices` | open only: on open, then every 60 s. Never while closed |
-| Watchdog pushes | `PUT /api/qbp/alerts/acked`, `PUT /api/qbp/devices/known`, `PUT /api/qbp/devices/exempt` and `PUT /api/qbp/devices/policy` | only when due (see "Watchdog (qberrypi)"): the first cycle of a session, a new login (in the same cycle), a Pi restart, a Pi that is `waiting` for its list, an edit of the known list (of the exempt list or the policy for their own calls). Each body is at most 4000 bytes (the Pi's cap is 4096), so the known list goes in chunks; the exempt list and the policy are one body each, of at most 64 addresses. An empty known list is pushed only when an edit emptied it; the exempt list and the default policy are pushed too, see "Watchdog (qberrypi)" |
+| Watchdog devices (qberrypi only) | `GET /api/qbp/devices` | open: on open, then every 60 s (the Pi's front panel's edits of the two lists are adopted from each read). Closed: only before a list is pushed (see "Watchdog (qberrypi)"), which is once per login session, after a Pi restart or an edit |
+| Watchdog pushes | `PUT /api/qbp/alerts/acked`, `PUT /api/qbp/devices/known`, `PUT /api/qbp/devices/exempt`, `PUT /api/qbp/devices/policy`, `PUT /api/qbp/devices/labels` and `PUT /api/qbp/panel` | only when due (see "Watchdog (qberrypi)"): the first cycle of a session, a new login (in the same cycle), a Pi restart, a Pi that is `waiting` for its list, an edit of the known list (of the ADS PASS list, the policy, the labels or the PIN for their own calls). Each body is at most 4000 bytes (the Pi's cap is 4096), so the known list and the labels go in chunks; the ADS PASS list and the policy are one body each, of at most 64 addresses, and carry the revision that was read as `if_rev`. An empty known list is pushed only when an edit emptied it; the ADS PASS list, the default policy and no labels are pushed too, the PIN only when one is set (or just cleared), see "Watchdog (qberrypi)" |
 
 ### Pi-hole API sessions
 
@@ -447,14 +461,15 @@ Field rules:
     have learned a device on its own, or a list edit may not have been pushed
     yet.
   - `label`: this PC's label for the device, `""` when there is none.
-  - `exemptOnPi`: the Pi skips ad blocking for the device (threat blocking
-    stays); `false` when the Pi does not say, as an older Pi does not.
-    `exempt`: it is on this PC's exempt list, the one pushed to the Pi. As
-    with the known flags the two can differ: the Pi's own config file can
-    exempt a device, an edit may not have been pushed yet, or the Pi's
-    software may not support exempt devices. In the exempt-by-default mode
-    `exemptOnPi` is the Pi's effective answer (every device but the blocked
-    ones), not a membership of its exempt list.
+  - `exemptOnPi`: the device has ADS PASS on the Pi (it skips ad blocking;
+    threat blocking stays); `false` when the Pi does not say, as an older Pi
+    does not. `exempt`: it is on this PC's ADS PASS list, the one pushed to the
+    Pi. As with the known flags the two can differ: the Pi's own config file
+    can pass a device, its front panel can give or take ADS PASS (this PC
+    adopts that at its next read, see "Watchdog (qberrypi)"), an edit may not
+    have been pushed yet, or the Pi's software may not support ADS PASS. In
+    the exempt-by-default mode `exemptOnPi` is the Pi's effective answer (every
+    device but the blocked ones), not a membership of its ADS PASS list.
   - `blockedOnPi`: the Pi keeps the device fully blocked, as a device on its
     block list (`false` when it does not say). `blocked`: it is on this PC's
     block list, the one pushed to the Pi with the exempt-by-default mode;
@@ -489,23 +504,26 @@ Field rules:
 | `qnet portal` | Opens `link.portalUrl`, or `http://neverssl.com`, in a normal **incognito window with a throwaway profile**: `chromium --user-data-dir=<new 0700 temp dir> --incognito <url>` (not `--app`: a portal page is untrusted web content). The temp dir is removed when the browser exits. |
 | `qnet watchdog alerts` | Every alert the Pi holds, newest change first, in the shape of `watchdog.alerts` (not cut at 50): `{"ok":true,"rev","suppressed","alerts":[…]}`. Error: `absent`. |
 | `qnet watchdog ack <id>` | Looks the alert up by `id` (`GET alerts`), `POST alerts/<id>/ack`, then records its key in the store so the Pi gets it again after a reboot. Result `{"ok":true,"id","key","saved":bool}`; `saved:false` means the Pi took it but this PC could not record it.<br>• Errors: `invalid` (not a whole number), `not-found` (no alert with that id, also when it vanished before the POST; nothing is written), `absent`. |
-| `qnet watchdog devices` | Result `{"ok":true,"knownList","devices":[…],"knownOffline":[{mac,label,firstSeen}],"exemptOffline":[{mac,label,firstSeen}],"exemptOnPiOnly":[mac,…],"exemptDefault":bool,"exemptDefaultOnPi":bool,"blockOffline":[{mac,label,firstSeen}],"blockOnPiOnly":[mac,…]}`.<br>• `devices`: everything the Pi reports (not cut at 128), last seen first, each as in `watchdog.devices`.<br>• `knownOffline`: devices on this PC's known list that the Pi did not report (`label` is `""` without one). `exemptOffline` and `blockOffline`: the same for this PC's exempt list and block list.<br>• `exemptOnPiOnly`: the addresses on the Pi's effective exempt list (`exempt_macs`) that are not on this PC's: they come from the Pi's own config file. `[]` for a Pi that does not say. `blockOnPiOnly`: the same for the Pi's block list (`block_macs`) against this PC's.<br>• `exemptDefault`: the mode on this PC. `exemptDefaultOnPi`: the mode the Pi says it is in (`false` when it does not say). They can differ while an edit is unpushed or the Pi has restarted.<br>• Error: `absent`. |
-| `qnet watchdog know <mac> [label...]` | Puts the device on this PC's known list, or changes its label, then pushes the whole list. Without a label an existing one stays. A new entry's `firstSeen` is when the Pi first saw the device, or now if the Pi does not list it or cannot be asked. It pushes on every call, also when nothing changed.<br>• **Seeding:** the Pi raises a `new_device` alert for every device it has seen that is not on the list it is given, so replacing a list it made itself with one device would flood. When this PC's list is empty (and no edit that emptied it is still unpushed) and the Pi's `knownList` is `learned` or `received`, the Pi's devices that are `known` are put on this PC's list first (no label, `firstSeen` from the Pi), in the same locked edit, then the device is added and the whole list pushed. If the devices cannot be read, nothing is seeded. `forget` cannot reach that state: an empty list has nothing to forget.<br>• Result `{"ok":true,"mac","label"?,"known":n,"seeded"?:n,"pushed":bool,"pushError"?}`; `known` is the size of the list after the edit, `seeded` (only when more than 0) how many entries were taken over from the Pi.<br>• A failed push, or a Pi-hole with no watchdog (`"pushError":"absent"`), still leaves the edit: `pushed:false`, and the watcher pushes it later.<br>• Errors: `invalid`, `full` (a new device, the list holds 1024; nothing is pushed), `store`. |
+| `qnet watchdog devices` | Result `{"ok":true,"rev","knownList","devices":[…],"knownOffline":[{mac,label,firstSeen}],"exemptOffline":[{mac,label,firstSeen}],"exemptOnPiOnly":[mac,…],"exemptDefault":bool,"exemptDefaultOnPi":bool,"blockOffline":[{mac,label,firstSeen}],"blockOnPiOnly":[mac,…]}`. It changes nothing (the watcher adopts what the panel did).<br>• `rev`: the revision of the Pi's device lists (a number; `null` when the Pi does not say).<br>• `devices`: everything the Pi reports (not cut at 128), last seen first, each as in `watchdog.devices` plus the Pi's front panel's fields: `labelOnPi` (the name the Pi was given, `null` for none; `label` is this PC's), `gateLeftSecs` (the seconds the panel's gate for the device stays open, `null` while shut), `fixed` (the Pi's configuration decides the device, so no edit changes it) and `always` (the router or the Pi itself: never ADS PASS). The last three are `null`, `false` and `false` for a Pi that does not say.<br>• `knownOffline`: devices on this PC's known list that the Pi did not report (`label` is `""` without one). `exemptOffline` and `blockOffline`: the same for this PC's ADS PASS list and block list.<br>• `exemptOnPiOnly`: the addresses on the Pi's effective ADS PASS list (`exempt_macs`) that are not on this PC's: they come from the Pi's own config file, or from its front panel and have not been adopted yet. `[]` for a Pi that does not say. `blockOnPiOnly`: the same for the Pi's block list (`block_macs`) against this PC's.<br>• `exemptDefault`: the mode on this PC. `exemptDefaultOnPi`: the mode the Pi says it is in (`false` when it does not say). They can differ while an edit is unpushed or the Pi has restarted.<br>• Error: `absent`. |
+| `qnet watchdog know <mac> [label...]` | Puts the device on this PC's known list, or changes its label, then pushes the whole list. Without a label an existing one stays. A new entry's `firstSeen` is when the Pi first saw the device, or now if the Pi does not list it or cannot be asked. It pushes on every call, also when nothing changed.<br>• **Seeding:** the Pi raises a `new_device` alert for every device it has seen that is not on the list it is given, so replacing a list it made itself with one device would flood. When this PC's list is empty (and no edit that emptied it is still unpushed) and the Pi's `knownList` is `learned` or `received`, the Pi's devices that are `known` are put on this PC's list first (no label, `firstSeen` from the Pi), in the same locked edit, then the device is added and the whole list pushed. If the devices cannot be read, nothing is seeded. `forget` cannot reach that state: an empty list has nothing to forget.<br>• Result `{"ok":true,"mac","label"?,"known":n,"seeded"?:n,"pushed":bool,"pushError"?,"labelsPushed":bool,"labelsPushError"?}`; `known` is the size of the list after the edit, `seeded` (only when more than 0) how many entries were taken over from the Pi, and `labelsPushed`/`labelsPushError` the push of the device names (`PUT devices/labels`, after every edit that may change them: `know`, `forget`, `exempt`, `unexempt`, `block` and `unblock`, also when none did; a 404 says "the Pi's software does not show device names yet"; it never hides another push).<br>• A failed push, or a Pi-hole with no watchdog (`"pushError":"absent"`), still leaves the edit: `pushed:false`, and the watcher pushes it later.<br>• Errors: `invalid`, `full` (a new device, the list holds 1024; nothing is pushed), `store`. |
 | `qnet watchdog forget <mac>` | Takes the device off this PC's known list, then pushes the list; an emptied list is pushed too. Result as for `know`, without `label`. Errors: `invalid`, `not-found` (not on this PC's list; the Pi's own `known` flag does not count; no request is made), `store`. |
-| `qnet watchdog exempt <mac> [label...]` | Puts the device on this PC's exempt list (or changes its label; without a label an existing one stays, a label is handled as for `know`) **and** on the known list exactly as `know` does (the owner named the device, so the Pi must not raise a new-device alert for it; the seeding of an empty known list applies too), in one locked edit. Then it pushes the known list, then the exempt list (`PUT /api/qbp/devices/exempt`, body `{"exempt":[…]}`, the whole list, at most 64 addresses; an emptied list is pushed too). It pushes on every call, also when nothing changed.<br>• Result `{"ok":true,"mac","label"?,"known":n,"exempt":n,"seeded"?:n,"pushed":bool,"pushError"?,"exemptPushed":bool,"exemptPushError"?}`: `known`, `seeded`, `pushed` and `pushError` are as for `know`; `exempt` is the size of the exempt list after the edit; `exemptPushed` and `exemptPushError` are the exempt push alone, so one failing never hides the other.<br>• A Pi (or a real Pi-hole) that answers 404 for the route has no exempt support: the edit stays and is saved, `exemptPushed:false` and `exemptPushError` says "the Pi's software does not support exempt devices yet". The watcher asks again once per login session. Any other failure leaves the edit too, and the watcher retries it on its next cycle.<br>• Errors: `invalid`, `full` (the exempt list holds 64 and this is a new device, or the known list holds 1024 and the device is not on it; nothing is changed or pushed), `store`. |
-| `qnet watchdog unexempt <mac>` | Takes the device off this PC's exempt list, then pushes that list (an emptied list is pushed too). The device stays on the known list, which is neither changed nor pushed. Result `{"ok":true,"mac","exempt":n,"exemptPushed":bool,"exemptPushError"?}`; a 404 is reported as for `exempt`. Errors: `invalid`, `not-found` (not on this PC's exempt list; the Pi's own config list does not count; no request is made), `store`. |
-| `qnet watchdog exempt-default on\|off` | Sets the exempt-by-default mode on this PC (`on`: every device skips ad blocking, threat blocking stays, except the devices on the block list, new ones included; `off`: the Pi blocks as before) and pushes the policy (`PUT /api/qbp/devices/policy`, body `{"exempt_default":bool,"block":[…]}`, both keys always, the whole block list, at most 64 addresses, answer `{"exempt_default":bool,"block":n}`). It pushes on every call, also when nothing changed. The block list is not touched: it is kept while the mode is off, and goes to the Pi with it.<br>• Result `{"ok":true,"exemptDefault":bool,"block":n,"policyPushed":bool,"policyPushError"?,"note"?}`; `block` is the size of the block list, `note` (only with `on`) says that every device that is not on the block list now skips ad blocking and that threat blocking stays.<br>• A Pi (or a real Pi-hole) that answers 404 for the route has no such mode: the edit stays and is saved, `policyPushed:false` and `policyPushError` says "the Pi's software does not support exempt-by-default blocking yet". The watcher asks again once per login session. Any other failure leaves the edit too, and the watcher retries it on its next cycle.<br>• Errors: `store`. |
-| `qnet watchdog block <mac> [label...]` | Puts the device on this PC's block list (or changes its label; without a label an existing one stays, a label is handled as for `know`) **and** on the known list exactly as `know` does (the seeding of an empty known list applies too) **and** takes it off the exempt list if it is there, in one locked edit. Then it pushes the known list, the exempt list (only when the device was taken off it, as `exempt` pushes it) and the policy, in that order, each on its own: one failing never holds up another. It pushes on every call, also when nothing changed.<br>• Result `{"ok":true,"mac","label"?,"known":n,"block":n,"seeded"?:n,"pushed":bool,"pushError"?,"policyPushed":bool,"policyPushError"?,"unexempted"?:true,"exempt"?:n,"exemptPushed"?:bool,"exemptPushError"?}`: `known`, `seeded`, `pushed` and `pushError` are as for `know`; `block` is the size of the block list after the edit; `unexempted`, `exempt` (the size of the exempt list) and `exemptPushed`/`exemptPushError` appear only when the device was on the exempt list; `policyPushed`/`policyPushError` are the policy push, with the 404 handling of `exempt-default`.<br>• Errors: `invalid`, `full` (the block list holds 64 and this is a new device, or the known list holds 1024 and the device is not on it; nothing is changed or pushed), `store`. |
-| `qnet watchdog unblock <mac>` | Takes the device off this PC's block list, then pushes the policy (an emptied list is pushed too). The device stays on the known list, which is neither changed nor pushed. Result `{"ok":true,"mac","block":n,"policyPushed":bool,"policyPushError"?}`; a 404 is reported as for `exempt-default`. Errors: `invalid`, `not-found` (not on this PC's block list; the Pi's own block list does not count; no request is made), `store`. |
+| `qnet watchdog exempt <mac> [label...]` (alias `ads-pass`) | Gives the device ADS PASS: puts it on this PC's ADS PASS list (or changes its label; without a label an existing one stays, a label is handled as for `know`) **and** on the known list exactly as `know` does (the owner named the device, so the Pi must not raise a new-device alert for it; the seeding of an empty known list applies too), in one locked edit, after it has read the Pi's devices and adopted what its front panel did to the list (see "Adopting what the panel did"). Then it pushes the known list, then the ADS PASS list (`PUT /api/qbp/devices/exempt`, body `{"exempt":[…],"if_rev":r}`, the whole list, at most 64 addresses; an emptied list is pushed too), then the labels. It pushes on every call, also when nothing changed. A push that the panel overtook is read again and merged (the command's edit on the Pi's new list).<br>• Result `{"ok":true,"mac","label"?,"known":n,"exempt":n,"seeded"?:n,"pushed":bool,"pushError"?,"exemptPushed":bool,"exemptPushError"?,"labelsPushed":bool,"labelsPushError"?}`: `known`, `seeded`, `pushed`, `pushError`, `labelsPushed` and `labelsPushError` are as for `know`; `exempt` is the size of the ADS PASS list after the edit; `exemptPushed` and `exemptPushError` are the ADS PASS push alone, so one failing never hides the other.<br>• A Pi (or a real Pi-hole) that answers 404 for the route has no ADS PASS support: the edit stays and is saved, `exemptPushed:false` and `exemptPushError` says "the Pi's software does not support ADS PASS devices yet". The watcher asks again once per login session. Any other failure leaves the edit too, and the watcher retries it on its next cycle.<br>• Errors: `invalid`, `full` (the ADS PASS list holds 64 and this is a new device, or the known list holds 1024 and the device is not on it; nothing is changed or pushed), `store`. |
+| `qnet watchdog unexempt <mac>` (alias `ads-block`) | Takes ADS PASS away from the device: takes it off this PC's ADS PASS list, then pushes that list (an emptied list is pushed too) and the labels. The device stays on the known list, which is neither changed nor pushed. It reads the Pi's devices first and adopts what the panel did, as `exempt` does, so a device that the panel put on the list can be taken off it here, and one that the panel took off already is `not-found`. Result `{"ok":true,"mac","exempt":n,"exemptPushed":bool,"exemptPushError"?,"labelsPushed":bool,"labelsPushError"?}`; a 404 is reported as for `exempt`. Errors: `invalid`, `not-found` (not on the ADS PASS list, as adopted; the Pi's own config list does not count; the one request made is the read), `store`. `ads-block` is not `block`: that is the exempt-by-default mode's block list. |
+| `qnet watchdog exempt-default on\|off` | Sets the exempt-by-default mode on this PC (`on`: every device has ADS PASS, threat blocking stays, except the devices on the block list, new ones included; `off`: the Pi blocks as before) and pushes the policy (`PUT /api/qbp/devices/policy`, body `{"exempt_default":bool,"block":[…],"if_rev":r}`, both keys always, the whole block list, at most 64 addresses, answer `{"exempt_default":bool,"block":n,"rev"}`). It pushes on every call, also when nothing changed. The block list is not touched, but for what the Pi's panel changed of it (read and adopted first, as for `exempt`): it is kept while the mode is off, and goes to the Pi with it.<br>• Result `{"ok":true,"exemptDefault":bool,"block":n,"policyPushed":bool,"policyPushError"?,"note"?}`; `block` is the size of the block list, `note` (only with `on`) says that every device that is not on the block list now has ADS PASS and that threat blocking stays.<br>• A Pi (or a real Pi-hole) that answers 404 for the route has no such mode: the edit stays and is saved, `policyPushed:false` and `policyPushError` says "the Pi's software does not support exempt-by-default blocking yet". The watcher asks again once per login session. Any other failure leaves the edit too, and the watcher retries it on its next cycle.<br>• Errors: `store`. |
+| `qnet watchdog block <mac> [label...]` | Puts the device on this PC's block list (or changes its label; without a label an existing one stays, a label is handled as for `know`) **and** on the known list exactly as `know` does (the seeding of an empty known list applies too) **and** takes it off the ADS PASS list if it is there, in one locked edit (after it has read the Pi's devices and adopted what its panel did to the lists). Then it pushes the known list, the ADS PASS list (only when the device was taken off it, as `exempt` pushes it), the policy and the labels, in that order, each on its own: one failing never holds up another. It pushes on every call, also when nothing changed.<br>• Result `{"ok":true,"mac","label"?,"known":n,"block":n,"seeded"?:n,"pushed":bool,"pushError"?,"policyPushed":bool,"policyPushError"?,"unexempted"?:true,"exempt"?:n,"exemptPushed"?:bool,"exemptPushError"?,"labelsPushed":bool,"labelsPushError"?}`: `known`, `seeded`, `pushed`, `pushError`, `labelsPushed` and `labelsPushError` are as for `know`; `block` is the size of the block list after the edit; `unexempted`, `exempt` (the size of the ADS PASS list) and `exemptPushed`/`exemptPushError` appear only when the device was on the ADS PASS list; `policyPushed`/`policyPushError` are the policy push, with the 404 handling of `exempt-default`.<br>• Errors: `invalid`, `full` (the block list holds 64 and this is a new device, or the known list holds 1024 and the device is not on it; nothing is changed or pushed), `store`. |
+| `qnet watchdog unblock <mac>` | Takes the device off this PC's block list, then pushes the policy (an emptied list is pushed too). The device stays on the known list, which is neither changed nor pushed. It reads the Pi's devices first and adopts what the panel did, as `exempt` does. Result `{"ok":true,"mac","block":n,"policyPushed":bool,"policyPushError"?,"labelsPushed":bool,"labelsPushError"?}`; a 404 is reported as for `exempt-default`. Errors: `invalid`, `not-found` (not on the block list, as adopted; the Pi's own block list does not count; the one request made is the read), `store`. |
 | `qnet watchdog block-this` | `block` for this computer, with nothing to type: the address is that of the interface that carries the IPv4 default route (from `/proc/net/route`: of the routes that are up, not rejecting, with destination and mask 0.0.0.0 the one with the lowest metric, the first listed among equals; the address from `/sys/class/net/<interface>/address`) and the label is the hostname (`/proc/sys/kernel/hostname`, cleaned as a label; none when it is empty). No command is run. Result as for `block` plus `"interface"`.<br>• Errors: `no-route` (no default route, or the routing table cannot be read), `no-address` (the interface has no Ethernet address, or an all-zero one: a tunnel, a VPN; nothing is changed or asked of the Pi), plus those of `block`. The address is the one the interface has now, not necessarily the one the router sees (a bridge, a VPN that takes the default route). |
 | `qnet watchdog know-all` | Adds every device the Pi reports that is not on the list, in one edit (existing entries and labels are untouched; `firstSeen` comes from the Pi), then pushes. It pushes only if something was added or an earlier edit is still waiting to go.<br>• Result `{"ok":true,"added":n,"known":n,"pushed":bool,"skipped"?:n,"pushError"?}`; `skipped` counts devices that did not fit on a full list.<br>• Errors: `absent`, `store`. |
+| `qnet watchdog pin set` | Sets the PIN of the Pi's front panel. It takes no argument: the four digits are one line on stdin (on a terminal a no-echo prompt `Panel PIN (4 digits):`, otherwise the first line of the pipe; the reader never waits for EOF), and the process is hardened (`PR_SET_DUMPABLE=0`) before it reads them. qnet hashes them (PBKDF2-HMAC-SHA256, 10,000 rounds, a random 16-byte salt: the format the Pi's `hash-pin` makes), keeps only the hash (`pinHash` in `watchdog-exempt.json`) and pushes it with `PUT /api/qbp/panel`, for the running boot; the watcher pushes it again after every login and restart, and when this push fails. The Pi's panel then asks for it before the actions that it locks. A new `pin set` replaces the PIN (the digits are never stored, so a forgotten one is replaced by setting another).<br>• Result `{"ok":true,"pin":"set","panelPushed":bool,"panelPushError"?}`: no digit and no hash is in it, in an error or in a log. A 404 says "the Pi's software does not take a panel PIN yet".<br>• Errors: `invalid` (not four digits; the message does not repeat what was typed), `io`, `store`. |
+| `qnet watchdog pin clear` | Takes the PIN off: forgets the hash here and pushes `{"pin_hash":null}`, which turns the lock off on the running Pi, also one that was set at its panel. It pushes on every call, also when this PC had no PIN. Result `{"ok":true,"pin":"cleared","panelPushed":bool,"panelPushError"?,"note"}`; the `note` says that a PIN in the Pi's own configuration comes back when the Pi restarts (only its configuration changes that). After a successful clear nothing is pushed again: with no hash here the watcher says nothing about the PIN. Errors: `store`. |
 
 The `watchdog` verbs share these rules:
 
 - A `<mac>` is six hex pairs with `:` or `-` between them, in either case; it is stored in lower-case colon form. Anything else is `invalid`, as is an `<id>` that is not a whole number.
 - A `label` is the rest of the line, words joined by single spaces and taken as typed (even words that look like flags). Control characters are removed, the ends trimmed and it is cut at 64 characters (cut, not refused); nothing left means no label.
 - A wrong shape of command is `usage`. Besides the errors above they can fail with `unconfigured`, `auth`, `tls`, `unreachable`, `api` (an answer qnet cannot use) and `interrupted`. The exit code matches `ok`, as for every verb.
-- `know`, `forget`, `exempt`, `unexempt`, `exempt-default`, `block`, `unblock` and `block-this` need no watchdog to edit the lists; `alerts`, `ack`, `devices` and `know-all` answer `absent` without one.
+- `know`, `forget`, `exempt`, `unexempt`, `exempt-default`, `block`, `unblock`, `block-this`, `pin set` and `pin clear` need no watchdog to edit the lists (or the PIN); `alerts`, `ack`, `devices` and `know-all` answer `absent` without one.
+- `ads-pass` and `ads-block` are other words for `exempt` and `unexempt`, for the panel's word ADS PASS: same arguments, same results, and the JSON field names keep `exempt`.
 
 ## Failover (in `qnet watch`)
 
@@ -566,14 +584,20 @@ as the Pi-hole API. It raises alerts (a new device, ARP spoofing, DGA lookups,
 DNS tunnels, beaconing, bursts, blocked threats, DNS rebinding) and keeps an
 inventory of the devices it has heard. qnet reads both over the pinned HTTPS
 API, puts them in the `watchdog` object of the state JSON and raises desktop
-notifications for new alerts. It keeps three lists and a policy on this PC and
-pushes them back to the Pi, so they survive its reboots: the acknowledged
-alerts, the known devices, the exempt devices (the ones that skip ad blocking;
-threat blocking stays) and the exempt-by-default policy (a mode in which every
-device skips ad blocking except the ones on a block list, devices never seen
-before included). The Pi holds the exempt list and the policy in memory only;
-this PC is their master. A real Pi-hole answers 404 on all of it, and then qnet
-behaves exactly as it did before. There is no panel for it yet.
+notifications for new alerts. It keeps three lists, a policy, the device names
+and the panel's PIN hash on this PC and pushes them back to the Pi, so they
+survive its reboots: the acknowledged alerts, the known devices, the ADS PASS
+devices (the ones that skip ad blocking; threat blocking stays), the
+exempt-by-default policy (a mode in which every device has ADS PASS except the
+ones on a block list, devices never seen before included), the names (labels)
+that this PC gives to its devices and the hash of the PIN of the Pi's front
+panel. The Pi holds all of those in memory only. This PC is their master, with
+one exception: the Pi's front panel can give a device ADS PASS or take it away
+(it edits the pushed ADS PASS list, or in the exempt-by-default mode the pushed
+block list), and that edit is newer than the list that this PC pushed, so qnet
+**adopts** it instead of pushing its older list over it (see "Adopting what the
+panel did"). A real Pi-hole answers 404 on all of it, and then qnet behaves
+exactly as it did before.
 
 Every call is under `/api/qbp/`, on the same session as the stats:
 
@@ -582,10 +606,12 @@ Every call is under `/api/qbp/`, on the same session as the stats:
 | `GET alerts?since=R` | `{rev, suppressed, alerts:[…]}`: the alerts that changed after revision `R`, oldest change first. The query is always sent (0 at the start). |
 | `POST alerts/{id}/ack` | Acknowledges one alert; 404 for an unknown id. |
 | `PUT alerts/acked` | `{"acked":[<key>…]}`. Additive; the Pi keeps at most 1024. |
-| `GET devices` | `{known_list, devices:[{mac, ipv4[], hostname, first_unix, last_unix, known, exempt?, blocked?}], exempt_macs?, exempt_default?, block_macs?}`. `exempt` and `exempt_macs` (the Pi's effective exempt list: its config file's plus the pushed one, lower-case colon form) are absent on an older Pi: they read as `false` and an empty list. `exempt` is the Pi's effective answer for the device: with the exempt-by-default mode it is true for every device but the blocked ones. `exempt_default` (the mode) and `block_macs` (the pushed block list) on top and `blocked` (the device is on the block list) are absent on a Pi from before the policy: they read as `false`, an empty list and `false`. |
+| `GET devices` | `{rev?, known_list, devices:[{mac, ipv4[], hostname, first_unix, last_unix, known, exempt?, blocked?, label?, gate_left_secs?, fixed?, always?}], exempt_macs?, exempt_pushed?, exempt_default?, block_macs?, block_pushed?}`. `exempt` and `exempt_macs` (the Pi's effective ADS PASS list: its config file's plus the pushed one, lower-case colon form) are absent on an older Pi: they read as `false` and an empty list. `exempt` is the Pi's effective answer for the device: with the exempt-by-default mode it is true for every device but the blocked ones, and a device whose gate is open is exempt. `exempt_default` (the mode) and `block_macs` (the pushed block list) on top and `blocked` (the device is on the block list) are absent on a Pi from before the policy: they read as `false`, an empty list and `false`. **The front panel's:** `rev` is the revision of the Pi's device lists, which moves with every change of the pushed lists, the mode, the labels and the gates, whoever makes it (this PC, the panel, a gate that shuts); `exempt_pushed` and `block_pushed` are the lists that this PC pushed, as the panel has edited them since, without the Pi's configuration's; `label` is the name this PC gave the device (`null` without one), `gate_left_secs` the seconds that the panel's gate for it stays open (`null` while shut), `fixed` that the Pi's configuration decides it (no edit changes it) and `always` that it is the router or the Pi itself (never ADS PASS). All of them are absent on a Pi from before the panel, and read as no revision, no pushed lists, `null`, `null`, `false`, `false`. (The Pi's `own_mac` and a device's `label_rank` are not read: nothing here acts on them.) |
 | `PUT devices/known` | `{"known":[<mac>…],"append":bool,"complete":bool}`. A list takes effect on the `complete` body; the Pi keeps at most 1024. |
-| `PUT devices/exempt` | `{"exempt":[<mac>…]}`: replaces the Pi's pushed list, `[]` clears it, at most 64 addresses in one body (no chunking). Answers `{"exempt":n}`; 400 means the body was refused. The Pi holds the list in memory only. A 404 means this Pi has no exempt support (see below). |
-| `PUT devices/policy` | `{"exempt_default":bool,"block":[<mac>…]}`: replaces the Pi's exempt-by-default policy: the mode and the block list, both keys always, `{"exempt_default":false,"block":[]}` is the default policy, at most 64 addresses in one body (no chunking), lower-case colon form. Answers `{"exempt_default":bool,"block":n}`; 400 means the body was refused. The Pi holds the policy in memory only. A 404 means this Pi has no such mode (see below). |
+| `PUT devices/exempt` | `{"exempt":[<mac>…],"if_rev":r?}`: replaces the Pi's pushed ADS PASS list, `[]` clears it, at most 64 addresses in one body (no chunking). Answers `{"exempt":n,"rev"}` (`rev` is the revision after the change; a push that changes nothing does not move it); 400 means the body was refused. With `if_rev` the Pi changes nothing unless that is its revision now, and answers **409** `{"error":…,"rev":current}`. qnet sends `if_rev` whenever the Pi's answer had a `rev`. The Pi holds the list in memory only. A 404 means this Pi has no ADS PASS support (see below). |
+| `PUT devices/policy` | `{"exempt_default":bool,"block":[<mac>…],"if_rev":r?}`: replaces the Pi's exempt-by-default policy: the mode and the block list, both keys always, `{"exempt_default":false,"block":[]}` is the default policy, at most 64 addresses in one body (no chunking), lower-case colon form. Answers `{"exempt_default":bool,"block":n,"rev"}`; 400 means the body was refused; `if_rev` and the 409 are as for `devices/exempt`. The Pi holds the policy in memory only. A 404 means this Pi has no such mode (see below). |
+| `PUT devices/labels` | `{"labels":[[<mac>,<label>]…],"append":bool,"complete":bool}`: what this PC calls its devices, in this PC's order, which the panel keeps; chunked like the known list (the labels take effect on the `complete` body). At most 64 pairs in all, a label is 1 to 24 printable ASCII characters. Answers `{"labels":n,"rev"}`. The Pi holds them in memory only. A 404 means a Pi from before the panel. |
+| `PUT panel` | `{"pin_hash":"<line>"}` or `{"pin_hash":null}`: the hash of the panel's PIN for the running boot (`$pbkdf2-sha256$i=10000$<salt hex>$<hash hex>`, made by qnet), or no PIN. A 404 means a Pi from before the panel's PIN. The hash is in no log and no error. (The Pi's `GET panel`, which says whether its lock is on and where the PIN came from, is not read.) |
 
 Answers are parsed leniently. An alert without a usable `id`, `key` or `kind`
 and a device without a valid MAC are dropped; other fields fall back to
@@ -625,7 +651,9 @@ answer that does not parse is an error, never "absent".
 - **The cycle** (the API thread; open after every good stats poll, closed on its
   own, where it asks for alerts only):
   1. Push what is due (below): the acknowledged keys first, then the known
-     list, then the exempt list, then the policy.
+     list, then the ADS PASS list, the policy, the labels and the PIN. When a
+     list of the two that the panel edits is to be pushed, the Pi's devices are
+     read first, before anything is pushed.
   2. `GET alerts?since=<cursor>`. The Pi may have restarted, and then the
      cursor and the alerts held cannot be trusted, so the cursor, the alerts
      and the device list are reset, the lists are pushed and the alerts are
@@ -650,9 +678,11 @@ answer that does not parse is an error, never "absent".
   4. Merge the page into the alerts held in memory, by `id`, at most 256 (the
      lowest `rev` goes first).
   5. Fold and show the notifications (below).
-  6. Open and devices due: `GET devices`. A `waiting` Pi with a non-empty PC
-     list is pushed at once (the exempt list and the policy with it). A failing devices read
-     or push does not fail the cycle.
+  6. Open and devices due: `GET devices`. What the panel did to the two lists
+     is adopted (see "Adopting what the panel did"), a revision that went back
+     is a Pi that started again, and a `waiting` Pi with a non-empty PC list is
+     pushed at once (the ADS PASS list, the policy, the labels and the PIN with
+     it). A failing devices read or push does not fail the cycle.
   7. Send the report to the main thread. The status is `ok` and `polledAt` is
      now.
 
@@ -681,27 +711,29 @@ answer that does not parse is an error, never "absent".
   - A failed push stays due and its message is `watchdog.pushError`. A
     successful one records `pushedKnownGen` as the generation read before the
     push, so an edit made while it was on the wire stays due.
-  - **The exempt list** is pushed wherever the known list is pushed again (the
-    first cycle of a client, a new login session, a restart, a `waiting` Pi),
-    and after an edit of its own (`generation` differs from `pushedGeneration`),
-    right after the known list: `PUT devices/exempt` with the whole list in one
-    body of at most 64 addresses. Unlike the known list it is pushed when it
+  - **The ADS PASS list** is pushed wherever the known list is pushed again
+    (the first cycle of a client, a new login session, a restart, a `waiting`
+    Pi), and after an edit of its own (`generation` differs from
+    `pushedGeneration`), right after the known list: `PUT devices/exempt` with
+    the whole list in one body of at most 64 addresses, and the revision that
+    was read as `if_rev` (below). Unlike the known list it is pushed when it
     is empty as well, on every such push and not only after an edit: this PC's
     list is the master, so a Pi that still holds exemptions from a store that
-    was lost or reset hears that there are none. It is not sent before the
-    watchdog has been seen (the first cycle of a client with an empty list
-    waits for the next one), so a real Pi-hole is never asked for it, and it
-    is left out when the lists answered 404 or the Pi cannot be reached. Its
-    push is kept apart from the known list's:
+    was lost or reset hears that there are none (but see "Adopting what the
+    panel did": a Pi list that has been changed since it started is taken over
+    first). It is not sent before the watchdog has been seen (the first cycle
+    of a client with an empty list waits for the next one), so a real Pi-hole
+    is never asked for it, and it is left out when the lists answered 404 or
+    the Pi cannot be reached. Its push is kept apart from the known list's:
     - a known list or acks that keep failing (the Pi answers, with an
       error) do not hold it back: it is sent in the same cycle, after them;
     - a failure of it (any status but 404, or no answer) never stops or
       delays the known list's push or the alerts; the list stays due, is tried
       again on the next cycle as a failed known push would be, and its message
-      shows in `watchdog.pushError` as `exempt list: <why>` unless the known
+      shows in `watchdog.pushError` as `ADS PASS list: <why>` unless the known
       list's own failure is there;
-    - a 404 means this Pi has no exempt support (an older qberrypi): it is not
-      an error and not an absence of the watchdog. The answer stands for the
+    - a 404 means this Pi has no ADS PASS support (an older qberrypi): it is
+      not an error and not an absence of the watchdog. The answer stands for the
       login session: the list is not sent again while the session lasts (the
       store keeps it due), and a new session, a restart that resets the
       cursor, or a new client gives it one more look, so a Pi that was
@@ -710,24 +742,97 @@ answer that does not parse is an error, never "absent".
     - success records `pushedGeneration` as the generation read before the
       push.
   - **The exempt-by-default policy** (the mode and the block list, one body)
-    is pushed by exactly the same rules, right after the exempt list:
+    is pushed by exactly the same rules, right after the ADS PASS list:
     wherever the known list is pushed again and after an edit of its own
     (`policyGeneration` differs from `pushedPolicyGeneration`), `PUT
     devices/policy` with both keys, also when it is the default policy (mode
     off, no block list), once the watchdog has been seen, so a Pi that still
     holds a mode or a block list from a store that was lost or reset hears
-    that there is none. It is independent of the known list's and the exempt
+    that there is none. It is independent of the known list's and the ADS PASS
     list's pushes, in both directions: neither a failing known list or acks
-    nor a failing exempt list holds it back (it is sent in the same cycle,
+    nor a failing ADS PASS list holds it back (it is sent in the same cycle,
     after them), and its own failure never stops or delays them or the
     alerts. A failure stays due, is tried again on the next cycle, and shows
     in `watchdog.pushError` as `device policy: <why>` unless the known list's
-    or the exempt list's failure is there. A 404 means this Pi has no such
+    or the ADS PASS list's failure is there. A 404 means this Pi has no such
     mode: not an error, not an absence of the watchdog; it stands for the
-    login session, like the exempt route's, tracked on its own (a Pi can have
+    login session, like the ADS PASS route's, tracked on its own (a Pi can have
     the one and not the other), and a new session, a restart or a new client
     gives it one more look. Success records `pushedPolicyGeneration` as the
     generation read before the push.
+  - **The labels** (`PUT devices/labels`) are pushed by the same triggers, after
+    the two lists so that they do not make those pushes stale, and are due again
+    when the labels that the store makes differ from the ones this run pushed
+    last (an edit). They are made from the store: the known list's labels in
+    its order, then those of the ADS PASS and block lists for devices that are
+    on no earlier list, a device once, by its first label. A label is made fit
+    for the Pi: a character outside printable ASCII is `?`, it is cut at 24
+    characters (no blank left at the end), one without a letter or a digit
+    left is left out, and so is an address no device can have (all zeros, or
+    with the multicast bit: one such pair would make the Pi refuse the whole
+    body); at most 64. They go in chunks of at most 4000 bytes as the known list
+    does (`append:false` first, `complete:true` last). No labels are pushed too
+    (the empty set clears a Pi that has stale ones), once the watchdog has been
+    seen. Their failure shows as `device labels: <why>` and, like a 404 (a Pi
+    from before the panel, remembered for the session), is kept apart from
+    every other push.
+  - **The PIN hash** (`PUT panel`) is pushed by the same triggers when a hash is
+    set here, and after a `pin set` or `pin clear` that is not pushed yet
+    (`pinGeneration` differs from `pushedPinGeneration`), so a Pi that
+    restarted (it keeps the PIN for the running boot only) gets the lock back.
+    With no hash and no edit waiting nothing is sent, ever: a PIN that the Pi
+    has in its own configuration is never taken off by a qnet that was never
+    given one. Failure: `panel PIN: <why>`, kept apart as the others; 404 as
+    for the labels.
+- **Adopting what the panel did:**
+  - The Pi's panel edits the same lists that this PC pushes, so the Pi's lists
+    can be newer than the store's. qnet reads `GET devices` before it pushes
+    either list (also while the panel of qnet is closed, once per session or
+    edit) and at every read of the open panel, and compares the Pi's
+    `exempt_pushed` and `block_pushed` with the store's, as sets. When they
+    differ, the Pi's list is **adopted** — the store's list becomes the Pi's, and
+    is counted as pushed — if all of these hold:
+    - the Pi's `rev` is above 0 (something has changed its lists since it
+      started: with 0 there is no panel edit to take, and the store's list is
+      pushed, which is how a Pi that lost its lists, or holds stale ones from a
+      store that was lost, hears this PC's);
+    - no edit of this PC is waiting to be pushed for that list (`generation`
+      differs from `pushedGeneration`; a command typed here whose push failed
+      is not given up for a difference, and wins over a panel edit it
+      overtook);
+    - nothing says the Pi started again: not a `rev` below the one this run
+      saw last, not a restart noticed by the alerts or the session, and not a
+      Pi that is still `waiting` for a known list that this PC has. A restarted
+      Pi has empty lists, which are no edit of the panel, and this PC pushes its
+      own. (A panel edit made after the Pi started and before qnet noticed is
+      lost to that push, as the Pi's spec accepts.)
+  - An adopted device keeps the label and `firstSeen` that the known list has
+    for it (a device that is not on it has none, and the time it was adopted).
+    Only the lists are adopted: the exempt-by-default **mode** and the known
+    list stay this PC's, and the Pi's labels (`label`) are read for display
+    only. A Pi without `rev` or without the pushed lists (older software) is
+    never adopted from and gets pushes without `if_rev`, as before.
+  - **`if_rev`:** the push of either list carries the `rev` of the answer that
+    was read for it, and the next push in the same cycle the revision that the
+    previous push answered. A push that the panel overtook (a gate that shuts
+    counts too) is a **409** with the revision now: qnet reads the Pi's devices
+    again and decides again, by the rules above, up to three times in a cycle.
+    So a push that the panel overtook is adopted over, not written over it; one
+    that keeps being overtaken stays due with `ADS PASS list: the Pi's lists
+    kept changing while they were pushed`, and is tried again at the next
+    cycle. A failing read of the devices holds the two lists back the same way
+    (no push is made on a revision nobody knows).
+  - **The commands** (`exempt`, `unexempt`, `ads-pass`, `ads-block`,
+    `exempt-default`, `block`, `unblock`, `block-this`) read the Pi's devices
+    first, adopt by the same rules inside their locked edit, edit what the Pi has
+    and push on the revision that was read. On a 409 they read again and put
+    their own edit (what they added and took off the list, from the list as the
+    command found it) on top of the Pi's new list, so the panel's edit and the
+    command's both stand; after three tries the result says so
+    (`exemptPushError` or `policyPushError`: "the Pi's lists kept changing
+    while this was sent (its front panel?); run it again") and the edit stays
+    due for the watcher. `unexempt` and `unblock` therefore make one request
+    (the read) even for a device that is not on the list.
 - **Notifications:**
   - An alert is new when it is not acknowledged and its key is not in
     `notified`, or its `first_unix` is later than the one recorded there (a
@@ -778,19 +883,25 @@ answer that does not parse is an error, never "absent".
     watcher or a verb. `push due` means they differ.
   - `exempt` (in `watchdog-exempt.json`, see the Process model): at most 64
     entries of the same shape as `known`, edited by
-    `watchdog exempt|unexempt` (a new device is refused when the list is full,
-    `full`). `generation` and `pushedGeneration` work as the known list's
-    `knownGen` and `pushedKnownGen`.
+    `watchdog exempt|unexempt` (also `ads-pass|ads-block`; a new device is
+    refused when the list is full, `full`) and by what is adopted from the
+    Pi's front panel. `generation` and `pushedGeneration` work as the known
+    list's `knownGen` and `pushedKnownGen`; an adopted list counts as pushed.
     `exempt` puts the device on `known` as well; `unexempt` leaves it
-    known, and `forget` leaves it on the exempt list.
+    known, and `forget` leaves it on the ADS PASS list.
   - `exemptDefault`, `block`, `policyGeneration` and `pushedPolicyGeneration`
     (also in `watchdog-exempt.json`): the mode and a block list of at most 64
     entries of the same shape as `known`, edited by
     `watchdog exempt-default|block|unblock|block-this` (a new device is
     refused when the list is full, `full`); the generations work as the
-    exempt list's, one pair for the mode and the list together. `block` puts
-    the device on `known` as well and takes it off `exempt`; `unblock`
-    leaves it known, and `forget` leaves it on the block list.
+    ADS PASS list's, one pair for the mode and the list together (the block
+    list is adopted from the Pi's panel as the ADS PASS list is, the mode never
+    is). `block` puts the device on `known` as well and takes it off `exempt`;
+    `unblock` leaves it known, and `forget` leaves it on the block list.
+  - `pinHash`, `pinGeneration` and `pushedPinGeneration` (also in
+    `watchdog-exempt.json`): the PIN's hash, edited by `watchdog pin set|clear`
+    (both bump `pinGeneration`, also a `clear` when there was no hash), see the
+    Process model.
   - `notified`: at most 1024 `{key, firstUnix, at}`; when full the oldest `at`
     goes first.
 
