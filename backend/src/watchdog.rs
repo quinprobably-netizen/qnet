@@ -2,9 +2,9 @@
 //! Pi-hole login, the tolerant parsers for their answers, notification text
 //! (titles, markup escaping, burst folding) and the chunking of the two
 //! lists that are pushed in chunks to the Pi (acknowledged alerts, known
-//! devices). The exempt list (devices that skip ad blocking) is pushed whole,
-//! in one body of at most 64 addresses ([`put_exempt`]); a Pi that answers 404
-//! for it has no exempt support.
+//! devices). The exempt list (devices that skip ad blocking) is pushed with
+//! it, in one body of at most 64 addresses, and a Pi that answers 404 for it
+//! (an older one) is simply not sent it again in that session.
 //!
 //! A real Pi-hole answers 404 on every `/api/qbp/` path. The calls here turn
 //! that into [`Qbp::Absent`], so the caller can treat the watchdog as not
@@ -743,6 +743,21 @@ pub struct Poller {
     /// session, so the Pi may have rebooted since: see
     /// [`restart`](Self::restart).
     alerts_logins: Option<u64>,
+    /// `api.logins()` after the last exempt push the Pi answered (a 404
+    /// counts: that was settled for the session); `None` = none with this
+    /// client. The exempt list rides on the known list's triggers, but is
+    /// tracked apart so that one failing never holds up the other.
+    exempt_pushed_logins: Option<u64>,
+    /// An exempt push was asked for (a restart, a `waiting` Pi) or the last
+    /// attempt failed, beyond what the other triggers say.
+    exempt_due: bool,
+    /// `api.logins()` when the Pi answered 404 for the exempt route: it has
+    /// no exempt support. While the session is the same the list is not
+    /// sent again (the store keeps it due); a new session, a restart or a
+    /// new client gets one more look, as the watchdog's own absence does.
+    exempt_absent_logins: Option<u64>,
+    /// Why the last exempt push failed, "" when it did not.
+    exempt_error: String,
     /// `"<address>|<pin>"` of the Pi-hole this poller talks to: what the
     /// store's `absent_for` is compared with. `None` = no verdict is kept.
     verdict_key: Option<String>,
@@ -776,6 +791,10 @@ impl Poller {
             push_due: false,
             absent_logins: 0,
             alerts_logins: None,
+            exempt_pushed_logins: None,
+            exempt_due: false,
+            exempt_absent_logins: None,
+            exempt_error: String::new(),
             verdict_key: None,
             verdict_stale: false,
             pushed_at: 0,
@@ -806,6 +825,8 @@ impl Poller {
     /// there was no client, so the next answer is taken from 0.
     pub fn client_replaced(&mut self) {
         self.pushed_logins = None;
+        self.exempt_pushed_logins = None;
+        self.exempt_absent_logins = None;
         self.alerts_logins = None;
         self.cursor = 0;
         self.alerts.clear();
@@ -837,6 +858,8 @@ impl Poller {
         self.rev = 0;
         self.suppressed = 0;
         self.push_error.clear();
+        self.exempt_error.clear();
+        self.exempt_absent_logins = None;
         self.status = "absent";
         self.polled_at = now;
     }
@@ -844,7 +867,8 @@ impl Poller {
     /// One watchdog cycle on `api`; see the plan's "One watchdog cycle".
     ///
     /// 1. When absent, nothing is asked unless a new login session began.
-    /// 2. Push what is due (acknowledged keys, then the known list).
+    /// 2. Push what is due (acknowledged keys, then the known list, then the
+    ///    exempt list, whose trouble never fails the cycle).
     /// 3. Fetch the alerts changed since the cursor. If the Pi may have
     ///    restarted (a new login session since the last page, a `rev` below
     ///    the cursor, or an `id` the map holds under another key) the cursor,
@@ -947,6 +971,7 @@ impl Poller {
                     self.inventory = Some(inv);
                     if waiting && !Store::load(store_path).known_macs().is_empty() {
                         self.push_due = true;
+                        self.exempt_due = true;
                         // Failures are in `push_error`; an absence is below.
                         let _ = self.push(api, store_path, now);
                     }
@@ -1002,8 +1027,11 @@ impl Poller {
         self.cursor = 0;
         self.alerts.clear();
         self.inventory = None;
+        // It may be newer software now: ask again for the exempt list.
+        self.exempt_absent_logins = None;
         if force_push {
             self.push_due = true;
+            self.exempt_due = true;
         }
     }
 
@@ -1036,9 +1064,24 @@ impl Poller {
     ) -> Result<Qbp<()>, ApiError> {
         let store = Store::load(store_path);
         let due = self.pushed_logins != Some(api.logins()) || self.push_due || store.push_due();
-        if !due {
-            return Ok(Qbp::Present(()));
+        if due && self.push_lists(api, store_path, &store, now)? == Qbp::Absent {
+            return Ok(Qbp::Absent);
         }
+        // After the other lists, and whatever happens to it, no failure of
+        // the cycle: see `push_exempt`.
+        self.push_exempt(api, store_path, &store, now);
+        Ok(Qbp::Present(()))
+    }
+
+    /// The acknowledged keys and the known list, which are due: `store` is
+    /// what was read at the start of the push.
+    fn push_lists(
+        &mut self,
+        api: &mut Pihole,
+        store_path: &Path,
+        store: &Store,
+        now: u64,
+    ) -> Result<Qbp<()>, ApiError> {
         let mut sent = false;
         let keys = store.acked_keys();
         if !keys.is_empty() {
@@ -1075,6 +1118,60 @@ impl Poller {
         Ok(Qbp::Present(()))
     }
 
+    /// The exempt list, when it is due: in a new login session (with the
+    /// known list's), after a restart or a `waiting` Pi (the same flags that
+    /// make the lists due), after an edit of it, and after a failed attempt.
+    /// It never fails the push and never stops the cycle: whatever it
+    /// runs into is kept in `exempt_error` and the list stays due (on the same
+    /// schedule as a failed known list), and a 404 (a Pi without exempt
+    /// support) is a verdict for the session, not an error. (A real Pi-hole
+    /// has answered 404 to the lists above, as a rule, and to the alerts at
+    /// the latest.) As for the known list, an empty list is sent only when an
+    /// edit emptied it.
+    fn push_exempt(&mut self, api: &mut Pihole, store_path: &Path, store: &Store, now: u64) {
+        if self.exempt_absent_logins == Some(api.logins()) {
+            return;
+        }
+        let due = self.exempt_pushed_logins != Some(api.logins())
+            || self.exempt_due
+            || store.exempt_push_due();
+        if !due {
+            return;
+        }
+        let macs = store.exempt_macs();
+        let send = !macs.is_empty() || store.exempt_push_due();
+        if send {
+            match put_exempt(api, &macs) {
+                Ok(Qbp::Present(_)) => {}
+                Ok(Qbp::Absent) => {
+                    self.exempt_absent_logins = Some(api.logins());
+                    self.exempt_pushed_logins = Some(api.logins());
+                    self.exempt_due = false;
+                    self.exempt_error.clear();
+                    return;
+                }
+                Err(e) => {
+                    self.exempt_error = e.message().to_string();
+                    self.exempt_due = true;
+                    return;
+                }
+            }
+        }
+        // Read after the call: a re-login during the push is this session.
+        self.exempt_pushed_logins = Some(api.logins());
+        self.exempt_due = false;
+        self.exempt_error.clear();
+        if send {
+            self.pushed_at = now;
+            // `store` was read before the push: an edit made while it was on
+            // the wire stays due.
+            let generation = store.exempt_gen;
+            if let Err(e) = wdstore::update(store_path, |s| s.mark_exempt_pushed(generation)) {
+                self.exempt_error = format!("the push could not be recorded: {e}");
+            }
+        }
+    }
+
     /// Merge a page into the alert map: by id, the lowest `rev` dropped
     /// beyond [`MAX_ALERTS`].
     fn merge(&mut self, alerts: Vec<Alert>) {
@@ -1086,6 +1183,16 @@ impl Poller {
                 break;
             };
             self.alerts.remove(&lowest);
+        }
+    }
+
+    /// Why the last push failed: the known list's or acks' reason, else the
+    /// exempt list's (marked as such), "" when none did.
+    fn push_error(&self) -> String {
+        if !self.push_error.is_empty() || self.exempt_error.is_empty() {
+            self.push_error.clone()
+        } else {
+            format!("exempt list: {}", self.exempt_error)
         }
     }
 
@@ -1116,7 +1223,7 @@ impl Poller {
             devices,
             known_count: store.known.len() as u64,
             pushed_at: self.pushed_at,
-            push_error: self.push_error.clone(),
+            push_error: self.push_error(),
             polled_at: self.polled_at,
         }
     }
@@ -2867,6 +2974,374 @@ mod tests {
         drop(held);
         rig.cycle(T0 + 1);
         assert_eq!(rig.store().absent_for, None, "cleared by the next cycle");
+    }
+
+    // -- the exempt list -------------------------------------------------------
+
+    impl Rig {
+        fn exempt_puts(&self) -> Vec<Value> {
+            self.pi.with(|s| s.exempt_puts.clone())
+        }
+        /// A known list of `known` MACs of which the first `exempt` are
+        /// also exempt, as the CLI would have left them.
+        fn prepare_exempt(&self, known: usize, exempt: usize) {
+            self.edit(|s| {
+                for i in 1..=known {
+                    s.know(&fakeqbp::mac(i), None, T0);
+                }
+                for i in 1..=exempt {
+                    s.add_exempt(&fakeqbp::mac(i), None, T0);
+                }
+            });
+        }
+        fn exempt_body(n: usize) -> Value {
+            json!({ "exempt": (1..=n).map(fakeqbp::mac).collect::<Vec<_>>() })
+        }
+    }
+
+    #[test]
+    fn the_first_cycle_pushes_the_exempt_list_right_after_the_known_list() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 3);
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.known_puts().len(), 1);
+        assert_eq!(rig.exempt_puts(), vec![Rig::exempt_body(3)]);
+        assert_eq!(
+            rig.pi.with(|s| s.exempt.clone()),
+            (1..=3).map(fakeqbp::mac).collect::<Vec<_>>()
+        );
+        let known = first_at(&rig.pi, "PUT /api/qbp/devices/known");
+        let exempt = first_at(&rig.pi, "PUT /api/qbp/devices/exempt");
+        let alerts = first_at(&rig.pi, "GET /api/qbp/alerts");
+        assert!(known < exempt && exempt < alerts);
+        let store = rig.store();
+        assert!(!store.push_due() && !store.exempt_push_due());
+        let r = rig.report();
+        assert_eq!(
+            (r.status, r.pushed_at, r.push_error.as_str()),
+            ("ok", T0 + 1, "")
+        );
+        // Nothing is due any more.
+        rig.cycle(T0 + 2);
+        rig.cycle_with_devices(T0 + 3);
+        assert_eq!(rig.exempt_puts().len(), 1);
+        assert_eq!(rig.known_puts().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_exempt_list_is_pushed_only_when_an_edit_emptied_it() {
+        let mut rig = Rig::new();
+        rig.prepare(3);
+        // A known list and no exempt list: no exempt request, not at a
+        // first cycle, a new client, a new session or a waiting Pi.
+        rig.cycle(T0);
+        rig.poller.client_replaced();
+        rig.cycle(T0 + 1);
+        rig.pi.invalidate();
+        rig.cycle(T0 + 2);
+        rig.pi.set_known_list("waiting");
+        rig.cycle_with_devices(T0 + 3);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/known"), 4);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 0);
+
+        // An edit that emptied the list is a change the Pi has to hear.
+        rig.edit(|s| {
+            s.add_exempt(&fakeqbp::mac(1), None, T0);
+            s.remove_exempt(&fakeqbp::mac(1));
+        });
+        assert!(rig.store().exempt_push_due() && rig.store().exempt.is_empty());
+        rig.cycle(T0 + 4);
+        assert_eq!(rig.exempt_puts(), vec![json!({"exempt": []})]);
+        assert!(!rig.store().exempt_push_due());
+        rig.cycle(T0 + 5);
+        assert_eq!(rig.exempt_puts().len(), 1, "and only once");
+    }
+
+    #[test]
+    fn an_exempt_edit_is_pushed_alone_and_a_known_edit_pushes_no_exempt_list() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 2);
+        rig.cycle(T0);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (1, 1));
+
+        rig.edit(|s| s.add_exempt(&fakeqbp::mac(3), Some("TV"), T0));
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.known_puts().len(), 1, "the known list did not change");
+        assert_eq!(
+            rig.exempt_puts(),
+            vec![Rig::exempt_body(2), Rig::exempt_body(3)]
+        );
+        assert!(!rig.store().exempt_push_due());
+
+        rig.edit(|s| s.know(&fakeqbp::mac(9), None, T0));
+        rig.cycle(T0 + 2);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (2, 2));
+
+        // Taking a device off the list is pushed too, the device stays known.
+        rig.edit(|s| s.remove_exempt(&fakeqbp::mac(1)));
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.exempt_puts().len(), 3);
+        assert_eq!(
+            rig.pi.with(|s| s.exempt.clone()),
+            [fakeqbp::mac(2), fakeqbp::mac(3)]
+        );
+        assert!(rig.store().is_known(&fakeqbp::mac(1)));
+    }
+
+    #[test]
+    fn a_new_login_session_and_a_new_client_push_the_exempt_list_again() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 3);
+        rig.cycle(T0);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (1, 1));
+        rig.pi.invalidate();
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.pi.with(|s| s.logins), 2);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (2, 2));
+        assert_eq!(rig.exempt_puts()[1], Rig::exempt_body(3));
+        rig.cycle(T0 + 2);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (2, 2));
+        // A new client has pushed nothing, whatever its login counter says.
+        rig.poller.client_replaced();
+        rig.cycle(T0 + 3);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (3, 3));
+    }
+
+    #[test]
+    fn a_pi_that_rebooted_gets_the_exempt_list_again_next_to_the_known_list() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 3);
+        rig.pi.with(|s| s.exempt_config = vec![fakeqbp::mac(40)]);
+        for i in 1..=3 {
+            rig.pi.raise("dga", "x.example", Some("192.0.2.5"), i);
+        }
+        rig.cycle(T0 + 1);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.since(), vec![0, 3]);
+        assert_eq!(rig.exempt_puts().len(), 1);
+
+        // The restart is seen through the new session.
+        rig.pi.reboot();
+        assert!(rig.pi.with(|s| s.exempt.is_empty()), "memory only");
+        rig.pi.raise("dga", "x.example", Some("192.0.2.5"), 1);
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.since(), vec![0, 3, 3, 0]);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (2, 2));
+        assert_eq!(rig.pi.with(|s| s.exempt.len()), 3);
+        // The Pi's config list is its own and was not sent back to it.
+        assert_eq!(rig.exempt_puts()[1], Rig::exempt_body(3));
+        // One push for the restart, not one per cycle.
+        rig.cycle(T0 + 4);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (2, 2));
+    }
+
+    #[test]
+    fn a_reboot_the_session_survived_still_pushes_the_exempt_list_again() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 3);
+        for i in 1..=3 {
+            rig.pi.raise("dga", "x.example", None, i);
+        }
+        rig.cycle(T0 + 1);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.exempt_puts().len(), 1);
+        // rev goes below the cursor: a restart, and the session is the same.
+        rig.pi.reboot_keeping_session();
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.pi.with(|s| s.logins), 1, "no new session");
+        assert_eq!(rig.since(), vec![0, 3, 3, 0]);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (2, 2));
+        assert_eq!(rig.pi.with(|s| s.exempt.len()), 3);
+    }
+
+    #[test]
+    fn a_waiting_pi_gets_the_exempt_list_too() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 2);
+        rig.cycle(T0);
+        assert_eq!(rig.exempt_puts().len(), 1);
+        // Its memory is gone without a new session; reading the devices
+        // shows it, and both lists follow in that cycle.
+        rig.pi.set_known_list("waiting");
+        rig.pi.with(|s| s.exempt.clear());
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.exempt_puts().len(), 1, "nobody knows yet");
+        rig.cycle_with_devices(T0 + 2);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (2, 2));
+        assert_eq!(rig.pi.with(|s| s.exempt.len()), 2);
+        rig.cycle_with_devices(T0 + 3);
+        assert_eq!((rig.known_puts().len(), rig.exempt_puts().len()), (2, 2));
+    }
+
+    #[test]
+    fn a_failing_exempt_push_stops_neither_the_known_push_nor_the_alerts_and_is_retried() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 2);
+        rig.pi.with(|s| s.fail_exempt = true);
+        rig.pi.raise("beacon", "x.example", None, 1);
+        let out = rig.cycle(T0 + 1);
+        // The known list got through and was recorded; the alert came.
+        assert_eq!(rig.known_puts().len(), 1);
+        assert_eq!(rig.pi.with(|s| s.known.len()), 5);
+        assert!(!rig.store().push_due());
+        assert_eq!(out.notifications.len(), 1);
+        let r = rig.report();
+        assert_eq!((r.status, r.alerts.len()), ("ok", 1));
+        assert!(
+            r.push_error.starts_with("exempt list: ") && r.push_error.contains("500"),
+            "{}",
+            r.push_error
+        );
+        assert_eq!(rig.exempt_puts().len(), 1);
+        assert!(rig.store().exempt_push_due());
+
+        // Retried on the next cycle, as a failed known push would be, and
+        // the known list is not pushed again meanwhile.
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.exempt_puts().len(), 2);
+        assert_eq!(rig.known_puts().len(), 1);
+        rig.pi.with(|s| s.fail_exempt = false);
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.exempt_puts().len(), 3);
+        assert_eq!(rig.pi.with(|s| s.exempt.len()), 2);
+        let r = rig.report();
+        assert_eq!((r.push_error.as_str(), r.pushed_at), ("", T0 + 3));
+        assert!(!rig.store().exempt_push_due());
+        rig.cycle(T0 + 4);
+        assert_eq!(rig.exempt_puts().len(), 3);
+    }
+
+    #[test]
+    fn a_failed_exempt_push_at_a_new_session_is_retried_though_nothing_else_is_due() {
+        let mut rig = Rig::new();
+        rig.prepare_exempt(5, 2);
+        rig.cycle(T0);
+        rig.pi.with(|s| s.fail_exempt = true);
+        rig.pi.invalidate();
+        rig.cycle(T0 + 1);
+        assert_eq!(rig.known_puts().len(), 2, "the known list went out");
+        assert_eq!(rig.exempt_puts().len(), 2);
+        // The store says nothing is due: the poller's own memory does.
+        assert!(!rig.store().exempt_push_due());
+        rig.pi.with(|s| s.fail_exempt = false);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.exempt_puts().len(), 3);
+        assert_eq!(rig.pi.with(|s| s.exempt.len()), 2);
+        assert_eq!(rig.report().push_error, "");
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.exempt_puts().len(), 3);
+    }
+
+    #[test]
+    fn an_older_pi_answers_404_once_and_is_not_asked_every_cycle() {
+        let mut rig = Rig::on(FakePi::without_exempt(200));
+        rig.prepare_exempt(5, 2);
+        rig.pi.raise("beacon", "x.example", None, 1);
+        let out = rig.cycle_with_devices(T0 + 1);
+        // The 404 is not a failure of anything.
+        assert_eq!(rig.poller.presence(), Presence::Present);
+        let r = rig.report();
+        assert_eq!((r.status, r.push_error.as_str()), ("ok", ""));
+        assert_eq!(out.notifications.len(), 1);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 1);
+        assert_eq!(rig.known_puts().len(), 1, "the known list went out");
+        assert!(!rig.store().push_due());
+        assert!(rig.store().exempt_push_due(), "kept: it was never taken");
+
+        // Not again, not at the next cycles, not for a waiting Pi, not for
+        // an edit; the alerts and devices keep coming.
+        let alerts = rig.pi.count("GET /api/qbp/alerts");
+        rig.cycle_with_devices(T0 + 2);
+        rig.edit(|s| s.add_exempt(&fakeqbp::mac(4), None, T0));
+        rig.cycle(T0 + 3);
+        rig.pi.set_known_list("waiting");
+        rig.cycle_with_devices(T0 + 4);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 1);
+        assert_eq!(rig.pi.count("GET /api/qbp/alerts"), alerts + 3);
+        assert_eq!(
+            rig.known_puts().len(),
+            2,
+            "the waiting Pi got its known list"
+        );
+        assert_eq!(rig.report().devices.len(), 3);
+
+        // A new login session gets one more look.
+        rig.pi.invalidate();
+        rig.cycle(T0 + 5);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 2);
+        rig.cycle(T0 + 6);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 2);
+        // So does a new client.
+        rig.poller.client_replaced();
+        rig.cycle(T0 + 7);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 3);
+        rig.cycle(T0 + 8);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 3);
+    }
+
+    #[test]
+    fn a_pi_that_was_upgraded_gets_the_exempt_list_after_it_restarts() {
+        let mut rig = Rig::on(FakePi::without_exempt(200));
+        rig.prepare_exempt(5, 2);
+        for i in 1..=3 {
+            rig.pi.raise("dga", "x.example", None, i);
+        }
+        rig.cycle(T0 + 1);
+        rig.cycle(T0 + 2);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 1);
+        assert!(rig.pi.with(|s| s.exempt.is_empty()));
+
+        // Restarted with newer software; the session survived, rev went back.
+        rig.pi.with(|s| s.exempt_support = true);
+        rig.pi.reboot_keeping_session();
+        rig.cycle(T0 + 3);
+        assert_eq!(rig.pi.with(|s| s.logins), 1);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 2);
+        assert_eq!(rig.pi.with(|s| s.exempt.len()), 2);
+        assert_eq!(rig.report().push_error, "");
+        assert!(!rig.store().exempt_push_due());
+    }
+
+    #[test]
+    fn on_a_real_pihole_the_exempt_list_is_not_even_tried() {
+        let mut rig = Rig::on(FakePi::pihole_only(50));
+        rig.prepare_exempt(3, 2);
+        rig.cycle(T0);
+        assert_eq!(rig.poller.presence(), Presence::Absent);
+        assert_eq!(rig.pi.qbp_requests(), 1, "the known list, answered 404");
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/exempt"), 0);
+        assert!(rig.store().exempt_push_due());
+    }
+
+    #[test]
+    fn exempt_devices_are_marked_on_both_sides_in_the_report() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| s.exempt_config = vec![fakeqbp::mac(3)]);
+        rig.edit(|s| {
+            s.know(&fakeqbp::mac(1), None, T0);
+            s.add_exempt(&fakeqbp::mac(1), Some("TV"), T0);
+        });
+        rig.cycle_with_devices(T0 + 1);
+        let r = rig.report();
+        let by_mac = |n: usize| {
+            r.devices
+                .iter()
+                .find(|d| d.device.mac == fakeqbp::mac(n))
+                .unwrap()
+        };
+        // Mac 1: on this PC's list and so pushed, the Pi says so too.
+        assert_eq!((by_mac(1).exempt, by_mac(1).device.exempt), (true, true));
+        // Mac 3: only in the Pi's config file.
+        assert_eq!((by_mac(3).exempt, by_mac(3).device.exempt), (false, true));
+        // Mac 2: neither.
+        assert_eq!((by_mac(2).exempt, by_mac(2).device.exempt), (false, false));
+        // An older Pi says nothing: its devices are not exempt on the Pi.
+        let mut old = Rig::on(FakePi::without_exempt(200));
+        old.edit(|s| s.add_exempt(&fakeqbp::mac(1), None, T0));
+        old.cycle_with_devices(T0 + 1);
+        let r = old.report();
+        assert!(r.devices.iter().all(|d| !d.device.exempt));
+        assert_eq!(r.devices.iter().filter(|d| d.exempt).count(), 1);
     }
 
     // -- notifications ---------------------------------------------------------

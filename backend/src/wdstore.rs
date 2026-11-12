@@ -315,8 +315,6 @@ impl Store {
     }
 
     /// Whether the exempt list changed since it was last pushed to the Pi.
-    // Read by the tests only until the watcher pushes the exempt list too.
-    #[allow(dead_code)]
     pub fn exempt_push_due(&self) -> bool {
         self.exempt_gen != self.pushed_exempt_gen
     }

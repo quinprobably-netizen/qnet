@@ -23,7 +23,8 @@ wiped the Pi-hole pin from every profile.
    - Safe automatic failover, and recovery.
    - Watchdog: when the Pi-hole is a qberrypi, qnet also fronts its watchdog
      (alerts, devices, desktop notifications, and the acknowledged and known
-     lists kept on this PC). Against a real Pi-hole nothing changes.
+     lists kept on this PC, and the exempt list). Against a real Pi-hole
+     nothing changes.
 3. **Passive Wi-Fi.** NetworkManager over D-Bus, event-driven, using NM's
    cached access-point list. Scan only on an explicit request (`qnet wifi
    scan`, at most once per 15 s); opening the panel never scans. The AX210 is
@@ -165,7 +166,7 @@ wiped the Pi-hole pin from every profile.
 | Pi-hole stats | HTTPS API on 443 with the **pinned cert SHA-256**: `/api/stats/summary`, `/api/dns/blocking` | only while open, every 10 s; `/api/history` and `/api/stats/upstreams` every 60 s and on open |
 | Watchdog alerts (qberrypi only) | `GET /api/qbp/alerts?since=<rev>` on the same pinned HTTPS session | open: after every good stats poll (10 s). Closed: 30 s after start, then every 60 s, while the watchdog is present; while the Pi-hole has not answered yet, a failing poll waits 60 s, 120 s, … up to 30 min. Never again once it is absent, until a new login session or a new config, and not at all while closed once the store says this Pi-hole is absent (`absentFor`) |
 | Watchdog devices (qberrypi only) | `GET /api/qbp/devices` | open only: on open, then every 60 s. Never while closed |
-| Watchdog pushes | `PUT /api/qbp/alerts/acked` and `PUT /api/qbp/devices/known` | only when due (see "Watchdog (qberrypi)"): the first cycle of a session, a new login (in the same cycle), a Pi restart, a Pi that is `waiting` for its list, an edit of the known list. Each body is at most 4000 bytes (the Pi's cap is 4096), so the known list goes in chunks. An empty known list is pushed only when an edit emptied it |
+| Watchdog pushes | `PUT /api/qbp/alerts/acked`, `PUT /api/qbp/devices/known` and `PUT /api/qbp/devices/exempt` | only when due (see "Watchdog (qberrypi)"): the first cycle of a session, a new login (in the same cycle), a Pi restart, a Pi that is `waiting` for its list, an edit of the known list (of the exempt list for its own call). Each body is at most 4000 bytes (the Pi's cap is 4096), so the known list goes in chunks; the exempt list is one body of at most 64 addresses. An empty known or exempt list is pushed only when an edit emptied it |
 
 ### Pi-hole API sessions
 
@@ -529,10 +530,11 @@ as the Pi-hole API. It raises alerts (a new device, ARP spoofing, DGA lookups,
 DNS tunnels, beaconing, bursts, blocked threats, DNS rebinding) and keeps an
 inventory of the devices it has heard. qnet reads both over the pinned HTTPS
 API, puts them in the `watchdog` object of the state JSON and raises desktop
-notifications for new alerts. It keeps two lists on this PC and pushes them
-back to the Pi, so they survive its reboots: the acknowledged alerts and the
-known devices. A real Pi-hole answers 404 on all of it, and then qnet behaves
-exactly as it did before. There is no panel for it yet.
+notifications for new alerts. It keeps three lists on this PC and pushes them
+back to the Pi, so they survive its reboots: the acknowledged alerts, the
+known devices and the exempt devices (the ones that skip ad blocking; threat
+blocking stays). A real Pi-hole answers 404 on all of it, and then qnet
+behaves exactly as it did before. There is no panel for it yet.
 
 Every call is under `/api/qbp/`, on the same session as the stats:
 
@@ -541,8 +543,9 @@ Every call is under `/api/qbp/`, on the same session as the stats:
 | `GET alerts?since=R` | `{rev, suppressed, alerts:[…]}`: the alerts that changed after revision `R`, oldest change first. The query is always sent (0 at the start). |
 | `POST alerts/{id}/ack` | Acknowledges one alert; 404 for an unknown id. |
 | `PUT alerts/acked` | `{"acked":[<key>…]}`. Additive; the Pi keeps at most 1024. |
-| `GET devices` | `{known_list, devices:[{mac, ipv4[], hostname, first_unix, last_unix, known}]}`. |
+| `GET devices` | `{known_list, devices:[{mac, ipv4[], hostname, first_unix, last_unix, known, exempt?}], exempt_macs?}`. `exempt` and `exempt_macs` (the Pi's effective exempt list: its config file's plus the pushed one, lower-case colon form) are absent on an older Pi: they read as `false` and an empty list. |
 | `PUT devices/known` | `{"known":[<mac>…],"append":bool,"complete":bool}`. A list takes effect on the `complete` body; the Pi keeps at most 1024. |
+| `PUT devices/exempt` | `{"exempt":[<mac>…]}`: replaces the Pi's pushed list, `[]` clears it, at most 64 addresses in one body (no chunking). Answers `{"exempt":n}`; 400 means the body was refused. The Pi holds the list in memory only. A 404 means this Pi has no exempt support (see below). |
 
 Answers are parsed leniently. An alert without a usable `id`, `key` or `kind`
 and a device without a valid MAC are dropped; other fields fall back to
@@ -581,7 +584,8 @@ answer that does not parse is an error, never "absent".
     drops the client and waits 60 s, like one of the stats.
 - **The cycle** (the API thread; open after every good stats poll, closed on its
   own, where it asks for alerts only):
-  1. Push what is due (below): the acknowledged keys first, then the known list.
+  1. Push what is due (below): the acknowledged keys first, then the known
+     list, then the exempt list.
   2. `GET alerts?since=<cursor>`. The Pi may have restarted, and then the
      cursor and the alerts held cannot be trusted, so the cursor, the alerts
      and the device list are reset, the lists are pushed and the alerts are
@@ -607,8 +611,8 @@ answer that does not parse is an error, never "absent".
      lowest `rev` goes first).
   5. Fold and show the notifications (below).
   6. Open and devices due: `GET devices`. A `waiting` Pi with a non-empty PC
-     list is pushed at once. A failing devices read or push does not fail the
-     cycle.
+     list is pushed at once (the exempt list with it). A failing devices read
+     or push does not fail the cycle.
   7. Send the report to the main thread. The status is `ok` and `polledAt` is
      now.
 
@@ -637,6 +641,27 @@ answer that does not parse is an error, never "absent".
   - A failed push stays due and its message is `watchdog.pushError`. A
     successful one records `pushedKnownGen` as the generation read before the
     push, so an edit made while it was on the wire stays due.
+  - **The exempt list** is pushed wherever the known list is pushed again (the
+    first cycle of a client, a new login session, a restart, a `waiting` Pi),
+    and after an edit of its own (`exemptGen` differs from `pushedExemptGen`),
+    right after the known list: `PUT devices/exempt` with the whole list in one
+    body of at most 64 addresses (none is sent for an empty list that nobody
+    edited, and it is never sent to a Pi-hole that has no watchdog, whose
+    lists answer 404 first). Its push is kept apart from the known list's:
+    - a failure of it (any status but 404, or no answer) never stops or
+      delays the known list's push or the alerts; the list stays due, is tried
+      again on the next cycle as a failed known push would be, and its message
+      shows in `watchdog.pushError` as `exempt list: <why>` unless the known
+      list's own failure is there;
+    - a 404 means this Pi has no exempt support (an older qberrypi): it is not
+      an error and not an absence of the watchdog. The answer stands for the
+      login session: the list is not sent again while the session lasts (the
+      store keeps it due), and a new session, a restart that resets the
+      cursor, or a new client gives it one more look, so a Pi that was
+      upgraded gets the list. Nothing of this is kept in the store (a closed
+      qnet whose Pi has a watchdog polls alerts either way);
+    - success records `pushedExemptGen` as the generation read before the
+      push.
 - **Notifications:**
   - An alert is new when it is not acknowledged and its key is not in
     `notified`, or its `first_unix` is later than the one recorded there (a
@@ -685,6 +710,11 @@ answer that does not parse is an error, never "absent".
   - `knownGen` goes up on every edit of the list, `pushedKnownGen` is set to
     the generation that was pushed by whoever pushes it successfully, the
     watcher or a verb. `push due` means they differ.
+  - `exempt`: at most 64 entries of the same shape as `known`, edited by
+    `watchdog exempt|unexempt` (a new device is refused when the list is full,
+    `full`). `exemptGen` and `pushedExemptGen` work as the known list's pair.
+    `exempt` puts the device on `known` as well; `unexempt` leaves it
+    known, and `forget` leaves it on the exempt list.
   - `notified`: at most 1024 `{key, firstUnix, at}`; when full the oldest `at`
     goes first.
 
