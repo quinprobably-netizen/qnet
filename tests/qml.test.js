@@ -263,8 +263,7 @@ test("the watchdog view is the third pushed view: Panel opens it (key 3, IPC, th
   // the tab's own state, reset when it is left or the panel closes
   for (const p of ["wdOrder", "wdScroll", "wdTicket", "wdFlip", "wdPinOpen", "wdNote"]) assert.match(panel, new RegExp("property \\w+ " + p + ":"), p)
   assert.match(panel, /function closeTransients\(\) \{[\s\S]*?wdReset\(\)/)
-  assert.match(panel, /Model\.holdOrder\(\[\], view\.watchdog\.bay\.jacks\)/, "the order is set on entering")
-  assert.match(panel, /Model\.holdOrder\(wdOrder, rawState\.watchdog\.bay\.jacks\)/, "and held as jacks come and go")
+  assert.match(panel, /Model\.holdOrder\(wdOrder, rawState\.watchdog\.bay\.jacks\)/, "the order is held as jacks come and go")
   assert.match(panel, /Model\.needsClock\(root\.view, root\.pending, root\.nowMs \/ 1000, \{ view: root\.page \}\)/, "gates count down")
   assert.match(panel, /Model\.focusRows\(view, page === "watchdog" \? wdRowsCtx/)
   assert.match(panel, /else if \(page === "watchdog"\) wdActivate\(id, item\)/)
@@ -393,7 +392,7 @@ test("a ticket's buttons are dead while an action runs, and one action runs at a
   assert.match(dev, /enabled: tk\.idle/, "the cords")
   const panel = read("Panel.qml")
   assert.match(panel, /readonly property bool wdBusy: wdRunning > 0 \|\| wdSettling/)
-  assert.match(panel, /if \(wdRunning > 0 \|\| \(wdSettling && o\.chain !== true\)\) return false/)
+  assert.match(panel, /if \(wdRunning === 0 && \(!wdSettling \|\| o\.chain === true\)\) return wdStart\(verb, args, done, o\)/, "one runs at a time; the others wait their turn (tests/wdaction.test.js)")
   assert.match(panel, /QnetService\.send\("devices"\)/)
   // every call goes through argvWatchdog, so nothing is built by hand
   const wd = panel.slice(panel.indexOf("function wdDismissAll()"), panel.indexOf("// -- Wi-Fi"))
@@ -428,6 +427,31 @@ test("a text field of the tab owns the keys while it has the focus, and gives th
   assert.match(dev, /function onWdCommitRequested\(\) \{ if \(field\.activeFocus\) field\.commit\(\) \}/, "and a ticket that is closing")
   assert.match(panel, /function wdSetTicket\(ticket\) \{\s*wdCommitRequested\(\)/)
   assert.equal((panel.match(/\bwdTicket = /g) || []).length, 2, "a ticket opens and closes through wdSetTicket (wdReset and wdSetTicket alone assign it)")
+})
+
+test("the label field: an untouched or cancelled field is no edit, a label is never shown saved when it was not sent", () => {
+  const dev = read("components/DeviceTicket.qml")
+  // sync() records what the field holds (maximumLength may have cut a longer name), not the name
+  assert.match(dev, /function sync\(\) \{\s*text = tk\.name\s*\n\s*sent = text\s*\n\s*\}/)
+  assert.doesNotMatch(dev, /sent = tk\.name/)
+  // no edit when the text is what was sent; Esc puts that back and lets go
+  assert.match(dev, /function commit\(\) \{\s*if \(text === sent\) return/)
+  assert.match(dev, /Keys\.onEscapePressed: \{\s*text = sent\s*\n\s*focus = false\s*\}/)
+  // the label is sent or waits (wdLabel true); refused, the field shows the name again
+  assert.match(dev, /if \(tk\.hub\.wdLabel\(tk\.mac, text\)\) sent = e\.text\s*\n\s*else sync\(\)/)
+  // a failure reaches the field through a signal, not a closure that outlives the ticket
+  assert.doesNotMatch(dev, /wdLabel\([^)]*function/)
+  assert.match(dev, /function onWdLabelFailed\(mac\) \{ if \(mac === tk\.mac\) field\.sync\(\) \}/)
+  const panel = read("Panel.qml")
+  assert.match(panel, /signal wdLabelFailed\(string mac\)/)
+  // leaving the tab or closing the panel asks the field to commit before the visit's state goes
+  assert.match(panel, /function wdReset\(\) \{\s*wdCommitRequested\(\)/)
+})
+
+test("a word is said by Model.sayWord: no String.replace with a name as its replacement", () => {
+  const panel = read("Panel.qml")
+  assert.match(panel, /function say\(w\) \{ return Model\.sayWord\(w, function\(key\) \{ return strings\.t\(key\) \}\) \}/)
+  assert.doesNotMatch(panel, /\.replace\("%"/)
 })
 
 test("the PIN is read, the field cleared in the same breath, and it goes to `pin set` on stdin and nowhere else", () => {

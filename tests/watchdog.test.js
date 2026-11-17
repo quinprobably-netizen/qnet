@@ -393,6 +393,44 @@ test("holdOrder: the jacks' order at first; then the held ones that still exist,
   assert.deepEqual(prev, [mac(1), mac(2)], "the held order is not changed in place")
 })
 
+test("holdOrder: a jack that arrives goes in front of the offline ones, which stay last", () => {
+  const jacks = wd("n30").bay.jacks
+  const first = Model.holdOrder([], jacks)
+  const offline = jacks.filter((j) => j.offline).map((j) => j.mac)
+  assert.equal(offline.length, 2)
+  assert.deepEqual(first.slice(-2), offline, "the jacks come with the offline ones last")
+  // one arrives (the list puts it where its rank says, here first): it sits after the 28 online jacks
+  const a = { mac: mac(98), offline: false }
+  const one = Model.holdOrder(first, [a].concat(jacks))
+  assert.equal(one.length, 31)
+  assert.deepEqual(one.slice(0, 28), first.slice(0, 28), "the held ones keep their places")
+  assert.equal(one[28], mac(98))
+  assert.deepEqual(one.slice(-2), offline)
+  // several arrive: in the order the list brings them, still in front of the offline ones
+  const b = { mac: mac(97), offline: false }
+  const two = Model.holdOrder(first, jacks.concat([a, b]))
+  assert.deepEqual(two.slice(28), [mac(98), mac(97)].concat(offline))
+  // one that arrives offline goes last of all
+  const c = { mac: mac(96), offline: true }
+  assert.deepEqual(Model.holdOrder(first, jacks.concat([c])), first.concat([mac(96)]))
+  // an offline jack that comes online keeps its place; a newcomer goes in front of the one still offline
+  const back = jacks.map((j) => (j.mac === offline[0] ? Object.assign({}, j, { offline: false }) : j))
+  const up = Model.holdOrder(first, back.concat([a]))
+  assert.deepEqual(up, first.slice(0, 29).concat([mac(98)], first.slice(29)))
+  // a jack that turns offline stays where it is; a newcomer is put after the last online jack
+  const off = jacks.map((j) => (j.tail === "·70" ? Object.assign({}, j, { offline: true }) : j))
+  const turned = Model.holdOrder(first, off.concat([a]))
+  assert.equal(turned.indexOf(mac(98)), 28, "after the last held online jack (·101), in front of the offline run")
+  assert.equal(turned.indexOf(jacks.find((j) => j.tail === "·70").mac), first.indexOf(jacks.find((j) => j.tail === "·70").mac))
+  // nothing is offline: the new one goes last; only offline ones held: the new one goes first
+  const rest = wd("rest").bay.jacks
+  assert.deepEqual(Model.holdOrder(Model.holdOrder([], rest), rest.concat([a])), Model.holdOrder([], rest).concat([mac(98)]))
+  const only = [{ mac: mac(1), offline: true }, { mac: mac(2), offline: true }]
+  assert.deepEqual(Model.holdOrder([mac(1), mac(2)], only.concat([a])), [mac(98), mac(1), mac(2)])
+  // the very first order is the jacks' own, whatever their flags
+  assert.deepEqual(Model.holdOrder([], [{ mac: mac(1), offline: true }, a]), [mac(1), mac(98)])
+})
+
 // ---- the bays --------------------------------------------------------------
 
 test("bayLayout, 8 devices: one bay, everything shown, no pager", () => {
@@ -1121,4 +1159,70 @@ test("literal words carry their text; the model says no word it has not got in t
       for (const w of words) if (w && w.key !== "") assert.ok(w.key in cat, n + ": " + w.key)
     }
   }
+})
+
+// ---- a word, said ----------------------------------------------------------
+
+test("sayWord fills %1, %2 from the arguments as they are: $&, $1 and %2 in a name stay a name", () => {
+  const t = (k) => ({ a: "Flip %1 of %2", b: "%1 and again %1", c: "Left %3 %1", d: "No placeholders", e: "50% of %1" })[k]
+  assert.equal(Model.sayWord({ key: "a", args: ["x", 7] }, t), "Flip x of 7")
+  // replace() with a string would read these; none of them is a placeholder here
+  for (const name of ["$&", "$'", "$`", "$1", "a$$b", "$<n>"]) assert.equal(Model.sayWord({ key: "a", args: [name, "z"] }, t), "Flip " + name + " of z", name)
+  // one pass: an argument that looks like the next placeholder is not filled again
+  assert.equal(Model.sayWord({ key: "a", args: ["%2", "z"] }, t), "Flip %2 of z")
+  assert.equal(Model.sayWord({ key: "a", args: ["%2 $& %1", "z"] }, t), "Flip %2 $& %1 of z")
+  assert.equal(Model.sayWord({ key: "b", args: ["q"] }, t), "q and again q")
+  assert.equal(Model.sayWord({ key: "c", args: ["1"] }, t), "Left %3 1", "a placeholder with no argument stays")
+  assert.equal(Model.sayWord({ key: "d", args: ["unused"] }, t), "No placeholders")
+  assert.equal(Model.sayWord({ key: "e", args: ["x"] }, t), "50% of x", "a percent sign that is no placeholder is left")
+  assert.equal(Model.sayWord({ key: "a" }, t), "Flip %1 of %2", "no arguments")
+  // a literal word is its text, whatever it holds
+  assert.equal(Model.sayWord(Model.lit("Sam's $& phone"), t), "Sam's $& phone")
+  assert.equal(Model.sayWord({ key: "" }, t), "")
+})
+
+// ---- the tab's actions wait their turn -------------------------------------
+
+test("queueAction: first in first out, one press once, the last label wins, a PIN never waits, a full queue refuses", () => {
+  const A = mac(1), B = mac(2)
+  const entry = (verb, args, opts) => ({ verb, args, opts: opts || {} })
+  const keys = (q) => q.map((e) => e.verb + ":" + e.args.join(","))
+  let r = Model.queueAction([], entry("patch", [A, "pass"]), "")
+  assert.equal(r.took, true)
+  r = Model.queueAction(r.queue, entry("gate", [A, 300]), "")
+  r = Model.queueAction(r.queue, entry("label", [A, "Sam"]), "")
+  assert.deepEqual(keys(r.queue), ["patch:" + A + ",pass", "gate:" + A + ",300", "label:" + A + ",Sam"], "in the order they came")
+  // the same press again is one (the last one waiting, or the running one when nothing waits)
+  const same = Model.queueAction(r.queue, entry("label", [A, "Sam"]), "")
+  assert.equal(same.took, true)
+  assert.equal(same.queue.length, 3)
+  const run = Model.actionKey("forget", [B])
+  assert.equal(Model.queueAction([], entry("forget", [B]), run).took, true)
+  assert.deepEqual(Model.queueAction([], entry("forget", [B]), run).queue, [], "already being served")
+  assert.equal(Model.queueAction([], entry("forget", [B]), "").queue.length, 1)
+  // ... but not when something else waits behind it: pass, blocked, pass is three presses and the last one counts
+  const flip = Model.queueAction(Model.queueAction([], entry("patch", [A, "blocked"]), Model.actionKey("patch", [A, "pass"])).queue, entry("patch", [A, "pass"]), Model.actionKey("patch", [A, "pass"]))
+  assert.deepEqual(keys(flip.queue), ["patch:" + A + ",blocked", "patch:" + A + ",pass"])
+  // a label for the device that has one waiting replaces its text, in its place
+  const edited = Model.queueAction(r.queue, entry("label", [A, "Sam's phone"]), "")
+  assert.deepEqual(keys(edited.queue), ["patch:" + A + ",pass", "gate:" + A + ",300", "label:" + A + ",Sam's phone"])
+  const other = Model.queueAction(r.queue, entry("label", [B, "Kit"]), "")
+  assert.equal(other.queue.length, 4, "another device's label is its own entry")
+  assert.equal(Model.queueAction(r.queue, entry("label", [A, ""]), "").queue.length, 3, "clearing a label is an edit as well")
+  // the queue passed in is never changed
+  assert.deepEqual(keys(r.queue), ["patch:" + A + ",pass", "gate:" + A + ",300", "label:" + A + ",Sam"])
+  // a PIN waits nowhere
+  const pin = Model.queueAction([], entry("pin", ["set"], { secret: "1234", silent: true }), "")
+  assert.deepEqual({ took: pin.took, n: pin.queue.length }, { took: false, n: 0 })
+  assert.equal(Model.queueAction([], entry("pin", ["clear"]), "").took, true, "clearing the PIN carries no secret")
+  // full: WD_QUEUE_MAX waiting, the next one is refused; a repeat or a label edit still fits
+  let q = []
+  for (let i = 0; i < Model.WD_QUEUE_MAX; i++) q = Model.queueAction(q, entry("gate", [mac(i + 10), 300]), "").queue
+  assert.equal(q.length, Model.WD_QUEUE_MAX)
+  assert.equal(Model.queueAction(q, entry("gate", [mac(99), 300]), "").took, false)
+  assert.equal(Model.queueAction(q, entry("gate", [mac(Model.WD_QUEUE_MAX + 9), 300]), "").took, true, "the last one pressed again is the same press")
+  // junk is refused
+  assert.equal(Model.queueAction(undefined, null, "").took, false)
+  assert.equal(Model.queueAction("x", { args: [] }, "").took, false)
+  assert.deepEqual(Model.queueAction(undefined, entry("ack", [3]), "").queue.length, 1)
 })

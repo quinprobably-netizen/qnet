@@ -1,9 +1,9 @@
 # qnet: the watchdog tab as a patch bay (plan)
 
-Date: 2026-11-17. Branch `watchdog-bay`, worktree `~/Work/qnet-bay`.
-Binding reference: the approved mockup `~/Work/qnet-mockups/watchdog-r2/`
-(`index.html`, `README.md`, stills `w2-B-*@2x.png`). Its build sheet says what
-each mark reads; its sizes are at `Style.space(1)` = 1 px.
+Date: 2026-11-17. Branch `watchdog-bay`, built in its own git worktree.
+Binding reference: the approved mockup (watchdog round 2: its `index.html`,
+its build sheet and its 2x stills). The build sheet says what each mark reads;
+its sizes are at `Style.space(1)` = 1 px.
 
 Owner decisions (approved, "build it"):
 - The jack's word says **PASS**; the rail, the readout and the tickets say **ADS PASS**.
@@ -15,7 +15,9 @@ Owner decisions (approved, "build it"):
 - **The tab is reached from the qbp node on the Route**, which carries the count
   of calls waiting. The DNS view moves to the **upstream node**.
 - Order: alerting and new first, then labelled, then by address; held while the
-  panel is open. Offline known devices dimmed at the end. Gates 5/30/60 min.
+  panel is open (set when it opens, kept across the views, dropped when it
+  closes; a device that turns up goes in front of the offline ones). Offline
+  known devices dimmed at the end. Gates 5/30/60 min.
   Dismiss and Dismiss all (both clear the Pi's screen). FIXED riveted. PIN in the
   footer (`pin set` semantics: the PIN goes on stdin, never on a command line).
 
@@ -26,14 +28,14 @@ repo: 192.0.2.x, 02:00:00:… MACs, example names only. Never read
 `~/.config/qnet/`, the keyring, `~/.local/state/qnet/`; never contact the Pi or
 the network; never write into `~/.config/omarchy/plugins/qqq.qnet`; never run
 `install.sh` or restart the shell; no synthetic input. No new dependencies.
-`export CARGO_TARGET_DIR=/home/qqq/Work/qnet-bay/backend/target`, run cargo from
+`export CARGO_TARGET_DIR=<this worktree>/backend/target`, run cargo from
 `backend/`.
 
 Gates before each commit: from `backend/` `cargo test`, `cargo clippy
 --all-targets` (0 warnings), `cargo fmt --check`; from the root `node --test
 tests/`; for QML tasks, offscreen shots (`tools/shot`).
 
-## What the Pi can and cannot do (checked in ~/Work/qberrypi)
+## What the Pi can and cannot do (checked in the qberrypi source)
 
 - `PUT /api/qbp/devices/gate` `{"mac","secs"}` → `{"gate_left_secs","rev"}`
   (secs 0 shuts it). Gates live in the Pi's memory only.
@@ -140,7 +142,8 @@ Files: `Model.js`, new `tests/watchdog.test.js`, `tests/route.test.js`,
 - `navOpen` accepts `"watchdog"`; `escapeStep` gains `pin`, `flip` (the
   confirm), `ticket` before `back`.
 - `holdOrder(prev, jacks)`: prev empty → the jacks' order; else keep prev's
-  macs that still exist in prev's order, append new ones at the end.
+  macs that still exist in prev's order, new online ones in front of the
+  offline ones at the end, new offline ones last.
 - `bayLayout(order, ui)`: bays of 8; slots shown = 1 with a ticket open (the
   ticket's bay), else min(2, bays); scroll clamp; pager text parts and the
   ring flags (an alerting jack above or below the shown bays).
@@ -161,7 +164,7 @@ not a door).
 ### T4 Offscreen harness (QML stubs; parallel with T1–T3)
 Files: new `tools/shot`, `tools/harness/Shot.qml`, `tools/harness/imports/…`
 (stubs of `qs.Ui`, `qs.Commons`, `Quickshell`, `Quickshell.Io`), a section in
-`README.md`. Model: `~/Work/soundhub-desk/tools/{shot,harness}`.
+`README.md`. Model: an earlier plugin's harness.
 `tools/shot <fixture> <out.png> [ui.json]` renders the whole `Panel.qml`
 offscreen (`QT_QPA_PLATFORM=offscreen`, software, 1x, `/usr/bin/qml6`), card
 520 px wide (488 content), with the Omarchy Amethyst colours of the mockup

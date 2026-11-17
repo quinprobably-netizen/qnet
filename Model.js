@@ -1926,19 +1926,25 @@ function anyGateOpen(v, nowS) {
   return false
 }
 
-// The order the board keeps while the panel is open: the macs in the order
-// the jacks come in (alerting and new first, then labelled, then by address,
-// offline last) when there is no held order yet; after that the held ones
-// that still exist, in their places, then the new ones at the end. So a jack
-// does not jump when an alert rings or a label changes under the cursor.
+// The order the board keeps while the panel is open (set when it opens, held
+// across the tab and the other views, dropped when it closes): the macs in the
+// order the jacks come in (alerting and new first, then labelled, then by
+// address, offline last) when there is no held order yet; after that the held
+// ones that still exist, in their places, then the new ones: an online jack
+// goes in front of the offline ones at the end (they stay the last), an
+// offline one goes last. So a jack does not jump when an alert rings or a
+// label changes under the cursor, and a device that turns up is not lost
+// behind the dimmed columns.
 function holdOrder(prev, jacks) {
   var list = Array.isArray(jacks) ? jacks : []
   var macs = []
   var live = Object.create(null)
+  var offline = Object.create(null)
   for (var i = 0; i < list.length; i++) {
     var m = list[i] && typeof list[i].mac === "string" ? list[i].mac : ""
     if (m === "" || live[m]) continue
     live[m] = true
+    if (list[i].offline === true) offline[m] = true
     macs.push(m)
   }
   var held = Array.isArray(prev) ? prev : []
@@ -1951,8 +1957,17 @@ function holdOrder(prev, jacks) {
     placed[h] = true
     out.push(h)
   }
-  for (var k = 0; k < macs.length; k++) if (!placed[macs[k]]) out.push(macs[k])
-  return out
+  // where the offline run at the end of the held order begins
+  var at = out.length
+  while (at > 0 && offline[out[at - 1]]) at--
+  var online = []
+  var last = []
+  for (var k = 0; k < macs.length; k++) {
+    if (placed[macs[k]]) continue
+    if (offline[macs[k]]) last.push(macs[k])
+    else online.push(macs[k])
+  }
+  return out.slice(0, at).concat(online, out.slice(at), last)
 }
 
 // The board as bays of eight, and which of them are in view.
@@ -2062,6 +2077,18 @@ function jackReadout(jack, nowS) {
 
 // Text that is shown as it is (a name, an address, a subject): a word with no key.
 function lit(text) { return { key: "", args: [], tone: "", text: String(text === undefined || text === null ? "" : text) } }
+
+// A word (word() or lit()) in the catalog's language: `t(key)` gives the
+// catalog's string and its %1, %2, … are filled with the word's arguments, in
+// one pass and as they are: a device's name with "$&", "$1" or "%2" in it is
+// shown as typed, and an argument is never read as a placeholder itself.
+function sayWord(w, t) {
+  if (w.key === "") return w.text === undefined ? "" : String(w.text)
+  var args = Array.isArray(w.args) ? w.args : []
+  return String(t(w.key)).replace(/%([1-9])/g, function(whole, n) {
+    return n <= args.length ? String(args[n - 1]) : whole
+  })
+}
 
 var CALL_KINDS = { threat: "threat", new_device: "newDevice", arp_spoof: "arpSpoof", rebind: "rebind", dga: "dga", tunnel: "tunnel", beacon: "beacon", burst: "burst" }
 
@@ -2281,6 +2308,44 @@ function gateRow(jack, nowS) {
 function labelEdit(current, typed) {
   var text = clean(typed, 1000).trim().substring(0, LABEL_MAX).trim()
   return { changed: text !== String(current === undefined || current === null ? "" : current), text: text }
+}
+
+// The watchdog tab's actions run one at a time; one that comes while another
+// runs (or has just succeeded, until the board shows it) waits its turn here.
+var WD_QUEUE_MAX = 8           // actions waiting; one more is refused as busy
+
+// Names an action for the queue: its verb and its arguments.
+function actionKey(verb, args) { return JSON.stringify([String(verb), Array.isArray(args) ? args : []]) }
+
+// Adds `entry` ({ verb, args, opts?, … the panel's own fields }) to the queue
+// of waiting actions, first in first out.
+//   current  the actionKey of the one running or just done ("" for none)
+// -> { queue (a new array), took }: took says the action runs now or later;
+// false says it was refused (the queue is full, or it carries a secret, which
+// never waits in memory), and the caller says "busy".
+// The same press twice in a row is one: an action equal to the last one
+// waiting (or, with nothing waiting, to the one running or just done) is
+// already being served. A label for a device that has one waiting replaces its
+// text in place, so the last edit is the one sent.
+function queueAction(queue, entry, current) {
+  var q = Array.isArray(queue) ? queue.slice() : []
+  if (!entry || typeof entry.verb !== "string") return { queue: q, took: false }
+  if (entry.opts && entry.opts.secret !== undefined) return { queue: q, took: false }
+  var args = Array.isArray(entry.args) ? entry.args : []
+  if (entry.verb === "label") {
+    for (var i = 0; i < q.length; i++) {
+      if (q[i].verb === "label" && q[i].args[0] === args[0]) {
+        q[i] = entry
+        return { queue: q, took: true }
+      }
+    }
+  }
+  var key = actionKey(entry.verb, args)
+  var last = q.length > 0 ? actionKey(q[q.length - 1].verb, q[q.length - 1].args) : current
+  if (key === last) return { queue: q, took: true }
+  if (q.length >= WD_QUEUE_MAX) return { queue: q, took: false }
+  q.push(entry)
+  return { queue: q, took: true }
 }
 
 // Whether pressing BLOCKED or ADS PASS on a jack's ticket does anything: the
@@ -2590,7 +2655,8 @@ if (typeof module !== "undefined") {
     callMeta: callMeta, callWhy: callWhy, callSubject: callSubject, alertOpenTarget: alertOpenTarget, alertActions: alertActions,
     deviceActions: deviceActions, newDeviceCalls: newDeviceCalls, quietLine: quietLine, ticketWord: ticketWord,
     deviceMeta: deviceMeta, patchCaption: patchCaption, jackNote: jackNote, gateRow: gateRow, labelEdit: labelEdit,
-    patchWanted: patchWanted, validPin: validPin, LABEL_MAX: LABEL_MAX,
+    patchWanted: patchWanted, validPin: validPin, LABEL_MAX: LABEL_MAX, WD_QUEUE_MAX: WD_QUEUE_MAX,
+    actionKey: actionKey, queueAction: queueAction, sayWord: sayWord,
     parseStateLine: parseStateLine, backoffMs: backoffMs, restartAttempt: restartAttempt,
     formatCountdown: formatCountdown, groupDigits: groupDigits, formatCount: formatCount,
     formatPercent: formatPercent, formatLatency: formatLatency, formatRate: formatRate,

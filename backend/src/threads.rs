@@ -2526,8 +2526,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut seen = Arrived::new(rx);
         // The devices are due on open and then only after an hour.
+        let cadence = Duration::from_secs(3600);
         let timing = ApiTiming {
-            history_every: Duration::from_secs(3600),
+            history_every: cadence,
             ..wd_timing()
         };
         let (ctl, h) = spawn_api(tx, timing, factory_for(&pi.srv), deps);
@@ -2553,9 +2554,15 @@ mod tests {
         ctl.send(ApiCtl::Devices).unwrap();
         assert!(wait_for(3000, || pi.count("GET /api/qbp/devices") == reads + 1));
         assert!(seen.wait(3000, |s| s.wd.last().is_some_and(|r| r.devices.len() == 4)));
+        // What this proves is the order of events: `reads` stood still through
+        // the kick and went up by one only after the `Devices` line, and the
+        // report that followed had the new device. The time is only a guard
+        // against the slow cadence (an hour): a read that waited for it could
+        // not come within a hundredth of it, and a loaded machine cannot
+        // stretch the next poll (tens of milliseconds here) that far.
         assert!(
-            t0.elapsed() < Duration::from_secs(1),
-            "within a second: {:?}",
+            t0.elapsed() < cadence / 100,
+            "the read came on the next poll, not on the {cadence:?} cadence: {:?}",
             t0.elapsed()
         );
         // Once, not on every poll after it.

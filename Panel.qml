@@ -81,12 +81,7 @@ Panel {
 
   // A word the model names by key ({ key, args }, as Model.jackReadout's
   // `how`), in the catalog's words.
-  function say(w) {
-    if (w.key === "") return w.text === undefined ? "" : String(w.text)
-    var s = strings.t(w.key)
-    for (var i = 0; i < w.args.length; i++) s = s.replace("%" + (i + 1), w.args[i])
-    return s
-  }
+  function say(w) { return Model.sayWord(w, function(key) { return strings.t(key) }) }
 
   // -------------------------------------------------------------- state
   // rawState is the newest snapshot from the service; the view is that with
@@ -279,10 +274,12 @@ Panel {
 
   // Everything that belongs to one opening of the panel. The passphrase is
   // not kept anywhere but in its field, which clears itself when its row
-  // closes.
+  // closes. The watchdog board's held order is one of them: it lasts from the
+  // panel opening to its closing, across the views.
   function resetUi() {
     nav = Model.navInit()
     closeTransients()
+    wdOrder = []
     dnsNote = ({ tone: "", text: "" })
     netNote = ""
     netFail = ({ id: "", text: "" })
@@ -313,6 +310,7 @@ Panel {
       settleTimer.restart()
       nowMs = Date.now()
       pending = Model.reconcilePending(pending, rawState, nowMs)
+      wdHold()
       cursorActive = false
       cursor = Model.initialCursor(rows, "main")
       cursorMemory = ({})
@@ -641,10 +639,11 @@ Panel {
   // -- Watchdog (a qberrypi's patch bay: WatchdogView, PatchBay, LampRow)
   // The tab's state lives here, as the other views' does: reset when the tab
   // is left or the panel closes, and nothing but the held order survives a
-  // state update.
-  //   wdOrder     the macs in the order the board keeps while the tab is up
-  //               (Model.holdOrder); set on entering, updated as jacks come
-  //               and go
+  // state update. The held order lives longer than a visit: it is the panel's.
+  //   wdOrder     the macs in the order the board keeps while the panel is
+  //               open (Model.holdOrder); set when the panel opens (or when
+  //               the first jacks arrive), updated as jacks come and go, kept
+  //               across the views, cleared when the panel closes (resetUi)
   //   wdScroll    the first bay in view (Model.bayLayout clamps it)
   //   wdTicket    null, { kind: "device", mac } or { kind: "alert", alertId }:
   //               the open ticket; the board shrinks to its bay
@@ -655,7 +654,10 @@ Panel {
   //   wdRunning   actions of the tab that have not answered yet; wdSettling is
   //               the moment after one succeeded, until the next state shows
   //               what it did: wdBusy (either) keeps a ticket's buttons from
-  //               running twice
+  //               running twice. An action that comes in that time is not lost:
+  //               it waits in wdQueue (Model.queueAction) and runs after the
+  //               one before it and its settle; wdCurrent names the one running
+  //               or just done
   //   wdEditing   a text field of the tab (the label, the PIN) has the keys
   property var wdOrder: []
   property int wdScroll: 0
@@ -666,6 +668,8 @@ Panel {
   property string wdPinNote: ""
   property int wdRunning: 0
   property bool wdSettling: false
+  property var wdQueue: []
+  property string wdCurrent: ""
   property bool wdLabelFocus: false
   property bool wdPinFocus: false
   readonly property bool wdEditing: wdLabelFocus || wdPinFocus
@@ -677,8 +681,18 @@ Panel {
   signal wdCommitRequested()
   signal wdPinSubmitRequested()
   signal wdLabelFocusRequested()
+  // A label did not get to the Pi: a field of that device shows its name again.
+  signal wdLabelFailed(string mac)
 
-  Timer { id: wdSettleTimer; interval: 1500; onTriggered: root.wdSettling = false }
+  Timer {
+    id: wdSettleTimer
+    interval: 1500
+    onTriggered: {
+      root.wdSettling = false
+      root.wdCurrent = ""
+      root.wdDrain()
+    }
+  }
 
   // The jack the open ticket belongs to ("" for none, or for a call that
   // rings no jack: the ARP spoof's).
@@ -699,8 +713,11 @@ Panel {
     view: "watchdog", flip: wdFlip, ticket: wdTicket, pinOpen: wdPinOpen, layout: wdLayout, order: wdOrder, nowS: nowMs / 1000
   })
 
+  // The tab is left or the panel closes: what the label field holds is sent
+  // first (the field commits once: it knows what was sent), then the visit's
+  // state goes. The held order stays (see wdOrder).
   function wdReset() {
-    wdOrder = []
+    wdCommitRequested()
     wdScroll = 0
     wdTicket = null
     wdFlip = false
@@ -711,20 +728,27 @@ Panel {
     wdPinFocus = false
   }
 
-  // Entering the tab: the order is the jacks' own (alerting and new first,
-  // labelled, then by address), held from here until the tab is left.
-  function wdOpen() {
-    wdReset()
-    wdOrder = Model.holdOrder([], view.watchdog.bay.jacks)
-  }
-
-  // A new snapshot while the tab is up: jacks that came are added at the end
-  // of the held order, jacks that went are dropped, and an alert ticket whose
-  // call is gone closes.
-  function wdSync() {
-    if (page !== "watchdog") return
+  // The held order: the jacks' own (alerting and new first, labelled, then by
+  // address, offline last) when there is none yet, which is when the panel
+  // opens or the first jacks arrive; after that the same places, with the jacks
+  // that came put in front of the offline ones and those that went dropped.
+  function wdHold() {
     var next = Model.holdOrder(wdOrder, rawState.watchdog.bay.jacks)
     if (next.join(",") !== wdOrder.join(",")) wdOrder = next
+  }
+
+  // Entering the tab: a fresh visit (the order is the panel's and is kept).
+  function wdOpen() {
+    wdReset()
+    wdHold()
+  }
+
+  // A new snapshot while the panel is open: the order is kept up, and on the
+  // tab an alert or device ticket whose subject is gone closes.
+  function wdSync() {
+    if (!opened) return
+    wdHold()
+    if (page !== "watchdog") return
     if (wdTicket !== null && wdTicket.kind === "alert" && Model.callOf(rawState, wdTicket.alertId) === null) wdSetTicket(null)
     if (wdTicket !== null && wdTicket.kind === "device" && Model.jackOf(rawState, wdTicket.mac) === null) wdSetTicket(null)
   }
@@ -820,31 +844,72 @@ Panel {
   // succeeds the watcher is told to read the devices again so the board shows
   // the edit at once; when it fails the board says why, inline. One at a time:
   // while one runs, and for a moment after it succeeded (until the state has
-  // had its turn), no other starts, so a ticket's buttons cannot run twice.
+  // had its turn), a ticket's buttons are dead so none runs twice, and an
+  // action that still comes (the label's commit when the field loses the keys,
+  // a key press) is not dropped: it waits in wdQueue and runs when the ones
+  // before it are done (wdDrain). Only a full queue, or a PIN (which never
+  // waits), is refused: the note says busy, and the caller learns it from the
+  // return value (true: it runs now or later).
   // opts: { secret } goes to the child's stdin (the PIN), { chain } lets an
   // action that follows another one start inside that moment, { silent }
-  // leaves the note to `done`.
+  // leaves the notes to `done` and the caller.
   function wdAction(verb, args, done, opts) {
     var o = opts || {}
-    if (wdRunning > 0 || (wdSettling && o.chain !== true)) return false
+    if (wdRunning === 0 && (!wdSettling || o.chain === true)) return wdStart(verb, args, done, o)
+    if (!Model.argvWatchdog(bin, verb, args)) return false
+    var q = Model.queueAction(wdQueue, { verb: verb, args: args, done: done, opts: o }, wdCurrent)
+    if (!q.took) {
+      if (o.secret !== undefined) o.secret = ""
+      if (o.silent !== true) setWdNote(strings.t("err.busy"))
+      return false
+    }
+    wdQueue = q.queue
+    return true
+  }
+
+  // Runs one now: the caller has made sure none is running.
+  function wdStart(verb, args, done, o) {
     var argv = Model.argvWatchdog(bin, verb, args)
     if (!argv) return false
+    var silent = o.silent === true
     wdNote = ""
     wdRunning++
+    wdCurrent = Model.actionKey(verb, args)
     var started = runCli(argv, o, function(res) {
       wdRunning = Math.max(0, wdRunning - 1)
       if (res.ok) {
         QnetService.send("devices")
         wdSettling = true
         wdSettleTimer.restart()
-      } else if (o.silent !== true) {
-        var words = failureText(Model.failure(res))
-        if (words !== "") setWdNote(words)
+      } else {
+        wdCurrent = ""
+        if (!silent) {
+          var words = failureText(Model.failure(res))
+          if (words !== "") setWdNote(words)
+        }
       }
       if (typeof done === "function") done(res)
+      wdDrain()
     })
-    if (!started) wdRunning = Math.max(0, wdRunning - 1)
+    // The PIN: the runner has its own copy, written to the child's stdin and
+    // cleared there; this object (which the callback's closure keeps alive)
+    // must not hold it until the child exits.
+    if (o.secret !== undefined) o.secret = ""
+    if (!started) {
+      wdRunning = Math.max(0, wdRunning - 1)
+      wdCurrent = ""
+    }
     return started
+  }
+
+  // The next waiting action, once nothing runs and the last one has settled.
+  // One that cannot start is skipped for the one after it.
+  function wdDrain() {
+    while (wdQueue.length > 0 && wdRunning === 0 && !wdSettling) {
+      var next = wdQueue[0]
+      wdQueue = wdQueue.slice(1)
+      wdStart(next.verb, next.args, next.done, next.opts)
+    }
   }
 
   // The queue's Dismiss all, a ticket's Dismiss (both clear the Pi's screen).
@@ -883,10 +948,12 @@ Panel {
   // The gate row: secs 0 shuts it, 300, 1800 or 3600 opens it.
   function wdGate(mac, secs) { wdAction("gate", [mac, secs]) }
 
-  // The label field's edit, as typed. done(ok) lets the field fall back to the
-  // jack's name when it failed.
-  function wdLabel(mac, text, done) {
-    return wdAction("label", [mac, text], function(res) { if (typeof done === "function") done(res.ok) })
+  // The label field's edit, as typed. True: it was sent or waits its turn (a
+  // failure shows as wdLabelFailed, which the field answers by showing the
+  // jack's name again); false: it was refused (busy, said inline) and the
+  // field must not look as if it were saved.
+  function wdLabel(mac, text) {
+    return wdAction("label", [mac, text], function(res) { if (!res.ok) wdLabelFailed(mac) })
   }
 
   // The PIN footer. Set and Change open the field (it takes the keys); the

@@ -17,8 +17,10 @@ import "../Model.js" as Model
 // The router, the Pi and a device the Pi's own configuration decides (ALWAYS,
 // FIXED) say so in a line instead of the patch and gate rows. The label is
 // sent when Enter is pressed or the field loses the keys (and when the ticket
-// changes), only if it changed; empty clears it. While an action runs (or has
-// just succeeded, until the board shows it) every button is dead
+// changes, the tab is left or the panel closes), only if it changed; empty
+// clears it; Esc takes the edit back. If an action is running the label waits
+// its turn (hub.wdAction queues it) and is never dropped. While an action runs
+// (or has just succeeded, until the board shows it) every button is dead
 // (hub.wdBusy), so none runs twice. There is no "recent lookups" section: the
 // Pi keeps no query log per device.
 //
@@ -122,8 +124,8 @@ TicketFrame {
       TextInput {
         id: field
 
-        // What the Pi knows now (what was sent last): an edit is sent only
-        // when it differs.
+        // What the Pi knows now (what was sent last, or what the field was
+        // given): an edit is sent only when the text differs from it.
         property string sent: ""
 
         x: 0
@@ -140,16 +142,24 @@ TicketFrame {
         clip: true
         inputMethodHints: Qt.ImhNoPredictiveText
 
+        // Shows the jack's name. `sent` is what the field then holds, not
+        // the name: maximumLength cuts a longer one (the CLI takes 64), and
+        // an untouched field, or an Esc, must never count as an edit.
         function sync() {
           text = tk.name
-          sent = tk.name
+          sent = text
         }
 
+        // Sends the edit if there is one. The label is sent or waits its turn
+        // behind the action that is running (hub.wdLabel true); if it is
+        // refused (the note says busy) the field shows the jack's name again:
+        // it never looks saved when it was not sent.
         function commit() {
+          if (text === sent) return
           var e = Model.labelEdit(sent, text)
           if (!e.changed) return
-          var mac = tk.mac
-          if (tk.hub.wdLabel(mac, text, function(ok) { if (!ok && tk.mac === mac) field.sync() })) sent = e.text
+          if (tk.hub.wdLabel(tk.mac, text)) sent = e.text
+          else sync()
         }
 
         Component.onCompleted: sync()
@@ -161,6 +171,8 @@ TicketFrame {
           tk.hub.wdFieldFocus("label", activeFocus)
           if (!activeFocus) commit()
         }
+        // Esc cancels: the field goes back to what it had and lets go, and
+        // that is no edit (text equals sent), so nothing is sent.
         Keys.onEscapePressed: {
           text = sent
           focus = false
@@ -204,7 +216,9 @@ TicketFrame {
       function onNameChanged() { if (!field.activeFocus) field.sync() }
       function onMacChanged() { field.sync() }
     }
-    // the label row of the keyboard took Enter, or a ticket is closing
+    // the label row of the keyboard took Enter, or a ticket is closing (or
+    // the tab is left, or the panel closes) with the field being typed in; or
+    // a label of this device did not get to the Pi
     Connections {
       target: tk.hub
       function onWdLabelFocusRequested() {
@@ -212,6 +226,7 @@ TicketFrame {
         field.cursorPosition = field.length
       }
       function onWdCommitRequested() { if (field.activeFocus) field.commit() }
+      function onWdLabelFailed(mac) { if (mac === tk.mac) field.sync() }
     }
   }
 
