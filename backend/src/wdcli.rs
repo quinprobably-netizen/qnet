@@ -735,47 +735,22 @@ pub fn devices(api: &mut Pihole, store_path: &Path) -> ActionResult {
     };
     let store = Store::load(store_path);
     let reported: HashSet<&str> = inv.devices.iter().map(|d| d.mac.as_str()).collect();
-    let offline: Vec<Value> = store
-        .known
-        .iter()
-        .filter(|k| !reported.contains(k.mac.as_str()))
-        .map(|k| {
-            json!({
-                "mac": k.mac,
-                "label": k.label.as_deref().unwrap_or(""),
-                "firstSeen": k.first_seen,
-            })
+    let missing = watchdog::unreported(&store, &reported);
+    let entry = |k: &&wdstore::Known| {
+        json!({
+            "mac": k.mac,
+            "label": k.label.as_deref().unwrap_or(""),
+            "firstSeen": k.first_seen,
         })
-        .collect();
-    let exempt_offline: Vec<Value> = store
-        .exempt
-        .iter()
-        .filter(|e| !reported.contains(e.mac.as_str()))
-        .map(|e| {
-            json!({
-                "mac": e.mac,
-                "label": e.label.as_deref().unwrap_or(""),
-                "firstSeen": e.first_seen,
-            })
-        })
-        .collect();
+    };
+    let offline: Vec<Value> = missing.known.iter().map(entry).collect();
+    let exempt_offline: Vec<Value> = missing.exempt.iter().map(entry).collect();
+    let block_offline: Vec<Value> = missing.block.iter().map(entry).collect();
     let mine: HashSet<&str> = store.exempt.iter().map(|e| e.mac.as_str()).collect();
     let exempt_on_pi_only: Vec<&String> = inv
         .exempt_macs
         .iter()
         .filter(|m| !mine.contains(m.as_str()))
-        .collect();
-    let block_offline: Vec<Value> = store
-        .block
-        .iter()
-        .filter(|b| !reported.contains(b.mac.as_str()))
-        .map(|b| {
-            json!({
-                "mac": b.mac,
-                "label": b.label.as_deref().unwrap_or(""),
-                "firstSeen": b.first_seen,
-            })
-        })
         .collect();
     let my_block: HashSet<&str> = store.block.iter().map(|b| b.mac.as_str()).collect();
     let block_on_pi_only: Vec<&String> = inv

@@ -23,6 +23,9 @@
 //! One-shot verbs print one JSON line and exit 0 (`ok`) or 1.
 
 mod actions;
+mod bay;
+#[cfg(test)]
+mod bayfix;
 mod config;
 mod dnsmodel;
 mod dnswire;

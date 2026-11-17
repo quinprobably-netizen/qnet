@@ -6,6 +6,7 @@ use std::net::IpAddr;
 
 use serde::Serialize;
 
+use crate::bay::{self, BayOut};
 use crate::config::{Config, Fallback};
 use crate::dnsmodel::{self, classify, detect_leaks, detect_mode, is_bypassed, LeakInput, Mode};
 use crate::failover::Failover;
@@ -379,6 +380,18 @@ pub struct WatchdogOut {
     pub pushed_at: u64,
     pub push_error: String,
     pub polled_at: u64,
+    /// This PC's exempt-by-default mode: every device skips ad blocking but
+    /// the ones on its block list.
+    pub exempt_default: bool,
+    /// The Pi's own mode (false when it does not say, and before a read).
+    pub exempt_default_on_pi: bool,
+    /// A panel PIN is set on this PC.
+    pub pin_set: bool,
+    /// Unix time of the last device read (0 = none yet): what the gates'
+    /// `gateUntil` counts from.
+    pub devices_at: u64,
+    /// The patch bay: the board, the lamps and the queue, worked out in Rust.
+    pub bay: BayOut,
 }
 
 impl WatchdogOut {
@@ -396,6 +409,11 @@ impl WatchdogOut {
             pushed_at: 0,
             push_error: String::new(),
             polled_at: 0,
+            exempt_default: false,
+            exempt_default_on_pi: false,
+            pin_set: false,
+            devices_at: 0,
+            bay: BayOut::empty(),
         }
     }
 
@@ -416,6 +434,17 @@ impl WatchdogOut {
             pushed_at: r.pushed_at,
             push_error: r.push_error.clone(),
             polled_at: r.polled_at,
+            exempt_default: r.exempt_default,
+            exempt_default_on_pi: r.exempt_default_on_pi,
+            pin_set: r.pin_set,
+            devices_at: r.devices_at,
+            bay: bay::build(&bay::Input {
+                devices: &r.devices,
+                offline: &r.offline,
+                alerts: &r.alerts,
+                exempt_default: r.exempt_default,
+                devices_at: r.devices_at,
+            }),
         }
     }
 }
@@ -958,9 +987,12 @@ pub fn signature_of(mut v: serde_json::Value, open: bool) -> String {
         if let Some(scan) = o.get_mut("scan").and_then(|s| s.as_object_mut()) {
             scan.remove("lastScanAgeS");
         }
-        // A quiet watchdog cycle only moves `polledAt`: a heartbeat, not news.
+        // A quiet watchdog cycle only moves `polledAt`, and a device read that
+        // finds the same devices only `devicesAt` (the gates it derives
+        // `gateUntil` from stay put): a heartbeat, not news.
         if let Some(w) = o.get_mut("watchdog").and_then(|s| s.as_object_mut()) {
             w.remove("polledAt");
+            w.remove("devicesAt");
         }
         if let Some(p) = o.get_mut("pihole").and_then(|s| s.as_object_mut()) {
             p.remove("pauseRemainingS");
@@ -993,7 +1025,7 @@ mod tests {
     use crate::dnsmodel::fixtures as fx;
     use crate::net::fake::{fake_cfg, FakeNet, U_ETH1, U_WIFI};
     use crate::pihole::{AnsweredBy, Upstream};
-    use crate::watchdog::{Alert, Device, ReportDevice};
+    use crate::watchdog::{Alert, Device, OfflineEntry, ReportDevice};
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
 
@@ -1050,7 +1082,7 @@ mod tests {
                     exempt: true,
                     blocked: false,
                     label: None,
-                    gate_left_secs: None,
+                    gate_left_secs: Some(300),
                     fixed: false,
                     always: false,
                 },
@@ -1063,6 +1095,18 @@ mod tests {
             pushed_at: 1_794_000_001,
             push_error: String::new(),
             polled_at: 1_794_000_005,
+            exempt_default: false,
+            exempt_default_on_pi: false,
+            pin_set: true,
+            devices_at: 1_794_000_004,
+            offline: vec![OfflineEntry {
+                mac: "02:00:00:00:00:0f".into(),
+                label: "Old laptop".into(),
+                first_seen: 1_793_642_400,
+                known: true,
+                exempt: false,
+                block: false,
+            }],
         }
     }
 
@@ -1142,6 +1186,10 @@ mod tests {
     }
 
     fn build(f: &Fixture) -> State {
+        build_at(f, 1_794_000_006.0)
+    }
+
+    fn build_at(f: &Fixture, now_unix: f64) -> State {
         build_state(
             &Inputs {
                 net: Some(&f.net),
@@ -1164,7 +1212,7 @@ mod tests {
                 scan: ScanView { running: false },
                 watchdog: f.watchdog.as_ref(),
                 error: "",
-                now_unix: 1_794_000_006.0,
+                now_unix,
                 net_age_s: 0.0,
             },
             42,
@@ -1180,7 +1228,7 @@ mod tests {
     fn json_snapshot_of_the_live_machine_shape() {
         let st = build(&fixture());
         let got = to_json(&st);
-        let want = json!({
+        let mut want = json!({
             "type": "state",
             "seq": 42,
             "link": {
@@ -1257,16 +1305,60 @@ mod tests {
                     "blockedOnPi": false, "blocked": true
                 }],
                 "knownCount": 12, "pushedAt": 1794000001, "pushError": "",
-                "polledAt": 1794000005
+                "polledAt": 1794000005,
+                "exemptDefault": false, "exemptDefaultOnPi": false, "pinSet": true,
+                "devicesAt": 1794000004
             },
             "error": ""
         });
+        want["watchdog"]["bay"] = bay_sample();
         assert_eq!(
             got,
             want,
             "\n{}",
             serde_json::to_string_pretty(&got).unwrap()
         );
+    }
+
+    /// `watchdog.bay` for `sample_report` (its own macro call: `json!` has a
+    /// recursion limit that the whole state does not fit in).
+    fn bay_sample() -> Value {
+        json!({
+            "jacks": [
+                {
+                    "mac": "02:00:00:00:00:07", "ip": "192.0.2.7", "tail": "·7",
+                    "hostname": "", "name": "Printer", "strip": ["Printer"],
+                    "known": true, "isNew": false, "offline": false,
+                    "firstUnix": 1794000000, "lastUnix": 1794000050,
+                    "patch": "blocked", "row": "blocked", "cord": false,
+                    "gateUntil": 1794000304, "lamp": "warn", "alertId": 7, "rank": 0
+                },
+                {
+                    "mac": "02:00:00:00:00:0f", "ip": "", "tail": ":0f",
+                    "hostname": "", "name": "Old laptop", "strip": ["Old", "laptop"],
+                    "known": true, "isNew": false, "offline": true,
+                    "firstUnix": 1793642400, "lastUnix": 0,
+                    "patch": "blocked", "row": "blocked", "cord": false,
+                    "gateUntil": null, "lamp": "", "alertId": null, "rank": 3
+                }
+            ],
+            "flipCount": 1,
+            "lamps": [
+                {"kind": "threat", "count": 0, "tone": "", "alertId": null},
+                {"kind": "new_device", "count": 1, "tone": "warn", "alertId": 7},
+                {"kind": "arp_spoof", "count": 0, "tone": "", "alertId": null},
+                {"kind": "rebind", "count": 0, "tone": "", "alertId": null},
+                {"kind": "lookups", "count": 0, "tone": "", "alertId": null}
+            ],
+            "calls": [{
+                "id": 7, "key": "a1b2c3d400000007", "kind": "new_device",
+                "lamp": "new_device", "severity": "warn", "tone": "warn",
+                "mac": "02:00:00:00:00:07", "relatedMac": null,
+                "subject": "02:00:00:00:00:07",
+                "count": 1, "firstUnix": 1794000000, "lastUnix": 1794000050
+            }],
+            "quietSince": 1794000050
+        })
     }
 
     fn shape(v: &Value, path: &str, out: &mut BTreeMap<String, &'static str>) {
@@ -1449,6 +1541,175 @@ mod tests {
                 "status (open: {open})"
             );
         }
+    }
+
+    #[test]
+    fn a_device_read_that_finds_the_same_devices_is_not_a_new_state_line() {
+        for open in [false, true] {
+            let base = build(&fixture());
+            // The read happened a minute later and nothing in it moved: the
+            // gate shuts at the same moment, so `gateUntil` does not change.
+            let mut g = fixture();
+            let r = g.watchdog.as_mut().unwrap();
+            r.devices_at += 60;
+            r.devices[0].device.gate_left_secs = Some(300 - 60);
+            let later = build(&g);
+            assert_eq!(
+                later.watchdog.bay.jacks[0].gate_until,
+                base.watchdog.bay.jacks[0].gate_until
+            );
+            assert_ne!(later.watchdog.devices_at, base.watchdog.devices_at);
+            assert_eq!(
+                change_signature(&later, open),
+                change_signature(&base, open),
+                "devicesAt alone (open: {open})"
+            );
+            // A gate that was opened or shut is news.
+            let mut g = fixture();
+            g.watchdog.as_mut().unwrap().devices[0]
+                .device
+                .gate_left_secs = None;
+            assert_ne!(
+                change_signature(&build(&g), open),
+                change_signature(&base, open),
+                "a gate shut (open: {open})"
+            );
+            // So is a change of mode, of the PIN, and a device gone offline.
+            for edit in [
+                (|r: &mut WatchdogReport| r.exempt_default = true) as fn(&mut WatchdogReport),
+                |r| r.pin_set = false,
+                |r| r.exempt_default_on_pi = true,
+                |r| r.offline.clear(),
+            ] {
+                let mut g = fixture();
+                edit(g.watchdog.as_mut().unwrap());
+                assert_ne!(
+                    change_signature(&build(&g), open),
+                    change_signature(&base, open),
+                    "open: {open}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_bay_and_its_facts_are_in_the_state() {
+        let w = build(&fixture()).watchdog;
+        assert_eq!(
+            (
+                w.exempt_default,
+                w.exempt_default_on_pi,
+                w.pin_set,
+                w.devices_at
+            ),
+            (false, false, true, 1_794_000_004)
+        );
+        assert_eq!(w.bay.jacks.len(), 2, "the Pi's device and the offline one");
+        assert_eq!(w.bay.calls.len(), 1);
+        assert_eq!(w.bay.quiet_since, 1_794_000_050);
+    }
+
+    #[test]
+    fn without_a_watchdog_the_bay_is_empty_and_its_lamps_dark() {
+        for st in [
+            WatchdogOut::empty("unconfigured"),
+            WatchdogOut::empty("unknown"),
+        ] {
+            assert_eq!(
+                (
+                    st.exempt_default,
+                    st.exempt_default_on_pi,
+                    st.pin_set,
+                    st.devices_at
+                ),
+                (false, false, false, 0)
+            );
+            let v = serde_json::to_value(&st).unwrap();
+            assert_eq!(v["bay"]["jacks"], json!([]));
+            assert_eq!(v["bay"]["calls"], json!([]));
+            assert_eq!(v["bay"]["flipCount"], 0);
+            assert_eq!(v["bay"]["quietSince"], 0);
+            let lamps = v["bay"]["lamps"].as_array().unwrap();
+            assert_eq!(
+                lamps
+                    .iter()
+                    .map(|l| l["kind"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["threat", "new_device", "arp_spoof", "rebind", "lookups"]
+            );
+            assert!(lamps
+                .iter()
+                .all(|l| l["count"] == 0 && l["tone"] == "" && l["alertId"].is_null()));
+        }
+        let mut f = fixture();
+        f.watchdog = None;
+        assert_eq!(build(&f).watchdog.bay, BayOut::empty());
+        f.watchdog = Some(sample_report());
+        f.cfg = Config::default();
+        assert_eq!(build(&f).watchdog.bay, BayOut::empty());
+    }
+
+    // -- the golden fixtures ----------------------------------------------------------
+
+    /// `tests/helpers.js` `NOW_S`: the clock the JS tests read the fixtures at.
+    const NOW_S: f64 = crate::bayfix::NOW_S as f64;
+
+    /// The fixture's inputs moved to the JS tests' clock, so that the probes
+    /// and the history sit just before it as they do in `healthy.json`.
+    fn golden_inputs(report: WatchdogReport) -> Fixture {
+        let mut f = fixture();
+        f.watchdog = Some(report);
+        f.probes = (0..12)
+            .map(|k| ProbeRec {
+                t: NOW_S - 55.9 + 5.0 * k as f64,
+                ok: true,
+                ms: Some(3.0 + (k % 4) as f64 * 0.2),
+                blocked: true,
+            })
+            .collect();
+        f.api.blocking = f.api.blocking.map(|(b, _)| (b, NOW_S - 4.0));
+        let end = (NOW_S as i64 / 600) * 600;
+        f.api.history = (0..12)
+            .map(|k| Bucket {
+                t: end - 600 * (11 - k),
+                total: 36 + (k as u64 * 7) % 25,
+                blocked: 4 + (k as u64 * 5) % 11,
+            })
+            .collect();
+        f
+    }
+
+    #[test]
+    fn the_watchdog_fixtures_are_what_the_state_says_for_the_bays_sample_data() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures");
+        let update = std::env::var_os("QNET_UPDATE_FIXTURES").is_some();
+        let mut stale = Vec::new();
+        for (name, report) in crate::bayfix::reports() {
+            let st = build_at(&golden_inputs(report), NOW_S);
+            assert_eq!(st.watchdog.status, "ok", "{name}");
+            let text = serde_json::to_string_pretty(&st).unwrap() + "\n";
+            let path = dir.join(format!("watchdog-{name}.json"));
+            if update {
+                std::fs::write(&path, &text).unwrap();
+            } else if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+                stale.push(name);
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "tests/fixtures/watchdog-{stale:?}.json differ from the state: \
+             QNET_UPDATE_FIXTURES=1 cargo test rewrites them"
+        );
+    }
+
+    #[test]
+    fn a_golden_state_is_a_healthy_one_with_the_watchdog_up() {
+        let (_, report) = crate::bayfix::reports().remove(0);
+        let v = to_json(&build_at(&golden_inputs(report), NOW_S));
+        assert_eq!(v["pihole"]["health"], "ok");
+        assert_eq!(v["pihole"]["blocking"], "enabled");
+        assert_eq!(v["dns"]["mode"], "pihole");
+        assert_eq!(v["watchdog"]["status"], "ok");
     }
 
     #[test]

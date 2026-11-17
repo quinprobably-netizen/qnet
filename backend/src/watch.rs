@@ -2339,6 +2339,11 @@ mod tests {
             pushed_at: 0,
             push_error: String::new(),
             polled_at,
+            exempt_default: false,
+            exempt_default_on_pi: false,
+            pin_set: false,
+            devices_at: 0,
+            offline: vec![],
         }
     }
 

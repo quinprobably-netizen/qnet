@@ -1,0 +1,663 @@
+{
+  "type": "state",
+  "seq": 42,
+  "link": {
+    "kind": "wifi",
+    "device": "wlp7s0",
+    "connection": "Redwood",
+    "uuid": "21307067-f47b-43ea-8c9c-2c746454b2bb",
+    "ssid": "Redwood",
+    "signal": 72,
+    "band": "5 GHz",
+    "bitrateMbps": 866,
+    "frequencyMhz": 5180,
+    "prefix": 24,
+    "signalDbm": null,
+    "ip4": "192.168.1.242",
+    "gateway": "192.168.1.1",
+    "gatewayMs": 3.8,
+    "connectivity": "full",
+    "portalUrl": ""
+  },
+  "radio": {
+    "wifiEnabled": true,
+    "hwEnabled": true
+  },
+  "networks": [
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/12",
+      "ssid": "Redwood",
+      "hidden": false,
+      "signal": 72,
+      "security": "psk",
+      "known": true,
+      "uuid": "21307067-f47b-43ea-8c9c-2c746454b2bb",
+      "active": true,
+      "band": "5 GHz",
+      "frequencyMhz": 5180
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/41",
+      "ssid": "Corp",
+      "hidden": false,
+      "signal": 60,
+      "security": "enterprise",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "5 GHz",
+      "frequencyMhz": 5180
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/40",
+      "ssid": "Cafe",
+      "hidden": false,
+      "signal": 50,
+      "security": "psk",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz",
+      "frequencyMhz": 2437
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/42",
+      "ssid": "Lobby",
+      "hidden": false,
+      "signal": 40,
+      "security": "open",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz",
+      "frequencyMhz": 2437
+    },
+    {
+      "id": "/org/freedesktop/NetworkManager/AccessPoint/43",
+      "ssid": "",
+      "hidden": true,
+      "signal": 30,
+      "security": "psk",
+      "known": false,
+      "uuid": "",
+      "active": false,
+      "band": "2.4 GHz",
+      "frequencyMhz": 2437
+    }
+  ],
+  "scan": {
+    "running": false,
+    "lastScanAgeS": 12
+  },
+  "dns": {
+    "mode": "pihole",
+    "modeSource": "profile",
+    "servers": [
+      {
+        "addr": "192.168.1.153",
+        "link": "wlp7s0",
+        "current": true,
+        "role": "pihole"
+      }
+    ],
+    "leaks": [
+      {
+        "kind": "profile",
+        "where": "Wired connection 1",
+        "uuid": "f5520df2-a482-3ff6-a770-64b74a740967",
+        "detail": "uses router DNS (automatic)"
+      },
+      {
+        "kind": "profile",
+        "where": "Wired connection 2",
+        "uuid": "10e2035e-2c2c-3815-ab60-f18f6b0e39d5",
+        "detail": "uses router DNS (automatic)"
+      }
+    ],
+    "failover": {
+      "enabled": true,
+      "fallback": "router",
+      "active": false,
+      "since": 0,
+      "reason": ""
+    },
+    "manualOverride": false,
+    "bypassed": false,
+    "resolvedFallback": ""
+  },
+  "pihole": {
+    "configured": true,
+    "address": "192.168.1.153",
+    "adminUrl": "https://192.168.1.153/admin/",
+    "reachable": true,
+    "latencyMs": 3.6,
+    "blocking": "enabled",
+    "pauseRemainingS": 0,
+    "api": "ok",
+    "health": "ok",
+    "healthReason": "",
+    "canaryBlocked": true,
+    "today": {
+      "total": 1204,
+      "blocked": 164,
+      "percent": 13.6,
+      "selfQueries": 0
+    },
+    "history": [
+      {
+        "t": 1794115800,
+        "total": 36,
+        "blocked": 4
+      },
+      {
+        "t": 1794116400,
+        "total": 43,
+        "blocked": 9
+      },
+      {
+        "t": 1794117000,
+        "total": 50,
+        "blocked": 14
+      },
+      {
+        "t": 1794117600,
+        "total": 57,
+        "blocked": 8
+      },
+      {
+        "t": 1794118200,
+        "total": 39,
+        "blocked": 13
+      },
+      {
+        "t": 1794118800,
+        "total": 46,
+        "blocked": 7
+      },
+      {
+        "t": 1794119400,
+        "total": 53,
+        "blocked": 12
+      },
+      {
+        "t": 1794120000,
+        "total": 60,
+        "blocked": 6
+      },
+      {
+        "t": 1794120600,
+        "total": 42,
+        "blocked": 11
+      },
+      {
+        "t": 1794121200,
+        "total": 49,
+        "blocked": 5
+      },
+      {
+        "t": 1794121800,
+        "total": 56,
+        "blocked": 10
+      },
+      {
+        "t": 1794122400,
+        "total": 38,
+        "blocked": 4
+      }
+    ],
+    "historySpanS": 7200,
+    "upstreams": [
+      {
+        "name": "dns9.quad9.net",
+        "ip": "9.9.9.9",
+        "port": 53,
+        "count": 287,
+        "responseMs": 159.2
+      }
+    ],
+    "answeredBy": {
+      "blocklist": 1734,
+      "cache": 1075,
+      "forwarded": 430
+    },
+    "detected": "",
+    "probes": [
+      {
+        "t": 1794122644.1,
+        "ok": true,
+        "ms": 3.0,
+        "blocked": true
+      },
+      {
+        "t": 1794122649.1,
+        "ok": true,
+        "ms": 3.2,
+        "blocked": true
+      },
+      {
+        "t": 1794122654.1,
+        "ok": true,
+        "ms": 3.4,
+        "blocked": true
+      },
+      {
+        "t": 1794122659.1,
+        "ok": true,
+        "ms": 3.6,
+        "blocked": true
+      },
+      {
+        "t": 1794122664.1,
+        "ok": true,
+        "ms": 3.0,
+        "blocked": true
+      },
+      {
+        "t": 1794122669.1,
+        "ok": true,
+        "ms": 3.2,
+        "blocked": true
+      },
+      {
+        "t": 1794122674.1,
+        "ok": true,
+        "ms": 3.4,
+        "blocked": true
+      },
+      {
+        "t": 1794122679.1,
+        "ok": true,
+        "ms": 3.6,
+        "blocked": true
+      },
+      {
+        "t": 1794122684.1,
+        "ok": true,
+        "ms": 3.0,
+        "blocked": true
+      },
+      {
+        "t": 1794122689.1,
+        "ok": true,
+        "ms": 3.2,
+        "blocked": true
+      },
+      {
+        "t": 1794122694.1,
+        "ok": true,
+        "ms": 3.4,
+        "blocked": true
+      },
+      {
+        "t": 1794122699.1,
+        "ok": true,
+        "ms": 3.6,
+        "blocked": true
+      }
+    ]
+  },
+  "watchdog": {
+    "status": "ok",
+    "rev": 2,
+    "suppressed": 0,
+    "unacked": 0,
+    "alerts": [],
+    "knownList": "received",
+    "devices": [
+      {
+        "mac": "02:00:00:00:00:01",
+        "ipv4": [
+          "192.0.2.1"
+        ],
+        "hostname": "gateway",
+        "firstUnix": 1793642400,
+        "lastUnix": 1794122680,
+        "knownOnPi": true,
+        "known": true,
+        "label": "router",
+        "exemptOnPi": false,
+        "exempt": false,
+        "blockedOnPi": false,
+        "blocked": false
+      },
+      {
+        "mac": "02:00:00:00:00:02",
+        "ipv4": [
+          "192.0.2.2"
+        ],
+        "hostname": "qbp",
+        "firstUnix": 1793728861,
+        "lastUnix": 1794122663,
+        "knownOnPi": true,
+        "known": true,
+        "label": "qbp",
+        "exemptOnPi": false,
+        "exempt": false,
+        "blockedOnPi": false,
+        "blocked": false
+      },
+      {
+        "mac": "02:00:00:00:00:0a",
+        "ipv4": [
+          "192.0.2.10"
+        ],
+        "hostname": "desk",
+        "firstUnix": 1793901722,
+        "lastUnix": 1794122646,
+        "knownOnPi": true,
+        "known": true,
+        "label": "This PC",
+        "exemptOnPi": false,
+        "exempt": false,
+        "blockedOnPi": false,
+        "blocked": false
+      },
+      {
+        "mac": "02:00:00:00:00:0c",
+        "ipv4": [
+          "192.0.2.12"
+        ],
+        "hostname": "laptop-01",
+        "firstUnix": 1794074583,
+        "lastUnix": 1794122629,
+        "knownOnPi": true,
+        "known": true,
+        "label": "Work laptop",
+        "exemptOnPi": false,
+        "exempt": false,
+        "blockedOnPi": false,
+        "blocked": false
+      },
+      {
+        "mac": "02:00:00:00:00:17",
+        "ipv4": [
+          "192.0.2.23"
+        ],
+        "hostname": "phone-7a",
+        "firstUnix": 1793642644,
+        "lastUnix": 1794122612,
+        "knownOnPi": true,
+        "known": true,
+        "label": "Sam's phone",
+        "exemptOnPi": false,
+        "exempt": false,
+        "blockedOnPi": false,
+        "blocked": false
+      },
+      {
+        "mac": "02:00:00:00:00:28",
+        "ipv4": [
+          "192.0.2.40"
+        ],
+        "hostname": "tv-40",
+        "firstUnix": 1793729105,
+        "lastUnix": 1794122595,
+        "knownOnPi": true,
+        "known": true,
+        "label": "Living room TV",
+        "exemptOnPi": true,
+        "exempt": true,
+        "blockedOnPi": false,
+        "blocked": false
+      },
+      {
+        "mac": "02:00:00:00:00:33",
+        "ipv4": [
+          "192.0.2.51"
+        ],
+        "hostname": "speaker",
+        "firstUnix": 1793901966,
+        "lastUnix": 1794122578,
+        "knownOnPi": true,
+        "known": true,
+        "label": "Kitchen speaker",
+        "exemptOnPi": false,
+        "exempt": false,
+        "blockedOnPi": false,
+        "blocked": false
+      },
+      {
+        "mac": "02:00:00:00:00:d8",
+        "ipv4": [
+          "192.0.2.216"
+        ],
+        "hostname": "",
+        "firstUnix": 1794120960,
+        "lastUnix": 1794122561,
+        "knownOnPi": true,
+        "known": true,
+        "label": "",
+        "exemptOnPi": false,
+        "exempt": false,
+        "blockedOnPi": false,
+        "blocked": false
+      }
+    ],
+    "knownCount": 8,
+    "pushedAt": 1794119100,
+    "pushError": "",
+    "polledAt": 1794122685,
+    "exemptDefault": false,
+    "exemptDefaultOnPi": false,
+    "pinSet": true,
+    "devicesAt": 1794122655,
+    "bay": {
+      "jacks": [
+        {
+          "mac": "02:00:00:00:00:01",
+          "ip": "192.0.2.1",
+          "tail": "·1",
+          "hostname": "gateway",
+          "name": "router",
+          "strip": [
+            "router"
+          ],
+          "known": true,
+          "isNew": false,
+          "offline": false,
+          "firstUnix": 1793642400,
+          "lastUnix": 1794122680,
+          "patch": "always",
+          "row": "blocked",
+          "cord": false,
+          "gateUntil": null,
+          "lamp": "",
+          "alertId": null,
+          "rank": 1
+        },
+        {
+          "mac": "02:00:00:00:00:02",
+          "ip": "192.0.2.2",
+          "tail": "·2",
+          "hostname": "qbp",
+          "name": "qbp",
+          "strip": [
+            "qbp"
+          ],
+          "known": true,
+          "isNew": false,
+          "offline": false,
+          "firstUnix": 1793728861,
+          "lastUnix": 1794122663,
+          "patch": "always",
+          "row": "blocked",
+          "cord": false,
+          "gateUntil": null,
+          "lamp": "",
+          "alertId": null,
+          "rank": 1
+        },
+        {
+          "mac": "02:00:00:00:00:0a",
+          "ip": "192.0.2.10",
+          "tail": "·10",
+          "hostname": "desk",
+          "name": "This PC",
+          "strip": [
+            "This PC"
+          ],
+          "known": true,
+          "isNew": false,
+          "offline": false,
+          "firstUnix": 1793901722,
+          "lastUnix": 1794122646,
+          "patch": "blocked",
+          "row": "blocked",
+          "cord": false,
+          "gateUntil": null,
+          "lamp": "",
+          "alertId": null,
+          "rank": 1
+        },
+        {
+          "mac": "02:00:00:00:00:0c",
+          "ip": "192.0.2.12",
+          "tail": "·12",
+          "hostname": "laptop-01",
+          "name": "Work laptop",
+          "strip": [
+            "Work",
+            "laptop"
+          ],
+          "known": true,
+          "isNew": false,
+          "offline": false,
+          "firstUnix": 1794074583,
+          "lastUnix": 1794122629,
+          "patch": "blocked",
+          "row": "blocked",
+          "cord": false,
+          "gateUntil": null,
+          "lamp": "",
+          "alertId": null,
+          "rank": 1
+        },
+        {
+          "mac": "02:00:00:00:00:17",
+          "ip": "192.0.2.23",
+          "tail": "·23",
+          "hostname": "phone-7a",
+          "name": "Sam's phone",
+          "strip": [
+            "Sam's",
+            "phone"
+          ],
+          "known": true,
+          "isNew": false,
+          "offline": false,
+          "firstUnix": 1793642644,
+          "lastUnix": 1794122612,
+          "patch": "blocked",
+          "row": "blocked",
+          "cord": false,
+          "gateUntil": null,
+          "lamp": "",
+          "alertId": null,
+          "rank": 1
+        },
+        {
+          "mac": "02:00:00:00:00:28",
+          "ip": "192.0.2.40",
+          "tail": "·40",
+          "hostname": "tv-40",
+          "name": "Living room TV",
+          "strip": [
+            "Living",
+            "room TV"
+          ],
+          "known": true,
+          "isNew": false,
+          "offline": false,
+          "firstUnix": 1793729105,
+          "lastUnix": 1794122595,
+          "patch": "pass",
+          "row": "pass",
+          "cord": true,
+          "gateUntil": null,
+          "lamp": "",
+          "alertId": null,
+          "rank": 1
+        },
+        {
+          "mac": "02:00:00:00:00:33",
+          "ip": "192.0.2.51",
+          "tail": "·51",
+          "hostname": "speaker",
+          "name": "Kitchen speaker",
+          "strip": [
+            "Kitchen",
+            "speaker"
+          ],
+          "known": true,
+          "isNew": false,
+          "offline": false,
+          "firstUnix": 1793901966,
+          "lastUnix": 1794122578,
+          "patch": "blocked",
+          "row": "blocked",
+          "cord": false,
+          "gateUntil": null,
+          "lamp": "",
+          "alertId": null,
+          "rank": 1
+        },
+        {
+          "mac": "02:00:00:00:00:d8",
+          "ip": "192.0.2.216",
+          "tail": "·216",
+          "hostname": "",
+          "name": "",
+          "strip": [],
+          "known": true,
+          "isNew": false,
+          "offline": false,
+          "firstUnix": 1794120960,
+          "lastUnix": 1794122561,
+          "patch": "blocked",
+          "row": "blocked",
+          "cord": false,
+          "gateUntil": null,
+          "lamp": "",
+          "alertId": null,
+          "rank": 2
+        }
+      ],
+      "flipCount": 5,
+      "lamps": [
+        {
+          "kind": "threat",
+          "count": 0,
+          "tone": "",
+          "alertId": null
+        },
+        {
+          "kind": "new_device",
+          "count": 0,
+          "tone": "",
+          "alertId": null
+        },
+        {
+          "kind": "arp_spoof",
+          "count": 0,
+          "tone": "",
+          "alertId": null
+        },
+        {
+          "kind": "rebind",
+          "count": 0,
+          "tone": "",
+          "alertId": null
+        },
+        {
+          "kind": "lookups",
+          "count": 0,
+          "tone": "",
+          "alertId": null
+        }
+      ],
+      "calls": [],
+      "quietSince": 0
+    }
+  },
+  "error": ""
+}

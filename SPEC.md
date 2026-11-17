@@ -333,7 +333,40 @@ subtracts it from `today` and from each `history` bucket.
     "knownCount": 12,
     "pushedAt": 1794000001,
     "pushError": "",
-    "polledAt": 1794000005
+    "polledAt": 1794000005,
+    "exemptDefault": false,
+    "exemptDefaultOnPi": false,
+    "pinSet": true,
+    "devicesAt": 1794000004,
+    "bay": {
+      "jacks": [
+        { "mac": "02:00:00:00:00:07", "ip": "192.0.2.7", "tail": "·7", "hostname": "",
+          "name": "Printer", "strip": ["Printer"], "known": true, "isNew": false,
+          "offline": false, "firstUnix": 1794000000, "lastUnix": 1794000050,
+          "patch": "blocked|pass|always|fixed", "row": "blocked|pass", "cord": false,
+          "gateUntil": 1794000304, "lamp": "warn|high", "alertId": 7, "rank": 0 },
+        { "mac": "02:00:00:00:00:0f", "ip": "", "tail": ":0f", "hostname": "",
+          "name": "Old laptop", "strip": ["Old", "laptop"], "known": true, "isNew": false,
+          "offline": true, "firstUnix": 1793642400, "lastUnix": 0,
+          "patch": "blocked", "row": "blocked", "cord": false,
+          "gateUntil": null, "lamp": "", "alertId": null, "rank": 3 }
+      ],
+      "flipCount": 1,
+      "lamps": [
+        { "kind": "threat|new_device|arp_spoof|rebind|lookups", "count": 0, "tone": "|warn|high", "alertId": null },
+        { "kind": "new_device", "count": 1, "tone": "warn", "alertId": 7 },
+        { "kind": "arp_spoof", "count": 0, "tone": "", "alertId": null },
+        { "kind": "rebind", "count": 0, "tone": "", "alertId": null },
+        { "kind": "lookups", "count": 0, "tone": "", "alertId": null }
+      ],
+      "calls": [
+        { "id": 7, "key": "a1b2c3d400000007", "kind": "new_device", "lamp": "new_device",
+          "severity": "info|warn|high", "tone": "warn|high", "mac": "02:00:00:00:00:07",
+          "relatedMac": null, "subject": "02:00:00:00:00:07", "count": 1,
+          "firstUnix": 1794000000, "lastUnix": 1794000050 }
+      ],
+      "quietSince": 1794000050
+    }
   },
   "error": ""
 }
@@ -352,8 +385,10 @@ Field rules:
   line sent, at most 4 per second. While the panel is closed `pihole.probes`,
   `pihole.latencyMs` and `link.bitrateMbps` do not count, so a healthy closed
   probe produces only a heartbeat. `watchdog.polledAt` never counts, open or
-  closed, so a quiet watchdog poll is a heartbeat too. `open` always sends the
-  full state.
+  closed, so a quiet watchdog poll is a heartbeat too, and so does
+  `watchdog.devicesAt`, so a device read that finds the same devices is no news
+  (the gates' `gateUntil` stays put, see below). `open` always sends the full
+  state.
 - **`link.frequencyMhz`, `link.prefix`:** the active access point's channel
   frequency in MHz (`null` off Wi-Fi), and the IPv4 prefix length of `ip4`
   (`null` without an address); both straight from NetworkManager's D-Bus
@@ -495,6 +530,95 @@ Field rules:
   (`""` once one has worked). A failed push stays due.
 - **`watchdog.polledAt`:** the time of the last cycle the Pi answered (0 =
   none). It moves with every poll, so it is not a change (see above).
+- **`watchdog.exemptDefault`, `exemptDefaultOnPi`:** the exempt-by-default mode
+  ("normal wiring is ADS PASS": every device skips ad blocking but the ones on
+  the block list; threat blocking stays) on this PC, and on the Pi (`false`
+  when it does not say, and before the first device read). They can differ
+  while an edit is unpushed or the Pi has restarted. The panel's NORMAL key
+  shows this PC's.
+- **`watchdog.pinSet`:** a PIN for the Pi's screen is set on this PC (`qnet
+  watchdog pin set`); the hash itself is never in the state.
+- **`watchdog.devicesAt`:** the unix time of the device read that `devices` and
+  `bay.jacks` come from; 0 = none yet (the first read is made when the panel
+  opens), and again 0 when the Pi's devices are forgotten (a new Pi-hole
+  address, a watchdog that went away). It only says what the gates' times count
+  from, and is never a change.
+- **`watchdog.bay`:** the watchdog tab's board, worked out in Rust so that the
+  panel only draws it. With status `unconfigured` or `unknown` it is empty:
+  `jacks` and `calls` `[]`, `flipCount` 0, `quietSince` 0, and the five lamps
+  dark (`count` 0, `tone` `""`, `alertId` `null`). The data of earlier cycles
+  stays under `auth`, `tls` and `unreachable`; under `absent` there is no
+  device read, so there are no jacks.
+  - **`bay.jacks`:** one per device, at most 128 of the Pi's (the ones seen
+    last) plus this PC's offline entries (at most 128: the devices on this PC's
+    known, ADS PASS or block list that the Pi's inventory does not list, each
+    once, the ones with a cord first). An offline entry has `offline: true`,
+    `ip: ""`, `hostname: ""`, `lastUnix: 0` (this PC does not keep when it was
+    last seen), `firstUnix` the earliest first-seen time of its lists (0 if none
+    says), `known` whether it is on the known list, `isNew: false`, and no gate.
+    Order: by `rank`, then by IPv4 numerically, then the devices without an
+    IPv4 by MAC (so it is what the panel opens with; it keeps its own order
+    while the panel is open).
+  - **`ip`, `tail`:** `ip` is the first IPv4 the Pi heard it with, `""` for
+    none. `tail` heads its column: `·40` (the last number of the address) or
+    `:d8` (the last byte of the MAC) when there is no IPv4.
+  - **`name`, `strip`:** `name` is this PC's label, else the one the Pi was given
+    (`labelOnPi`), else `""`. `strip` is `name` as the two lines of eight
+    characters on a label strip: `[]` for no name, one line when it fits, else
+    broken at a joint (a space, after `-_./`, at a lower-case to upper-case change
+    or at a letter-to-digit change) at the most even break whose halves both fit
+    (`["Living","room TV"]`), else the longest first line that fits and the rest
+    cut short with an ellipsis (`["Streami…","stick"]`), else seven characters
+    and an ellipsis (`["Thermos…"]`). Counted in characters, not bytes.
+  - **`known`, `isNew`:** `known` is membership of this PC's known list; `isNew`
+    is neither this PC nor the Pi counting it as known.
+  - **`patch`, `row`, `cord`:** how the device is wired. `patch` is `always` for
+    the router and the Pi (never ADS PASS; `row` `blocked`), `fixed` when the
+    Pi's own configuration decides the device (`row` is `pass` when the Pi
+    passes it, `exemptOnPi`, else `blocked`; no edit changes it), else, with the
+    exempt-by-default mode off, `pass` for a device on this PC's ADS PASS list
+    and `blocked` for any other, and with the mode on `blocked` for a device on
+    the block list and `pass` for any other. `row` is the row the cord, the
+    normal wire or the rivet bar runs to (`blocked` or `pass`; equal to `patch`
+    but for `always` and `fixed`). `cord` is true when the device is off the
+    normal wiring: on the ADS PASS list with the mode off, on the block list
+    with it on; the other list is ignored. Open gates do not change `patch`.
+  - **`gateUntil`:** the unix time an open gate shuts (`devicesAt` plus the
+    seconds the Pi said were left), `null` while none is open. It is kept as
+    it was while later reads agree with it to within 2 s, so a device read that
+    changes nothing does not change it. A gate can be open on a jack that
+    passes anyway (opened before the mode was flipped); only a `blocked` jack is
+    given the gate's cord.
+  - **`lamp`, `alertId`:** the newest unacknowledged alert that rings this
+    jack (by `lastUnix`, then revision, then id): `alertId` is its `id` and
+    `lamp` its tone, `high` for severity `high` and `warn` for any other;
+    `""` and `null` for none. Which jack an alert rings: `new_device` rings the
+    jack whose MAC is its `subject`; `arp_spoof` rings none; any other kind rings
+    the jack that holds its `client` among its IPv4 addresses (when two devices
+    hold one address, the one seen last), and none when no jack does.
+  - **`rank`:** 0 for a jack with an alert ringing it or `isNew`, 1 for a
+    labelled one (`name` is not `""`), 2 for the rest, 3 for an offline one
+    (whatever else is true of it).
+  - **`bay.flipCount`:** how many jacks would get ADS PASS if the normal
+    wiring became ADS PASS: with the mode off, the jacks that are `blocked`
+    on the normal wire (`cord` false) with no open gate (it sees ads already);
+    offline ones count (they will when they come back), `always`, `fixed`,
+    cords and block-list entries do not. 0 when the mode is on already.
+  - **`bay.lamps`:** always five, in this order: `threat`, `new_device`,
+    `arp_spoof`, `rebind`, `lookups`. `count` is the calls of that kind waiting,
+    `tone` is `""` when there are none, `high` when any is high, else `warn`,
+    and `alertId` is the newest of them (`null` for none). `dga`, `tunnel`,
+    `beacon`, `burst` and any kind the panel does not know ring `lookups`.
+  - **`bay.calls`:** the alerts not acknowledged among `watchdog.alerts`
+    (so at most 50), newest `lastUnix` first (then revision, then id). `lamp`
+    is the lamp that rings for the kind, `severity` is the Pi's, `tone` is
+    `high` or `warn`. `mac` is the jack it rings, `null` for none: the call is
+    queued as "LAN" and rings its lamp only. `relatedMac` is set for an
+    `arp_spoof` only: the jack whose MAC is its `subject` (the second card
+    that answers for the router's address), `null` when no jack has it. The rest
+    is as in `alerts` (`subject` is text from the network).
+  - **`bay.quietSince`:** the newest `lastUnix` of any alert held, whether
+    acknowledged or not (among the 50); 0 when there is none.
 
 ## Actions
 
@@ -695,9 +819,16 @@ answer that does not parse is an error, never "absent".
      is adopted (see "Adopting what the panel did"), a revision that went back
      is a Pi that started again, and a `waiting` Pi with a non-empty PC list is
      pushed at once (the ADS PASS list, the policy, the labels and the PIN with
-     it). A failing devices read or push does not fail the cycle.
+     it). A failing devices read or push does not fail the cycle. The read's
+     time is kept (`devicesAt`); a gate whose shut time agrees to within 2 s
+     with the one of the last read keeps that time, so a read that changes
+     nothing is no news.
   7. Send the report to the main thread. The status is `ok` and `polledAt` is
-     now.
+     now. The report is built from the poller's memory and this PC's store as
+     it is then (as `knownCount` is): the mode, the PIN flag, the labels, the
+     lists, and the entries of the three lists that the Pi's whole inventory
+     (not the 128 shown) does not hold, which are what the state's `bay` is
+     worked out from.
 
   A failure that means no contact (auth, tls, unreachable) or an alerts
   answer that cannot be used ends the cycle with that status, and nothing is

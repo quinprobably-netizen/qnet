@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 
 use crate::pihole::{ApiError, Checked, Pihole};
 use crate::pinhash::PinHash;
-use crate::wdstore::{self, Store};
+use crate::wdstore::{self, Known, Store};
 
 /// The largest request body sent to the Pi: its cap is 4096 bytes, this
 /// leaves room for the headers' share of whatever the Pi counts.
@@ -979,6 +979,10 @@ pub enum Presence {
     Absent,
 }
 
+/// Seconds of difference in when a gate shuts that two reads of the Pi still
+/// count as the same gate (see [`Poller::steady_gates`]).
+const GATE_JITTER_S: u64 = 2;
+
 /// Alerts the report carries (the newest changes).
 pub const REPORT_ALERTS: usize = 50;
 /// Devices the report carries (the ones seen last).
@@ -1023,6 +1027,90 @@ pub fn annotate(devices: Vec<Device>, store: &Store) -> Vec<ReportDevice> {
         .collect()
 }
 
+/// Offline entries the report carries at most (see [`Unreported::merged`]).
+pub const REPORT_OFFLINE: usize = 128;
+
+/// One of this PC's three lists (known, ADS PASS, block): the entries whose
+/// address the Pi did not report. The `devices` verb shows each list as it is;
+/// the report merges them (see [`merged`](Self::merged)).
+#[derive(Debug, Clone, Default)]
+pub struct Unreported<'a> {
+    pub known: Vec<&'a Known>,
+    pub exempt: Vec<&'a Known>,
+    pub block: Vec<&'a Known>,
+}
+
+/// The entries of this PC's known, ADS PASS and block lists whose address is
+/// not in `reported` (the addresses of the Pi's whole inventory).
+pub fn unreported<'a>(store: &'a Store, reported: &HashSet<&str>) -> Unreported<'a> {
+    let missing = |list: &'a [Known]| -> Vec<&'a Known> {
+        list.iter()
+            .filter(|k| !reported.contains(k.mac.as_str()))
+            .collect()
+    };
+    Unreported {
+        known: missing(&store.known),
+        exempt: missing(&store.exempt),
+        block: missing(&store.block),
+    }
+}
+
+/// A device that only this PC knows: on its known, ADS PASS or block list, and
+/// not in the Pi's inventory (so offline, or not heard for long).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineEntry {
+    pub mac: String,
+    /// The label of the first list that has one (known, ADS PASS, block);
+    /// "" when none does.
+    pub label: String,
+    /// The earliest first-seen time of the lists that hold it (0 when none
+    /// says).
+    pub first_seen: u64,
+    pub known: bool,
+    pub exempt: bool,
+    pub block: bool,
+}
+
+impl Unreported<'_> {
+    /// One entry per address over the three lists, the devices with a cord
+    /// (ADS PASS or block list) before the ones that are only known, at most
+    /// [`REPORT_OFFLINE`] of them.
+    pub fn merged(&self) -> Vec<OfflineEntry> {
+        let mut out: Vec<OfflineEntry> = Vec::new();
+        let mut at: HashMap<&str, usize> = HashMap::new();
+        let lists = [(&self.exempt, 1u8), (&self.block, 2), (&self.known, 0)];
+        for (list, which) in lists {
+            for k in list {
+                let i = *at.entry(k.mac.as_str()).or_insert_with(|| {
+                    out.push(OfflineEntry {
+                        mac: k.mac.clone(),
+                        label: String::new(),
+                        first_seen: 0,
+                        known: false,
+                        exempt: false,
+                        block: false,
+                    });
+                    out.len() - 1
+                });
+                let e = &mut out[i];
+                match which {
+                    0 => e.known = true,
+                    1 => e.exempt = true,
+                    _ => e.block = true,
+                }
+                if e.label.is_empty() {
+                    e.label = k.label.clone().unwrap_or_default();
+                }
+                if k.first_seen > 0 && (e.first_seen == 0 || k.first_seen < e.first_seen) {
+                    e.first_seen = k.first_seen;
+                }
+            }
+        }
+        out.truncate(REPORT_OFFLINE);
+        out
+    }
+}
+
 /// What the API thread tells the main thread after a watchdog cycle: the
 /// final display data, so building the state costs nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1048,6 +1136,18 @@ pub struct WatchdogReport {
     pub push_error: String,
     /// Unix time of the last cycle the Pi answered (0 = never).
     pub polled_at: u64,
+    /// This PC's exempt-by-default mode.
+    pub exempt_default: bool,
+    /// The Pi's (false when it does not say, and before the first read).
+    pub exempt_default_on_pi: bool,
+    /// A panel PIN is set on this PC.
+    pub pin_set: bool,
+    /// Unix time of the device read that `devices` and `offline` come from
+    /// (0 = none yet).
+    pub devices_at: u64,
+    /// The entries of this PC's lists that the Pi's inventory does not hold;
+    /// empty before the first read.
+    pub offline: Vec<OfflineEntry>,
 }
 
 /// What one [`Poller::cycle`] produced.
@@ -1200,6 +1300,8 @@ pub struct Poller {
     /// The Pi's device `rev` as it was last read or answered: a revision that
     /// is lower later is a Pi that started again.
     dev_rev: Option<u64>,
+    /// Unix time of the device read that `inventory` comes from (0 = none).
+    devices_at: u64,
     /// The labels that were last pushed (by this poller): the labels are due
     /// again when the store's differ.
     labels_pushed: Option<Vec<(String, String)>>,
@@ -1238,6 +1340,7 @@ impl Poller {
             alerts_logins: None,
             sides: Default::default(),
             dev_rev: None,
+            devices_at: 0,
             labels_pushed: None,
             verdict_key: None,
             verdict_stale: false,
@@ -1277,10 +1380,16 @@ impl Poller {
         self.alerts_logins = None;
         self.cursor = 0;
         self.alerts.clear();
-        self.inventory = None;
+        self.drop_inventory();
         if self.presence == Presence::Absent {
             self.presence = Presence::Unknown;
         }
+    }
+
+    /// Forget the devices the Pi listed, and when they were read.
+    fn drop_inventory(&mut self) {
+        self.inventory = None;
+        self.devices_at = 0;
     }
 
     /// A cycle failed with `e`: the status says why, the data stays.
@@ -1300,7 +1409,7 @@ impl Poller {
         }
         self.alerts_logins = None;
         self.alerts.clear();
-        self.inventory = None;
+        self.drop_inventory();
         self.cursor = 0;
         self.rev = 0;
         self.suppressed = 0;
@@ -1422,11 +1531,13 @@ impl Poller {
         // 6.
         if with_devices {
             match get_devices(api) {
-                Ok(Qbp::Present(inv)) => {
+                Ok(Qbp::Present(mut inv)) => {
                     let waiting = inv.known_list == "waiting"
                         && !Store::load(store_path).known_macs().is_empty();
                     let went_back = self.adopt_seen(&inv, store_path, now);
+                    self.steady_gates(&mut inv, now);
                     self.inventory = Some(inv);
+                    self.devices_at = now;
                     if waiting || went_back {
                         self.push_due = true;
                         self.mark_restarted();
@@ -1443,6 +1554,30 @@ impl Poller {
             self.status = "ok";
         }
         Ok(notifications)
+    }
+
+    /// A gate that is open at the Pi keeps closing at the same moment, but its
+    /// seconds left are whole numbers read at a moment of ours that is a whole
+    /// number too, so the moment it shuts at (`devices_at` + seconds) differs
+    /// by a second between two reads. A shut time within [`GATE_JITTER_S`] of
+    /// the last one read for the same device is the same gate: its seconds are
+    /// set so that it shuts when it did, and a read that changes nothing
+    /// reports nothing new.
+    fn steady_gates(&self, inv: &mut Inventory, now: u64) {
+        let Some(old) = &self.inventory else { return };
+        let shuts: HashMap<&str, u64> = old
+            .devices
+            .iter()
+            .filter_map(|d| Some((d.mac.as_str(), self.devices_at + d.gate_left_secs?)))
+            .collect();
+        for d in &mut inv.devices {
+            let (Some(left), Some(&was)) = (d.gate_left_secs, shuts.get(d.mac.as_str())) else {
+                continue;
+            };
+            if was > now && was.abs_diff(now + left) <= GATE_JITTER_S {
+                d.gate_left_secs = Some(was - now);
+            }
+        }
     }
 
     /// A watchdog was seen: the store must not say "absent" for this Pi-hole
@@ -1484,7 +1619,7 @@ impl Poller {
     fn restart(&mut self, force_push: bool) {
         self.cursor = 0;
         self.alerts.clear();
-        self.inventory = None;
+        self.drop_inventory();
         // It may be newer software now: ask again for the ADS PASS list, the
         // policy, the labels and the PIN.
         for side in &mut self.sides {
@@ -1976,9 +2111,19 @@ impl Poller {
         alerts.truncate(REPORT_ALERTS);
         let unacked = self.alerts.values().filter(|a| !a.acked).count() as u64;
 
-        let (known_list, mut devices) = match &self.inventory {
-            Some(inv) => (inv.known_list.clone(), inv.devices.clone()),
-            None => (String::new(), Vec::new()),
+        let (known_list, mut devices, exempt_default_on_pi, offline) = match &self.inventory {
+            Some(inv) => {
+                // Offline is judged against everything the Pi listed, not the
+                // few the report carries.
+                let reported: HashSet<&str> = inv.devices.iter().map(|d| d.mac.as_str()).collect();
+                (
+                    inv.known_list.clone(),
+                    inv.devices.clone(),
+                    inv.exempt_default,
+                    unreported(store, &reported).merged(),
+                )
+            }
+            None => (String::new(), Vec::new(), false, Vec::new()),
         };
         // The Pi sends the one seen last first; do not rely on it.
         devices.sort_by_key(|d| std::cmp::Reverse(d.last_unix));
@@ -1997,6 +2142,11 @@ impl Poller {
             pushed_at: self.pushed_at,
             push_error: self.push_error(),
             polled_at: self.polled_at,
+            exempt_default: store.exempt_default,
+            exempt_default_on_pi,
+            pin_set: store.pin_hash.is_some(),
+            devices_at: self.devices_at,
+            offline,
         }
     }
 }
@@ -5805,6 +5955,184 @@ mod tests {
         assert_eq!(rig.pi.with(|s| s.conflicts), 0);
         assert_eq!(rig.pi_exempt(), [m(1), m(2)]);
         assert_eq!(rig.report().push_error, "");
+    }
+
+    // -- what the panel's bay needs of the report ---------------------------------
+
+    /// This PC's lists for the offline tests: the entries and what they are on.
+    fn lists() -> Store {
+        let mut s = Store::default();
+        s.know(&m(1), Some("Desk"), T0 + 1);
+        s.know(&m(4), Some("Old laptop"), T0 + 4);
+        s.know(&m(5), None, T0 + 5);
+        s.add_exempt(&m(4), Some("Old laptop"), T0 + 2);
+        s.add_exempt(&m(6), None, 0);
+        s.add_block(&m(7), Some("Tablet"), T0 + 7);
+        s.add_block(&m(5), Some("Cam"), T0 + 3);
+        s
+    }
+
+    #[test]
+    fn the_three_lists_merge_into_one_entry_per_address_without_the_reported_ones() {
+        let store = lists();
+        let one = m(1);
+        let reported: HashSet<&str> = [one.as_str()].into_iter().collect();
+        let missing = unreported(&store, &reported);
+        assert_eq!(missing.known.len(), 2, "·1 is reported");
+        assert_eq!((missing.exempt.len(), missing.block.len()), (2, 2));
+        let macs = |v: Vec<&Known>| v.iter().map(|k| k.mac.clone()).collect::<Vec<_>>();
+        assert_eq!(macs(missing.known.clone()), [m(4), m(5)]);
+
+        let merged = missing.merged();
+        // The devices with a cord first (ADS PASS, then block list), then the
+        // ones that are only known; each address once.
+        assert_eq!(
+            merged.iter().map(|e| e.mac.clone()).collect::<Vec<_>>(),
+            [m(4), m(6), m(7), m(5)]
+        );
+        let flags = |e: &OfflineEntry| (e.known, e.exempt, e.block);
+        assert_eq!(flags(&merged[0]), (true, true, false));
+        assert_eq!(flags(&merged[1]), (false, true, false));
+        assert_eq!(flags(&merged[2]), (false, false, true));
+        assert_eq!(flags(&merged[3]), (true, false, true));
+        // The label of the first list that has one; the earliest first-seen
+        // time that is set.
+        assert_eq!(merged[0].label, "Old laptop");
+        assert_eq!(merged[1].label, "");
+        assert_eq!(
+            merged[3].label, "Cam",
+            "known has none, the block list does"
+        );
+        assert_eq!(merged[0].first_seen, T0 + 2);
+        assert_eq!(merged[1].first_seen, 0, "none says");
+        assert_eq!(merged[3].first_seen, T0 + 3);
+    }
+
+    #[test]
+    fn at_most_so_many_offline_entries_go_in_the_report_the_ones_with_a_cord_first() {
+        let mut store = Store::default();
+        for n in 1..=REPORT_OFFLINE + 20 {
+            store.know(&m(n), None, T0);
+        }
+        store.add_block(&m(REPORT_OFFLINE + 20), None, T0);
+        let merged = unreported(&store, &HashSet::new()).merged();
+        assert_eq!(merged.len(), REPORT_OFFLINE);
+        assert_eq!(merged[0].mac, m(REPORT_OFFLINE + 20), "the cord is kept");
+    }
+
+    #[test]
+    fn a_report_before_any_device_read_has_no_devices_no_offline_and_no_read_time() {
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            s.know(&m(9), Some("Gone"), T0);
+            s.set_exempt_default(true);
+            s.set_pin(crate::pinhash::hash_with_salt("1234", [3; 16]).unwrap());
+        });
+        rig.cycle(T0 + 1);
+        let r = rig.report();
+        assert_eq!((r.devices.len(), r.devices_at), (0, 0));
+        assert!(r.offline.is_empty(), "nothing to be offline from");
+        assert!(r.exempt_default && r.pin_set, "this PC's facts are there");
+        assert!(!r.exempt_default_on_pi);
+    }
+
+    #[test]
+    fn a_device_read_gives_the_report_the_modes_the_pin_the_read_time_and_the_offline_entries() {
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            s.know(&m(1), Some("Desk"), T0);
+            s.know(&m(9), Some("Gone"), T0 + 5);
+            s.add_exempt(&m(10), None, T0 + 6);
+            s.set_pin(crate::pinhash::hash_with_salt("1234", [3; 16]).unwrap());
+        });
+        rig.cycle_with_devices(T0 + 1);
+        let r = rig.report();
+        assert_eq!(r.devices_at, T0 + 1);
+        assert_eq!(r.devices.len(), 3);
+        assert!(r.pin_set && !r.exempt_default && !r.exempt_default_on_pi);
+        assert_eq!(
+            r.offline.iter().map(|e| e.mac.clone()).collect::<Vec<_>>(),
+            [m(10), m(9)]
+        );
+        assert_eq!(r.offline[1].label, "Gone");
+
+        // The mode, on this PC and then on the Pi it was pushed to.
+        rig.edit(|s| {
+            s.set_exempt_default(true);
+        });
+        rig.cycle_with_devices(T0 + 2);
+        let r = rig.report();
+        assert_eq!(r.devices_at, T0 + 2, "the read time moves with the read");
+        assert!(r.exempt_default && r.exempt_default_on_pi);
+
+        // A cycle that reads no devices keeps the last read and its time.
+        rig.cycle(T0 + 3);
+        let r = rig.report();
+        assert_eq!(
+            (r.devices_at, r.devices.len(), r.polled_at),
+            (T0 + 2, 3, T0 + 3)
+        );
+        // The Pi forgetting its watchdog drops the read.
+        rig.poller.client_replaced();
+        assert_eq!(rig.report().devices_at, 0);
+    }
+
+    #[test]
+    fn offline_is_judged_against_every_device_the_pi_listed_not_the_128_in_the_report() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| {
+            s.devices = (1..=200)
+                .map(|i| (m(i), format!("192.0.2.{}", i % 250)))
+                .collect();
+        });
+        rig.edit(|s| {
+            for n in 1..=200 {
+                s.know(&m(n), None, T0);
+            }
+            s.know(&m(900), Some("Gone"), T0);
+        });
+        rig.cycle_with_devices(T0 + 1);
+        let r = rig.report();
+        assert_eq!(r.devices.len(), REPORT_DEVICES);
+        assert_eq!(
+            r.offline.iter().map(|e| e.mac.clone()).collect::<Vec<_>>(),
+            [m(900)],
+            "the 72 devices the report cut are not offline"
+        );
+    }
+
+    #[test]
+    fn a_read_that_finds_the_same_gate_a_second_off_does_not_move_when_it_shuts() {
+        let mut rig = Rig::new();
+        rig.cycle_with_devices(T0);
+        rig.pi.panel_gate(&m(2), 300);
+        rig.cycle_with_devices(T0 + 10);
+        let shuts = |rig: &Rig| {
+            let r = rig.report();
+            let d = r.devices.iter().find(|d| d.device.mac == m(2)).unwrap();
+            d.device.gate_left_secs.map(|left| r.devices_at + left)
+        };
+        assert_eq!(shuts(&rig), Some(T0 + 310));
+
+        // Sixty seconds on the Pi says 240, 239 or 241: the same gate.
+        for (now, left) in [(T0 + 70, 240), (T0 + 130, 179), (T0 + 190, 121)] {
+            rig.pi.with(|s| s.gates = vec![(m(2), left)]);
+            rig.cycle_with_devices(now);
+            assert_eq!(
+                shuts(&rig),
+                Some(T0 + 310),
+                "read at {now} with {left} left"
+            );
+            assert_eq!(rig.report().devices_at, now);
+        }
+        // A gate that really moved (opened again for an hour) is a new one.
+        rig.pi.with(|s| s.gates = vec![(m(2), 3600)]);
+        rig.cycle_with_devices(T0 + 250);
+        assert_eq!(shuts(&rig), Some(T0 + 250 + 3600));
+        // And one that shut and opened for another device is not mixed up.
+        rig.pi.with(|s| s.gates = vec![(m(3), 100)]);
+        rig.cycle_with_devices(T0 + 260);
+        assert_eq!(shuts(&rig), None);
     }
 
     #[test]
