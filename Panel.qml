@@ -82,6 +82,7 @@ Panel {
   // A word the model names by key ({ key, args }, as Model.jackReadout's
   // `how`), in the catalog's words.
   function say(w) {
+    if (w.key === "") return w.text === undefined ? "" : String(w.text)
     var s = strings.t(w.key)
     for (var i = 0; i < w.args.length; i++) s = s.replace("%" + (i + 1), w.args[i])
     return s
@@ -207,6 +208,13 @@ Panel {
     return Qt.locale(Commons.I18n.formatLocale).toString(new Date(sec * 1000), "HH:mm")
   }
 
+  // The watchdog tab's clock for Model's words: "14:02", "2 Nov", "Mon 09:14".
+  readonly property var timeFmt: ({
+    clock: function(sec) { return root.formatClock(sec) },
+    date: function(sec) { return Qt.locale(Commons.I18n.formatLocale).toString(new Date(sec * 1000), "d MMM") },
+    stamp: function(sec) { return Qt.locale(Commons.I18n.formatLocale).toString(new Date(sec * 1000), "ddd HH:mm") }
+  })
+
   // The DNS view's failover line.
   readonly property var failoverData: Model.failoverInfo(view)
   readonly property bool failoverActive: failoverData.state === "active"
@@ -241,7 +249,7 @@ Panel {
   // short screen.
   readonly property int listRows: Math.max(3, Math.min(8, Math.floor((panel.availableCardHeight - Style.space(360)) / Style.space(36))))
 
-  Timer { id: noteTimer; interval: 7000; onTriggered: { root.dnsNote = ({ tone: "", text: "" }); root.netNote = ""; root.netFail = ({ id: "", text: "" }); root.wdNote = "" } }
+  Timer { id: noteTimer; interval: 7000; onTriggered: { root.dnsNote = ({ tone: "", text: "" }); root.netNote = ""; root.netFail = ({ id: "", text: "" }); root.wdNote = ""; root.wdPinNote = "" } }
   Timer { id: armTimer; interval: 4000; onTriggered: root.armedUuid = "" }
   Timer { id: copiedTimer; interval: 1300; onTriggered: root.copied = false }
 
@@ -428,9 +436,9 @@ Panel {
     if (step === "disarm") disarmForget()
     else if (step === "confirm") confirmCancel()
     else if (step === "password") cancelPassword()
-    else if (step === "pin") wdPinOpen = false
+    else if (step === "pin") wdClosePin()
     else if (step === "flip") wdFlip = false
-    else if (step === "ticket") wdTicket = null
+    else if (step === "ticket") wdSetTicket(null)
     else if (step === "back") goBack()
     else close()
   }
@@ -643,12 +651,34 @@ Panel {
   //   wdFlip      the NORMAL confirm is open
   //   wdPinOpen   the PIN field is open
   //   wdNote      an inline note (a failed action), cleared by noteTimer
+  //   wdPinNote   the same, in the PIN footer
+  //   wdRunning   actions of the tab that have not answered yet; wdSettling is
+  //               the moment after one succeeded, until the next state shows
+  //               what it did: wdBusy (either) keeps a ticket's buttons from
+  //               running twice
+  //   wdEditing   a text field of the tab (the label, the PIN) has the keys
   property var wdOrder: []
   property int wdScroll: 0
   property var wdTicket: null
   property bool wdFlip: false
   property bool wdPinOpen: false
   property string wdNote: ""
+  property string wdPinNote: ""
+  property int wdRunning: 0
+  property bool wdSettling: false
+  property bool wdLabelFocus: false
+  property bool wdPinFocus: false
+  readonly property bool wdEditing: wdLabelFocus || wdPinFocus
+  readonly property bool wdBusy: wdRunning > 0 || wdSettling
+
+  // A ticket is closing or changing: the label field, if it holds an edit,
+  // sends it now. The PIN footer's Set was pressed from the keyboard: the PIN
+  // field submits. The label row got Enter: the label field takes the keys.
+  signal wdCommitRequested()
+  signal wdPinSubmitRequested()
+  signal wdLabelFocusRequested()
+
+  Timer { id: wdSettleTimer; interval: 1500; onTriggered: root.wdSettling = false }
 
   // The jack the open ticket belongs to ("" for none, or for a call that
   // rings no jack: the ARP spoof's).
@@ -676,6 +706,9 @@ Panel {
     wdFlip = false
     wdPinOpen = false
     wdNote = ""
+    wdPinNote = ""
+    wdLabelFocus = false
+    wdPinFocus = false
   }
 
   // Entering the tab: the order is the jacks' own (alerting and new first,
@@ -692,7 +725,20 @@ Panel {
     if (page !== "watchdog") return
     var next = Model.holdOrder(wdOrder, rawState.watchdog.bay.jacks)
     if (next.join(",") !== wdOrder.join(",")) wdOrder = next
-    if (wdTicket !== null && wdTicket.kind === "alert" && Model.callOf(rawState, wdTicket.alertId) === null) wdTicket = null
+    if (wdTicket !== null && wdTicket.kind === "alert" && Model.callOf(rawState, wdTicket.alertId) === null) wdSetTicket(null)
+    if (wdTicket !== null && wdTicket.kind === "device" && Model.jackOf(rawState, wdTicket.mac) === null) wdSetTicket(null)
+  }
+
+  // Open, switch or close the ticket. An edit in the label field is sent
+  // first (a ticket going away ends the field's focus).
+  function wdSetTicket(ticket) {
+    wdCommitRequested()
+    wdTicket = ticket
+    // a label field that goes away with its ticket takes its focus with it
+    if (ticket === null || ticket.kind !== "device") {
+      wdLabelFocus = false
+      wdReturnFocus()
+    }
   }
 
   // Which bay is in view after a ticket for `mac` opens: its own, which stays
@@ -705,9 +751,17 @@ Panel {
   function wdToggleDevice(mac) {
     if (typeof mac !== "string" || mac === "") return
     wdFlip = false
-    if (wdTicket !== null && wdTicket.kind === "device" && wdTicket.mac === mac) { wdTicket = null; return }
+    if (wdTicket !== null && wdTicket.kind === "device" && wdTicket.mac === mac) { wdSetTicket(null); return }
     wdSeat(mac)
-    wdTicket = ({ kind: "device", mac: mac })
+    wdSetTicket({ kind: "device", mac: mac })
+  }
+
+  // "Open device ›" on an alert's ticket: that jack's ticket, whatever is open.
+  function wdOpenDevice(mac) {
+    if (typeof mac !== "string" || mac === "" || Model.jackOf(view, mac) === null) return
+    wdFlip = false
+    wdSeat(mac)
+    wdSetTicket({ kind: "device", mac: mac })
   }
 
   // A click or Enter on a lit drop lamp, a lit window of the lamp row or a
@@ -715,11 +769,11 @@ Panel {
   function wdOpenAlert(alertId) {
     if (typeof alertId !== "number") return
     wdFlip = false
-    if (wdTicket !== null && wdTicket.kind === "alert" && wdTicket.alertId === alertId) { wdTicket = null; return }
+    if (wdTicket !== null && wdTicket.kind === "alert" && wdTicket.alertId === alertId) { wdSetTicket(null); return }
     var call = Model.callOf(view, alertId)
     if (call === null) return
     if (call.mac !== null) wdSeat(call.mac)
-    wdTicket = ({ kind: "alert", alertId: alertId })
+    wdSetTicket({ kind: "alert", alertId: alertId })
   }
 
   // A lit window of the lamp row opens its kind's newest call.
@@ -764,30 +818,172 @@ Panel {
 
   // One `qnet watchdog <verb>` (Model.argvWatchdog builds it). When it
   // succeeds the watcher is told to read the devices again so the board shows
-  // the edit at once; when it fails the board says why, inline.
-  function wdAction(verb, args, done) {
+  // the edit at once; when it fails the board says why, inline. One at a time:
+  // while one runs, and for a moment after it succeeded (until the state has
+  // had its turn), no other starts, so a ticket's buttons cannot run twice.
+  // opts: { secret } goes to the child's stdin (the PIN), { chain } lets an
+  // action that follows another one start inside that moment, { silent }
+  // leaves the note to `done`.
+  function wdAction(verb, args, done, opts) {
+    var o = opts || {}
+    if (wdRunning > 0 || (wdSettling && o.chain !== true)) return false
     var argv = Model.argvWatchdog(bin, verb, args)
     if (!argv) return false
     wdNote = ""
-    return runCli(argv, {}, function(res) {
-      if (res.ok) QnetService.send("devices")
-      else {
+    wdRunning++
+    var started = runCli(argv, o, function(res) {
+      wdRunning = Math.max(0, wdRunning - 1)
+      if (res.ok) {
+        QnetService.send("devices")
+        wdSettling = true
+        wdSettleTimer.restart()
+      } else if (o.silent !== true) {
         var words = failureText(Model.failure(res))
         if (words !== "") setWdNote(words)
       }
       if (typeof done === "function") done(res)
     })
+    if (!started) wdRunning = Math.max(0, wdRunning - 1)
+    return started
+  }
+
+  // The queue's Dismiss all, a ticket's Dismiss (both clear the Pi's screen).
+  function wdDismissAll() {
+    if (view.watchdog.bay.calls.length === 0) return
+    wdAction("ack-all", [], function(res) {
+      if (res.ok && wdTicket !== null && wdTicket.kind === "alert") wdSetTicket(null)
+    })
+  }
+
+  function wdDismiss(alertId) {
+    wdAction("ack", [alertId], function(res) {
+      if (res.ok && wdTicket !== null && wdTicket.kind === "alert" && wdTicket.alertId === alertId) wdSetTicket(null)
+    })
+  }
+
+  // Mark known puts the jack on this PC's list and settles the calls that
+  // said it was new (the Pi would otherwise keep ringing them).
+  function wdKnow(mac) {
+    var calls = Model.newDeviceCalls(view, mac)
+    wdAction("know", [mac], function(res) { if (res.ok) wdAckEach(calls) })
+  }
+
+  function wdAckEach(ids) {
+    if (ids.length === 0) return
+    wdAction("ack", [ids[0]], function(res) { if (res.ok) wdAckEach(ids.slice(1)) }, { chain: true })
+  }
+
+  // The patch row: the cord of the open ticket's jack (patch is blocked or pass).
+  function wdPatch(mac, want) {
+    var jack = Model.jackOf(view, mac)
+    if (!jack || !Model.patchWanted(jack, want, nowMs / 1000)) return
+    wdAction("patch", [mac, want])
+  }
+
+  // The gate row: secs 0 shuts it, 300, 1800 or 3600 opens it.
+  function wdGate(mac, secs) { wdAction("gate", [mac, secs]) }
+
+  // The label field's edit, as typed. done(ok) lets the field fall back to the
+  // jack's name when it failed.
+  function wdLabel(mac, text, done) {
+    return wdAction("label", [mac, text], function(res) { if (typeof done === "function") done(res.ok) })
+  }
+
+  // The PIN footer. Set and Change open the field (it takes the keys); the
+  // field's text goes to `pin set` as the runner's stdin and nowhere else.
+  function wdOpenPin() {
+    wdPinNote = ""
+    wdPinOpen = true
+  }
+
+  function wdClosePin() {
+    wdPinOpen = false
+    wdPinNote = ""
+    wdPinFocus = false
+    wdReturnFocus()
+  }
+
+  // Called with the PIN field: the digits are read, the field cleared in the
+  // same breath, and they are not kept (the passphrase's way: submitPassword).
+  function wdSubmitPin(field) {
+    var pin = field.text
+    field.text = ""
+    if (!Model.validPin(pin)) {
+      pin = ""
+      wdPinNote = strings.t("wd.pin.four")
+      noteTimer.restart()
+      return
+    }
+    var started = wdAction("pin", ["set"], function(res) {
+      secretRun = null
+      if (res.ok) wdClosePin()
+      else {
+        wdPinNote = failureText(Model.failure(res))
+        noteTimer.restart()
+      }
+    }, { secret: pin, silent: true })
+    pin = ""
+    if (!started) {
+      wdPinNote = strings.t("err.busy")
+      noteTimer.restart()
+    }
+  }
+
+  // A text field of the tab ("label" or "pin") took the keys, or let them go.
+  function wdFieldFocus(which, on) {
+    if (which === "pin") wdPinFocus = on
+    else wdLabelFocus = on
+    if (!on) wdReturnFocus()
+  }
+
+  // The keys go back to the key gate (a field is done with them).
+  function wdReturnFocus() {
+    Qt.callLater(function() { if (root.opened && root.passwordFor === "" && !root.wdEditing) keyGate.forceActiveFocus() })
   }
 
   // Enter on a stop of the watchdog view (the back button is handled above).
-  // TODO(T5b): queue (dismissall), call:ID (open its ticket), label, patch,
-  // gate, tactions and pin rows; their actions go through wdAction.
+  // Each row's items are named in Model.focusRows.
   function wdActivate(id, item) {
+    var mac = wdTicketMac
     if (id === "lamps") wdOpenLamp(item)
     else if (id.indexOf("bay:") === 0) wdToggleDevice(item)
     else if (id === "normal") wdPressKey()
     else if (id === "flip") { if (item === "flip") wdConfirmFlip(); else wdCancelFlip() }
     else if (id === "pager") wdPage(item === "up" ? -1 : 1)
+    else if (id === "queue") wdDismissAll()
+    else if (id.indexOf("call:") === 0) wdOpenAlert(parseInt(id.substring(5), 10))
+    else if (id === "label") wdLabelFocusRequested()
+    else if (id === "patch") wdPatch(mac, item)
+    else if (id === "gate") wdGate(mac, item === "shut" ? 0 : parseInt(item, 10))
+    else if (id === "tactions") wdTicketAction(item)
+    else if (id === "pin") wdPinAction(item)
+  }
+
+  // The buttons under a ticket. Both tickets name theirs in Model
+  // (deviceActions, alertActions).
+  function wdTicketAction(item) {
+    if (wdTicket === null) return
+    if (item === "close") { wdSetTicket(null); return }
+    if (wdTicket.kind === "device") {
+      if (item === "know") wdKnow(wdTicket.mac)
+      else if (item === "forget") wdAction("forget", [wdTicket.mac])
+      return
+    }
+    var call = Model.callOf(view, wdTicket.alertId)
+    if (call === null) return
+    if (item === "dismiss") wdDismiss(call.id)
+    else if (item === "know" && call.mac !== null) wdKnow(call.mac)
+    else if (item === "open") {
+      var target = Model.alertOpenTarget(view, call)
+      if (target !== null) wdOpenDevice(target.mac)
+    }
+  }
+
+  function wdPinAction(item) {
+    if (item === "clear") wdAction("pin", ["clear"])
+    else if (item === "cancel") wdClosePin()
+    else if (item === "set" && wdPinOpen) wdPinSubmitRequested()
+    else wdOpenPin()
   }
 
   // -- Wi-Fi
@@ -1062,8 +1258,9 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      // The passphrase field owns the keys while its row is open.
-      blocked: root.passwordFor !== ""
+      // The passphrase field owns the keys while its row is open, and so do
+      // the watchdog's label and PIN fields while one of them has the focus.
+      blocked: root.passwordFor !== "" || root.wdEditing
       Component.onCompleted: root.panelCard = root.findPanelCard(keyCatcher)
 
       onMoveRequested: function(dx, dy) {
@@ -1099,14 +1296,14 @@ Panel {
       // Holds the keyboard focus: sees every key before the catcher (its
       // parent) and lets it through, noting whether it is an auto-repeat. It
       // takes the focus back if a control under the pointer took it, except
-      // while the passphrase field has it.
+      // while the passphrase field, or a field of the watchdog tab, has it.
       Item {
         id: keyGate
         focus: true
         Keys.onPressed: function(event) { root.noteKey(event); event.accepted = false }
         onActiveFocusChanged: if (!activeFocus) Qt.callLater(keyGate.retakeFocus)
         function retakeFocus() {
-          if (root.opened && root.passwordFor === "" && keyGate.Window.active && !keyGate.activeFocus) keyGate.forceActiveFocus()
+          if (root.opened && root.passwordFor === "" && !root.wdEditing && keyGate.Window.active && !keyGate.activeFocus) keyGate.forceActiveFocus()
         }
       }
 

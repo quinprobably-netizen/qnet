@@ -750,27 +750,27 @@ test("device ticket: an offline jack has no gate (the Pi has none for it); an un
   assert.deepEqual(ids(gone).slice(0, 3), ["back", "lamps", "bay:0"])
 })
 
-test("alert ticket: dismiss, Mark known for a new device, Open for a jack, close", () => {
+test("alert ticket: dismiss, Mark known for a new device, Open for a jack (no Close: Esc and the call's row do that)", () => {
   const v = view("watchdog-rest")
   const newDev = rowsOf(v, { ticket: { kind: "alert", mac: null, alertId: 2 } })
   assert.deepEqual(ids(newDev).slice(-2), ["tactions", "pin"])
-  assert.deepEqual(row(newDev, "tactions").items, ["dismiss", "know", "open", "close"])
+  assert.deepEqual(row(newDev, "tactions").items, ["dismiss", "know", "open"])
   const threat = rowsOf(v, { ticket: { kind: "alert", mac: null, alertId: 1 } })
-  assert.deepEqual(row(threat, "tactions").items, ["dismiss", "open", "close"])
+  assert.deepEqual(row(threat, "tactions").items, ["dismiss", "open"])
   const arp = rowsOf(view("watchdog-arp"), { ticket: { kind: "alert", mac: null, alertId: 3 } })
-  assert.deepEqual(row(arp, "tactions").items, ["dismiss", "open", "close"], "open the second card's jack")
+  assert.deepEqual(row(arp, "tactions").items, ["dismiss", "open"], "open the second card's jack")
   assert.equal(ids(arp).includes("label"), false)
   // a device already known is not offered again
   const known = edited("rest", (r) => { for (const j of r.watchdog.bay.jacks) if (j.mac === mac(216)) j.known = true })
-  assert.deepEqual(row(rowsOf(known, { ticket: { kind: "alert", mac: null, alertId: 2 } }), "tactions").items, ["dismiss", "open", "close"])
-  // an alert that rings no jack and names none: dismiss and close
+  assert.deepEqual(row(rowsOf(known, { ticket: { kind: "alert", mac: null, alertId: 2 } }), "tactions").items, ["dismiss", "open"])
+  // an alert that rings no jack and names none: dismiss alone
   const lan = edited("rest", (r) => { r.watchdog.bay.calls[0].mac = null })
-  assert.deepEqual(row(rowsOf(lan, { ticket: { kind: "alert", mac: null, alertId: 1 } }), "tactions").items, ["dismiss", "close"])
+  assert.deepEqual(row(rowsOf(lan, { ticket: { kind: "alert", mac: null, alertId: 1 } }), "tactions").items, ["dismiss"])
   const lanNew = edited("rest", (r) => { r.watchdog.bay.calls[1].mac = null })
-  assert.deepEqual(row(rowsOf(lanNew, { ticket: { kind: "alert", mac: null, alertId: 2 } }), "tactions").items, ["dismiss", "close"])
-  // an alert that is gone: Close alone
-  assert.deepEqual(row(rowsOf(v, { ticket: { kind: "alert", mac: null, alertId: 99 } }), "tactions").items, ["close"])
-  assert.deepEqual(row(rowsOf(v, { ticket: { kind: "alert", mac: null, alertId: null } }), "tactions").items, ["close"])
+  assert.deepEqual(row(rowsOf(lanNew, { ticket: { kind: "alert", mac: null, alertId: 2 } }), "tactions").items, ["dismiss"])
+  // an alert that is gone has no buttons (its ticket closes with the next state)
+  assert.equal(row(rowsOf(v, { ticket: { kind: "alert", mac: null, alertId: 99 } }), "tactions"), undefined)
+  assert.equal(row(rowsOf(v, { ticket: { kind: "alert", mac: null, alertId: null } }), "tactions"), undefined)
 })
 
 test("rows with no layout in the ctx work it out from the order, or from the jacks", () => {
@@ -895,4 +895,230 @@ test("jackOf and callOf find a jack by its mac and a call by its id", () => {
   assert.equal(Model.jackOf(v, "02:00:00:00:ff:ff"), null)
   assert.equal(Model.callOf(v, 1).kind, "threat")
   assert.equal(Model.callOf(v, 99), null)
+})
+
+// ---- the queue and the tickets: Model's words ---------------------------------
+
+const FMT = { clock: (s) => "C" + (s - NOW_S), date: (s) => "D" + (s - NOW_S), stamp: (s) => "S" + (s - NOW_S) }
+const say = (w) => (w === null ? null : w.key === "" ? w.text : w.key + (w.args.length ? "(" + w.args.join("|") + ")" : ""))
+const callIn = (v, id) => Model.callOf(v, id)
+
+test("a call's title is the Pi's word for its kind, in capitals; an unknown kind is spelt out", () => {
+  const titles = { threat: "wd.call.threat", new_device: "wd.call.newDevice", arp_spoof: "wd.call.arpSpoof", rebind: "wd.call.rebind", dga: "wd.call.dga", tunnel: "wd.call.tunnel", beacon: "wd.call.beacon", burst: "wd.call.burst" }
+  for (const [kind, key] of Object.entries(titles)) assert.equal(Model.callTitle({ kind }).key, key, kind)
+  assert.deepEqual(say(Model.callTitle({ kind: "odd_thing" })), "ODD THING")
+  const cat = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "i18n", "en.json"), "utf8"))
+  assert.equal(cat["wd.call.threat"], "THREAT BLOCKED")
+  assert.equal(cat["wd.call.newDevice"], "NEW DEVICE")
+  assert.equal(cat["wd.call.arpSpoof"], "ARP SPOOF")
+  assert.equal(cat["wd.call.rebind"], "REBIND")
+})
+
+test("a call's brief: the subject and ×n, nothing for a new device, the address for the ARP spoof", () => {
+  const v = view("watchdog-arp")
+  assert.equal(say(Model.callBrief(v, callIn(v, 1))), "malware.example.org ×3")
+  assert.equal(Model.callBrief(v, callIn(v, 2)), null, "a new device: its jack says it")
+  assert.equal(say(Model.callBrief(v, callIn(v, 3))), "wd.brief.arp(192.0.2.1)")
+  const once = edited("rest", (r) => { r.watchdog.bay.calls[0].count = 1 })
+  assert.equal(say(Model.callBrief(once, callIn(once, 1))), "malware.example.org")
+  const none = edited("rest", (r) => { r.watchdog.bay.calls[0].count = 1; r.watchdog.bay.calls[0].subject = "  " })
+  assert.equal(Model.callBrief(none, callIn(none, 1)), null)
+  const noAlert = edited("arp", (r) => { r.watchdog.alerts = [] })
+  assert.equal(say(Model.callBrief(noAlert, callIn(noAlert, 3))), "wd.brief.arpPlain", "no address to name")
+  assert.equal(Model.callBrief(v, null), null)
+})
+
+test("the jack's name in the queue: its name, else its tail, else LAN", () => {
+  const v = view("watchdog-arp")
+  assert.equal(say(Model.callJackName(v, callIn(v, 1))), "Living room TV")
+  assert.equal(say(Model.callJackName(v, callIn(v, 2))), "·216")
+  assert.equal(say(Model.callJackName(v, callIn(v, 3))), "wd.queue.lan")
+  assert.equal(say(Model.callJackName(v, null)), "wd.queue.lan")
+})
+
+test("who an alert is about: asked by, joined as, the client that is no jack, or no line to ring", () => {
+  const v = view("watchdog-arp")
+  assert.equal(say(Model.callWho(v, callIn(v, 1))), "wd.who.asked(Living room TV|192.0.2.40)")
+  assert.equal(say(Model.callWho(v, callIn(v, 2))), "wd.who.joined(·216|192.0.2.216)")
+  assert.equal(say(Model.callWho(v, callIn(v, 3))), "wd.who.none")
+  const noIp = edited("rest", (r) => { for (const j of r.watchdog.bay.jacks) if (j.tail === "·40" || j.mac === mac(216)) j.ip = "" })
+  assert.equal(say(Model.callWho(noIp, callIn(noIp, 1))), "wd.who.askedNoIp(Living room TV)")
+  assert.equal(say(Model.callWho(noIp, callIn(noIp, 2))), "wd.who.joinedNoIp(·216)")
+  // a client that is no device on the board says who it is
+  const stranger = edited("rest", (r) => { r.watchdog.bay.calls[0].mac = null; for (const al of r.watchdog.alerts) if (al.kind === "threat") al.client = "192.0.2.77" })
+  const a = stranger.watchdog.alerts.find((x) => x.kind === "threat")
+  assert.equal(say(Model.callWho(stranger, callIn(stranger, a.id))), "wd.who.client(192.0.2.77)")
+  assert.equal(say(Model.callWho(v, null)), "wd.who.none")
+})
+
+test("the head of an alert ticket: severity, ×n and the times", () => {
+  const v = view("watchdog-arp")
+  assert.deepEqual(Model.callMeta(callIn(v, 1), FMT).map(say), ["wd.sev.high", "×3", "C-720 – C-480"])
+  assert.deepEqual(Model.callMeta(callIn(v, 2), FMT).map(say), ["wd.sev.warn", "×1", "C-1740"], "one time when first and last read the same")
+  assert.deepEqual(Model.callMeta(callIn(v, 3), FMT).map(say), ["wd.sev.high", "×12", "C-180 – C-60"])
+})
+
+test("the sentences of an alert ticket: one a kind, the ARP spoof names the two cards and the second one's jack", () => {
+  const v = view("watchdog-arp")
+  assert.deepEqual(Model.callWhy(v, callIn(v, 1), FMT).map(say), ["wd.why.threatMany(3)"])
+  assert.deepEqual(Model.callWhy(v, callIn(v, 2), FMT).map(say), ["wd.why.newDevice"])
+  assert.deepEqual(Model.callWhy(v, callIn(v, 3), FMT).map(say), [
+    "wd.why.arpTwo(…:01|…:d8)", "wd.why.arpJackAt(·216|C-1740)", "wd.why.arpRisk"
+  ])
+  const once = edited("rest", (r) => { r.watchdog.bay.calls[0].count = 1 })
+  assert.deepEqual(Model.callWhy(once, callIn(once, 1), FMT).map(say), ["wd.why.threat"])
+  for (const [kind, key] of [["rebind", "rebind"], ["dga", "dga"], ["tunnel", "tunnel"], ["beacon", "beacon"], ["burst", "burst"], ["odd_thing", "other"]]) {
+    const k = edited("rest", (r) => { r.watchdog.bay.calls[0].kind = kind })
+    assert.deepEqual(Model.callWhy(k, callIn(k, 1), FMT).map(say), ["wd.why." + key], kind)
+  }
+  // a second card that is no jack, a router that is none, a jack that joined days ago, or with no time
+  const noJack = edited("arp", (r) => { r.watchdog.bay.calls[0].relatedMac = null; r.watchdog.bay.jacks = r.watchdog.bay.jacks.filter((j) => j.mac !== mac(216)) })
+  assert.deepEqual(Model.callWhy(noJack, callIn(noJack, 3), FMT).map(say), ["wd.why.arpTwo(…:01|…:d8)", "wd.why.arpRisk"], "the subject is still the second card")
+  const noRouter = edited("arp", (r) => { r.watchdog.alerts[0].client = "192.0.2.99" })
+  assert.equal(say(Model.callWhy(noRouter, callIn(noRouter, 3), FMT)[0]), "wd.why.arpSecond(…:d8)")
+  const plain = edited("arp", (r) => { r.watchdog.bay.calls[0].subject = "not a mac"; r.watchdog.bay.calls[0].relatedMac = null })
+  assert.equal(say(Model.callWhy(plain, callIn(plain, 3), FMT)[0]), "wd.why.arpPlain")
+  const old = edited("arp", (r) => { for (const j of r.watchdog.bay.jacks) if (j.mac === mac(216)) j.firstUnix = NOW_S - 5 * 86400 })
+  assert.equal(say(Model.callWhy(old, callIn(old, 3), FMT)[1]), "wd.why.arpJackOn(·216|D-432000)")
+  const undated = edited("arp", (r) => { for (const j of r.watchdog.bay.jacks) if (j.mac === mac(216)) j.firstUnix = 0 })
+  assert.equal(say(Model.callWhy(undated, callIn(undated, 3), FMT)[1]), "wd.why.arpJack(·216)")
+  assert.deepEqual(Model.callWhy(v, null, FMT), [])
+})
+
+test("the subject of an alert ticket: its own; the ARP spoof says which address is answered twice", () => {
+  const v = view("watchdog-arp")
+  assert.equal(say(Model.callSubject(v, callIn(v, 1))), "malware.example.org")
+  assert.equal(say(Model.callSubject(v, callIn(v, 3))), "wd.subject.arp(192.0.2.1)")
+  const noAlert = edited("arp", (r) => { r.watchdog.alerts = [] })
+  assert.equal(say(Model.callSubject(noAlert, callIn(noAlert, 3))), "wd.subject.arpPlain")
+})
+
+test("an alert ticket's buttons: Dismiss, Mark known for an unknown new device, Open for the jack or the second card's", () => {
+  const v = view("watchdog-arp")
+  assert.deepEqual(Model.alertActions(v, callIn(v, 1)), ["dismiss", "open"])
+  assert.deepEqual(Model.alertActions(v, callIn(v, 2)), ["dismiss", "know", "open"])
+  assert.deepEqual(Model.alertActions(v, callIn(v, 3)), ["dismiss", "open"])
+  assert.deepEqual(Model.alertActions(v, null), [])
+  assert.equal(say(Model.alertOpenTarget(v, callIn(v, 1)).label), "wd.act.openDevice")
+  assert.equal(Model.alertOpenTarget(v, callIn(v, 1)).mac, mac(40))
+  const arp = Model.alertOpenTarget(v, callIn(v, 3))
+  assert.equal(say(arp.label), "wd.act.openTail(·216)")
+  assert.equal(arp.mac, mac(216), "the second card's jack")
+  assert.equal(Model.alertOpenTarget(v, null), null)
+  const lan = edited("rest", (r) => { r.watchdog.bay.calls[0].mac = null })
+  assert.equal(Model.alertOpenTarget(lan, callIn(lan, 1)), null)
+})
+
+test("a device ticket's buttons: Mark known or Forget (never the router's), then Close", () => {
+  const v = view("watchdog-rest")
+  assert.deepEqual(Model.deviceActions(jackOf("rest", "·216")), ["know", "close"])
+  assert.deepEqual(Model.deviceActions(jackOf("rest", "·23")), ["forget", "close"])
+  assert.deepEqual(Model.deviceActions(jackOf("rest", "·1")), ["close"])
+  assert.deepEqual(Model.deviceActions(null), ["close"])
+  assert.ok(v)
+})
+
+test("Mark known settles the calls that said the device was new", () => {
+  const v = view("watchdog-rest")
+  assert.deepEqual(Model.newDeviceCalls(v, mac(216)), [2])
+  assert.deepEqual(Model.newDeviceCalls(v, mac(40)), [], "a threat is not settled by it")
+  assert.deepEqual(Model.newDeviceCalls(v, mac(777)), [])
+})
+
+test("the queue's last line when nothing waits: how long it has been quiet", () => {
+  assert.equal(say(Model.quietLine(view("watchdog-calm"), FMT)), "wd.queue.none", "no alert ever held")
+  const quiet = edited("calm", (r) => { r.watchdog.bay.quietSince = NOW_S - 3600 })
+  assert.equal(say(Model.quietLine(quiet, FMT)), "wd.queue.quiet(S-3600)")
+})
+
+test("the state word on a device ticket is the board's, with a gate's time", () => {
+  const w = (tail, name) => Model.ticketWord(jackOf(name || "rest", tail), NOW_S)
+  assert.deepEqual([w("·23").kind, say(w("·23").word)], ["gate", "14:32"])
+  assert.deepEqual([w("·10").kind, say(w("·10").word)], ["blocked", "wd.rail.blocked"])
+  assert.deepEqual([w("·40").kind, say(w("·40").word)], ["pass", "wd.rail.pass"], "ADS PASS in full on the ticket")
+  assert.deepEqual([w("·1").kind, say(w("·1").word)], ["always", "wd.word.always"])
+  assert.deepEqual([w("·31", "n30").kind, say(w("·31", "n30").word)], ["fixed", "wd.word.fixed"])
+  assert.equal(say(Model.ticketWord(jackOf("rest", "·23"), NOW_S + 900).word), "wd.rail.blocked", "a gate that has run out reads as shut")
+})
+
+test("the meta line: address, MAC, host and when it was first seen; offline says so, no address leaves it out", () => {
+  assert.deepEqual(Model.deviceMeta(jackOf("rest", "·23"), FMT).map(say), ["192.0.2.23", "02:00:00:00:00:17", "phone-7a", "wd.meta.seen(D-" + (NOW_S - 1793642644) + ")"])
+  const off = jackOf("n30", ":0f")
+  assert.deepEqual(Model.deviceMeta(off, FMT).map(say).slice(-2), [off.mac, "wd.meta.offline"], "offline: no address, no first seen")
+  assert.equal(Model.deviceMeta(off, FMT).map(say).includes(""), false)
+  assert.deepEqual(Model.deviceMeta(jackOf("rest", "·216"), FMT).map(say), ["192.0.2.216", mac(216), "wd.meta.seen(D-" + (NOW_S - 1794120960) + ")"], "no host name: none shown")
+})
+
+test("the patch row's caption and the ALWAYS and FIXED lines", () => {
+  assert.deepEqual(Model.patchCaption(jackOf("rest", "·10")).map(say), ["wd.cap.blocked", "wd.cap.normal"])
+  assert.deepEqual(Model.patchCaption(jackOf("rest", "·40")).map(say), ["wd.cap.pass", "wd.cap.cord"])
+  assert.deepEqual(Model.patchCaption(jackOf("mode", "·10")).map(say), ["wd.cap.blocked", "wd.cap.cord"], "a cord to blocked in the other mode")
+  assert.deepEqual(Model.patchCaption(jackOf("mode", "·51")).map(say), ["wd.cap.pass", "wd.cap.normal"])
+  assert.equal(say(Model.jackNote(jackOf("rest", "·1"))), "wd.note.always")
+  assert.equal(say(Model.jackNote(jackOf("n30", "·31"))), "wd.note.fixedPass")
+  assert.equal(say(Model.jackNote(edited("n30", (r) => { for (const j of r.watchdog.bay.jacks) if (j.tail === "·31") j.row = "blocked" }).watchdog.bay.jacks.find((j) => j.tail === "·31"))), "wd.note.fixedBlocked")
+  assert.equal(Model.jackNote(jackOf("rest", "·10")), null)
+})
+
+test("the gate row: open with the time left, shut with the lengths, nothing needed when it passes, none when it cannot be", () => {
+  const g = (tail, name, now) => Model.gateRow(jackOf(name || "rest", tail), now === undefined ? NOW_S : now)
+  assert.deepEqual(g("·23"), { show: true, state: "open", left: 872, text: "14:32" })
+  assert.equal(g("·23", "rest", NOW_S + 900).state, "shut")
+  assert.deepEqual(g("·10"), { show: true, state: "shut", left: 0, text: "" })
+  assert.equal(g("·40").state, "notNeeded", "already ADS PASS")
+  assert.equal(g("·1").show, false, "ALWAYS")
+  assert.equal(g("·31", "n30").show, false, "FIXED")
+  assert.equal(g(":0f", "n30").show, false, "an offline blocked jack: the Pi has no gate for it")
+  assert.equal(g("·10", "mode").state, "shut", "a cord to blocked can have a gate")
+  // the gate row's buttons are the keyboard's gate row
+  const rows = rowsOf(view("watchdog-rest"), { ticket: { kind: "device", mac: jackOf("rest", "·23").mac, alertId: null } })
+  assert.deepEqual(row(rows, "gate").items, ["shut"])
+})
+
+test("the label field: sent only when it changed, cleaned and cut at 24; empty clears", () => {
+  assert.deepEqual(Model.labelEdit("Sam's phone", "Sam's phone"), { changed: false, text: "Sam's phone" })
+  assert.deepEqual(Model.labelEdit("Sam's phone", "  Sam's phone  "), { changed: false, text: "Sam's phone" })
+  assert.deepEqual(Model.labelEdit("Sam's phone", "Sam's tablet"), { changed: true, text: "Sam's tablet" })
+  assert.deepEqual(Model.labelEdit("Sam's phone", ""), { changed: true, text: "" })
+  assert.deepEqual(Model.labelEdit("", "   "), { changed: false, text: "" })
+  assert.deepEqual(Model.labelEdit("", "x".repeat(40)), { changed: true, text: "x".repeat(24) })
+  assert.deepEqual(Model.labelEdit(undefined, "a"), { changed: true, text: "a" })
+  assert.equal(Model.LABEL_MAX, 24)
+  assert.deepEqual(Model.argvWatchdog(BIN, "label", [mac(23), "x".repeat(40)]).slice(3), [mac(23), "x".repeat(24)])
+})
+
+test("a PIN is exactly four digits", () => {
+  for (const ok of ["0000", "1234", "9999"]) assert.equal(Model.validPin(ok), true, ok)
+  for (const bad of ["", "123", "12345", "12a4", " 123", "123 ", "١٢٣٤", "12\n4", null, undefined, 1234]) assert.equal(Model.validPin(bad), false, String(bad))
+})
+
+test("BLOCKED and ADS PASS run only when they change something, or shut an open gate", () => {
+  const n = NOW_S
+  assert.equal(Model.patchWanted(jackOf("rest", "·10"), "blocked", n), false, "already blocked, no gate")
+  assert.equal(Model.patchWanted(jackOf("rest", "·10"), "pass", n), true)
+  assert.equal(Model.patchWanted(jackOf("rest", "·23"), "blocked", n), true, "a patch shuts the gate, so the cord decides")
+  assert.equal(Model.patchWanted(jackOf("rest", "·23"), "blocked", n + 900), false, "the gate has run out")
+  assert.equal(Model.patchWanted(jackOf("rest", "·40"), "pass", n), false)
+  assert.equal(Model.patchWanted(jackOf("rest", "·1"), "pass", n), false, "ALWAYS: nothing here patches it")
+  assert.equal(Model.patchWanted(jackOf("n30", "·31"), "blocked", n), false, "FIXED")
+  assert.equal(Model.patchWanted(jackOf("rest", "·10"), "other", n), false)
+  assert.equal(Model.patchWanted(null, "pass", n), false)
+})
+
+test("literal words carry their text; the model says no word it has not got in the catalog", () => {
+  assert.deepEqual(Model.lit("x"), { key: "", args: [], tone: "", text: "x" })
+  assert.equal(Model.lit(null).text, "")
+  const cat = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "i18n", "en.json"), "utf8"))
+  for (const n of FIXTURES) {
+    const v = view("watchdog-" + n)
+    for (const c of v.watchdog.bay.calls) {
+      const words = [Model.callTitle(c), Model.callBrief(v, c), Model.callJackName(v, c), Model.callWho(v, c), Model.callSubject(v, c)]
+        .concat(Model.callWhy(v, c, FMT), Model.callMeta(c, FMT), [Model.quietLine(v, FMT)])
+      for (const w of words) if (w && w.key !== "") assert.ok(w.key in cat, n + ": " + w.key)
+    }
+    for (const j of v.watchdog.bay.jacks) {
+      const words = [Model.ticketWord(j, NOW_S).word, Model.jackNote(j)].concat(Model.patchCaption(j), Model.deviceMeta(j, FMT))
+      for (const w of words) if (w && w.key !== "") assert.ok(w.key in cat, n + ": " + w.key)
+    }
+  }
 })

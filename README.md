@@ -9,13 +9,37 @@ knows about the Pi-hole on the LAN. It is a thin QML panel over a Rust binary,
   - Blocked queries drain into the Pi-hole node.
   - Paused, failover, bypass, unreachable, degraded and offline each show on
     the route itself.
+  - A node opens its view: the AP node Wi-Fi, the Pi-hole node the Watchdog
+    when the Pi-hole is a qberrypi (it carries the number of calls waiting;
+    otherwise it opens DNS), the upstream node DNS (it carries the leak count).
   - Below the route: Pause blocking 5 min (`p`), and the IP line.
 - **Wi-Fi view** (click the AP node, or `2`): an active-connection card and the
   nearby list. Opening it scans only if the last scan is more than 60 s old.
-- **DNS view** (click the Pi-hole node, or `1`):
+- **DNS view** (click the upstream node, or `1`; the Pi-hole node too when it
+  has no watchdog):
   - the resolver chain, systemd-resolved → Pi-hole → upstreams;
   - the resolver choice (leaving the Pi-hole asks first);
   - leaks with Pin, failover, and Admin.
+- **Watchdog view** (qberrypi only: click the Pi-hole node, or `3`; IPC
+  `view watchdog`): a patch bay of the Pi's devices.
+  - Each device is a column of three jacks, ADS PASS above, its line in the
+    middle, BLOCKED below, with its name on a strip and one word under it:
+    BLOCKED, PASS, ALWAYS, FIXED, or the time its gate has left. A dotted wire
+    is the normal wiring, a cord is a device patched by hand, an amber cord is
+    a gate, the router and the Pi are riveted. The slot at the left is NORMAL:
+    it flips the default between BLOCKED and ADS PASS (to ADS PASS it asks
+    first and says how many devices lose ad blocking). Eight jacks make a bay;
+    past 16 devices two bays show and the wheel, or the pager, moves one.
+  - Along the top, a lamp for each kind of alert; under the board, the calls
+    waiting, newest first, with Dismiss all.
+  - A column opens its ticket: the name (24 characters, kept on this PC), the
+    address, MAC, host name and when it was first seen, BLOCKED or ADS PASS,
+    a gate for 5, 30 or 60 minutes, Mark known or Forget. A call opens its
+    trouble ticket: what rang, which device, what it means, Dismiss (which
+    clears the Pi's screen too). Enter does the same from the keyboard.
+  - The foot sets or clears the PIN of the Pi's screen: four digits, sent to
+    `qnet watchdog pin set` on stdin and kept only as a hash.
+  - The card is 520 px wide while this view is up (the board is 488).
 - **Failover:** when the Pi-hole stops answering (≥30 s, and its pinned API is
   also dead), the *runtime* DNS switches to the trusted router or Quad9. It
   switches back on recovery. The saved profile is never written.
@@ -67,7 +91,8 @@ knows about the Pi-hole on the LAN. It is a thin QML panel over a Rust binary,
     never on the command line, no echo on a terminal) and keeps only their
     hash, which it pushes to the Pi after every login and restart so that the
     panel's lock holds. `pin clear` takes the PIN off the running Pi.
-  - Against a real Pi-hole nothing changes. There is no panel for it yet.
+  - Against a real Pi-hole nothing changes: there is no Watchdog view, and the
+    Pi-hole node opens DNS.
 
 Details: `SPEC.md`.
 

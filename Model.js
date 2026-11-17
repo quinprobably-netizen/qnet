@@ -2053,6 +2053,248 @@ function jackReadout(jack, nowS) {
   return { name: jack.name, tail: jack.tail, how: how, offline: jack.offline === true, isNew: jack.isNew === true }
 }
 
+// ---------------------------------------------------- the queue and the tickets
+// The words of the call queue and of the two tickets. Each helper says what
+// to show as words (word(): a catalog key and its arguments, or lit(): text
+// from the network or the state that is shown as it is); the panel says them
+// in the catalog's language. fmt is the host's clock: { clock(sec) -> "14:02",
+// date(sec) -> "2 Nov", stamp(sec) -> "Mon 09:14" }.
+
+// Text that is shown as it is (a name, an address, a subject): a word with no key.
+function lit(text) { return { key: "", args: [], tone: "", text: String(text === undefined || text === null ? "" : text) } }
+
+var CALL_KINDS = { threat: "threat", new_device: "newDevice", arp_spoof: "arpSpoof", rebind: "rebind", dga: "dga", tunnel: "tunnel", beacon: "beacon", burst: "burst" }
+
+// The alert (in watchdog.alerts) behind a call, or null.
+function alertOf(v, id) {
+  var list = v.watchdog.alerts
+  for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i]
+  return null
+}
+
+// A call's title in capitals: the catalog's for the kinds the Pi names
+// (THREAT BLOCKED, NEW DEVICE, ARP SPOOF, REBIND, and a word for each lookup
+// kind), else the kind itself spelt out ("odd_thing" is ODD THING).
+function callTitle(call) {
+  var kind = call && typeof call.kind === "string" ? call.kind : ""
+  if (CALL_KINDS[kind] !== undefined) return word("wd.call." + CALL_KINDS[kind])
+  return lit(kind.replace(/_/g, " ").toUpperCase())
+}
+
+// The dim line after a call's name in the queue: its subject (and " ×n" when
+// it came more than once); the address of an ARP spoof; nothing for a new
+// device (its subject is a MAC the jack's name stands for). null for none.
+function callBrief(v, call) {
+  if (!call || call.kind === "new_device") return null
+  if (call.kind === "arp_spoof") {
+    var a = alertOf(v, call.id)
+    return a && a.client !== null ? word("wd.brief.arp", [a.client]) : word("wd.brief.arpPlain")
+  }
+  var s = call.subject + (call.count > 1 ? " ×" + call.count : "")
+  return s.trim() === "" ? null : lit(s.trim())
+}
+
+// The jack's name for a call: its label, else its tail (·216); "LAN" when the
+// call rings no jack.
+function callJackName(v, call) {
+  var jack = call && call.mac !== null ? jackOf(v, call.mac) : null
+  if (!jack) return word("wd.queue.lan")
+  return lit(jack.name !== "" ? jack.name : jack.tail)
+}
+
+// The line under an alert ticket's subject: who the call is about.
+//   asked by Living room TV · 192.0.2.40   joined as ·216 · 192.0.2.216
+// A call that rings no jack says why it rings the lamp row.
+function callWho(v, call) {
+  var jack = call && call.mac !== null ? jackOf(v, call.mac) : null
+  if (!jack) {
+    var a = call ? alertOf(v, call.id) : null
+    if (call && call.kind !== "arp_spoof" && call.kind !== "new_device" && a && a.client !== null) return word("wd.who.client", [a.client])
+    return word("wd.who.none")
+  }
+  var name = jack.name !== "" ? jack.name : jack.tail
+  if (call.kind === "new_device") return jack.ip !== "" ? word("wd.who.joined", [name, jack.ip]) : word("wd.who.joinedNoIp", [name])
+  return jack.ip !== "" ? word("wd.who.asked", [name, jack.ip]) : word("wd.who.askedNoIp", [name])
+}
+
+// "high · ×12 · 14:07 – 14:09": the head of an alert ticket, as words to join
+// with " · ".
+function callMeta(call, fmt) {
+  var first = fmt.clock(call.firstUnix)
+  var last = fmt.clock(call.lastUnix)
+  return [word("wd.sev." + call.severity), lit("×" + call.count), lit(first === last ? last : first + " – " + last)]
+}
+
+// A short last byte of a MAC for the ARP sentence: "…:d8".
+function macByte(mac) { return typeof mac === "string" && mac.length >= 2 ? "…:" + mac.substring(mac.length - 2) : "" }
+
+// The sentences of an alert ticket, one to three, as words: what the kind
+// says and nothing more than the alert holds.
+function callWhy(v, call, fmt) {
+  if (!call) return []
+  switch (call.kind) {
+  case "threat": return [call.count > 1 ? word("wd.why.threatMany", [call.count]) : word("wd.why.threat")]
+  case "new_device": return [word("wd.why.newDevice")]
+  case "rebind": return [word("wd.why.rebind")]
+  case "dga": return [word("wd.why.dga")]
+  case "tunnel": return [word("wd.why.tunnel")]
+  case "beacon": return [word("wd.why.beacon")]
+  case "burst": return [word("wd.why.burst")]
+  case "arp_spoof": break
+  default: return [word("wd.why.other")]
+  }
+  var a = alertOf(v, call.id)
+  var own = null
+  if (a && a.client !== null) {
+    var js = v.watchdog.bay.jacks
+    for (var i = 0; i < js.length; i++) if (js[i].ip === a.client) { own = js[i]; break }
+  }
+  var second = call.relatedMac !== null ? call.relatedMac : macOf(call.subject)
+  var out = []
+  if (own && second !== null) out.push(word("wd.why.arpTwo", [macByte(own.mac), macByte(second)]))
+  else if (second !== null) out.push(word("wd.why.arpSecond", [macByte(second)]))
+  else out.push(word("wd.why.arpPlain"))
+  var rel = call.relatedMac !== null ? jackOf(v, call.relatedMac) : null
+  if (rel) {
+    var name = rel.name !== "" ? rel.name : rel.tail
+    if (rel.firstUnix <= 0) out.push(word("wd.why.arpJack", [name]))
+    else if (call.lastUnix - rel.firstUnix > 12 * 3600) out.push(word("wd.why.arpJackOn", [name, fmt.date(rel.firstUnix)]))
+    else out.push(word("wd.why.arpJackAt", [name, fmt.clock(rel.firstUnix)]))
+  }
+  out.push(word("wd.why.arpRisk"))
+  return out
+}
+
+// The subject line of an alert ticket: the call's own, except an ARP spoof,
+// whose subject is the second card's MAC and which says what is wrong.
+function callSubject(v, call) {
+  if (call && call.kind === "arp_spoof") {
+    var a = alertOf(v, call.id)
+    if (a && a.client !== null) return word("wd.subject.arp", [a.client])
+    return word("wd.subject.arpPlain")
+  }
+  return lit(call ? call.subject : "")
+}
+
+// Whether the queue's actions go to a jack, and what its button says: for an
+// alert that rings a jack "Open device ›", for the ARP spoof the second card's
+// jack "Open ·216 ›". -> { mac, label (a word) } or null.
+function alertOpenTarget(v, call) {
+  if (!call) return null
+  if (call.mac !== null) return jackOf(v, call.mac) ? { mac: call.mac, label: word("wd.act.openDevice") } : null
+  var rel = call.relatedMac !== null ? jackOf(v, call.relatedMac) : null
+  return rel ? { mac: rel.mac, label: word("wd.act.openTail", [rel.tail]) } : null
+}
+
+// The buttons of an alert ticket: dismiss, know (a new device whose jack is
+// not known yet), open (alertOpenTarget).
+function alertActions(v, call) {
+  var out = []
+  if (!call) return out
+  out.push("dismiss")
+  var rung = call.mac !== null ? jackOf(v, call.mac) : null
+  if (call.kind === "new_device" && rung && !rung.known) out.push("know")
+  if (alertOpenTarget(v, call) !== null) out.push("open")
+  return out
+}
+
+// The buttons of a device ticket: know for a jack not on this PC's list, else
+// forget (never the router or the Pi), then close.
+function deviceActions(jack) {
+  var out = []
+  if (jack) {
+    if (!jack.known) out.push("know")
+    else if (jack.patch !== "always") out.push("forget")
+  }
+  out.push("close")
+  return out
+}
+
+// The ids of the new-device calls that Mark known settles for a jack.
+function newDeviceCalls(v, mac) {
+  var out = []
+  var calls = v.watchdog.bay.calls
+  for (var i = 0; i < calls.length; i++) if (calls[i].kind === "new_device" && calls[i].mac === mac) out.push(calls[i].id)
+  return out
+}
+
+// The queue's last line when there is nothing waiting.
+function quietLine(v, fmt) {
+  var since = v.watchdog.bay.quietSince
+  return since > 0 ? word("wd.queue.quiet", [fmt.stamp(since)]) : word("wd.queue.none")
+}
+
+// The state word on a device ticket's head, as the board's word for the jack:
+// { kind: blocked | pass | always | fixed | gate, word }. A gate says its time.
+function ticketWord(jack, nowS) {
+  var w = jackWord(jack, nowS)
+  if (w.kind === "gate") return { kind: "gate", word: lit(w.text) }
+  var keys = { blocked: "wd.rail.blocked", pass: "wd.rail.pass", always: "wd.word.always", fixed: "wd.word.fixed" }
+  return { kind: w.kind, word: word(keys[w.kind] || "wd.rail.blocked") }
+}
+
+// The dim line under a device ticket's label: address, MAC, host name and
+// when it was first seen, as words to join with " · ". An offline one says
+// "offline"; one with no IPv4 address leaves the address out.
+function deviceMeta(jack, fmt) {
+  var out = []
+  if (jack.ip !== "") out.push(lit(jack.ip))
+  out.push(lit(jack.mac))
+  if (jack.hostname !== "") out.push(lit(jack.hostname))
+  if (jack.offline) out.push(word("wd.meta.offline"))
+  else if (jack.firstUnix > 0) out.push(word("wd.meta.seen", [fmt.date(jack.firstUnix)]))
+  return out
+}
+
+// What the patch row says under its two buttons: the state, then whether it is
+// the normal wiring or this PC's cord.
+function patchCaption(jack) {
+  var state = jack.patch === "pass" ? word("wd.cap.pass") : word("wd.cap.blocked")
+  var wiring = jack.cord ? word("wd.cap.cord") : word("wd.cap.normal")
+  return [state, wiring]
+}
+
+// The one line that stands for the patch and gate rows of a jack nobody can
+// patch from here (the router and the Pi; a device the Pi's own configuration
+// decides), or null.
+function jackNote(jack) {
+  if (jack.patch === "always") return word("wd.note.always")
+  if (jack.patch === "fixed") return jack.row === "pass" ? word("wd.note.fixedPass") : word("wd.note.fixedBlocked")
+  return null
+}
+
+// The gate row of a device ticket: { show, state: open | shut | notNeeded,
+// left (seconds), text ("14:32") }. Shown for a jack that can be patched,
+// except a blocked one that is offline (the Pi has no gate for it); one that
+// passes already says so.
+function gateRow(jack, nowS) {
+  var free = jack.patch !== "always" && jack.patch !== "fixed"
+  if (!free) return { show: false, state: "shut", left: 0, text: "" }
+  if (jack.patch === "pass") return { show: true, state: "notNeeded", left: 0, text: "" }
+  if (jack.offline) return { show: false, state: "shut", left: 0, text: "" }
+  var left = gateLeft(jack, nowS)
+  return left > 0 ? { show: true, state: "open", left: left, text: formatGate(left) } : { show: true, state: "shut", left: 0, text: "" }
+}
+
+// The label a field holds against the one the jack has: { changed, text } with
+// the text as it would be sent (cleaned, cut at 24, "" clears it).
+function labelEdit(current, typed) {
+  var text = clean(typed, 1000).trim().substring(0, LABEL_MAX).trim()
+  return { changed: text !== String(current === undefined || current === null ? "" : current), text: text }
+}
+
+// Whether pressing BLOCKED or ADS PASS on a jack's ticket does anything: the
+// cord is not there yet, or a gate is open (which a patch shuts, so that the
+// cord decides and not a timer).
+function patchWanted(jack, want, nowS) {
+  if (!jack || (want !== "blocked" && want !== "pass")) return false
+  if (jack.patch === "always" || jack.patch === "fixed") return false
+  return jack.patch !== want || gateLeft(jack, nowS) > 0
+}
+
+// A PIN is exactly four digits.
+function validPin(text) { return typeof text === "string" && /^[0-9]{4}$/.test(text) }
+
 // The mac of the jack the keyboard cursor is on: cursor { row, item } on a
 // "bay:I" row of the layout; "" when it is on anything else (or nowhere).
 function bayCursorMac(layout, cursor) {
@@ -2142,23 +2384,12 @@ function watchdogRows(v, ctx) {
         var open = jack.gateUntil !== null && (c.nowS === undefined || gateLeft(jack, c.nowS) > 0)
         rows.push({ id: "gate", items: open ? ["shut"] : GATE_SECS.map(String) })
       }
-      var acts = []
-      if (!jack.known) acts.push("know")
-      else if (jack.patch !== "always") acts.push("forget")
-      acts.push("close")
-      rows.push({ id: "tactions", items: acts })
-    } else rows.push({ id: "tactions", items: ["close"] })
+      rows.push({ id: "tactions", items: deviceActions(jack) })
+    } else rows.push({ id: "tactions", items: deviceActions(null) })
   } else if (ticket) {
     var call = callOf(v, ticket.alertId)
-    var tacts = []
-    if (call) {
-      tacts.push("dismiss")
-      var rung = call.mac !== null ? jackOf(v, call.mac) : null
-      if (call.kind === "new_device" && rung && !rung.known) tacts.push("know")
-      if (call.mac !== null || call.relatedMac !== null) tacts.push("open")
-    }
-    tacts.push("close")
-    rows.push({ id: "tactions", items: tacts })
+    var tacts = alertActions(v, call)
+    if (tacts.length) rows.push({ id: "tactions", items: tacts })
   }
 
   rows.push({ id: "pin", items: c.pinOpen ? ["set", "cancel"] : (w.pinSet ? ["change", "clear"] : ["set"]) })
@@ -2232,7 +2463,9 @@ function escapeStep(ctx) {
 //            1800, 3600, or shut while open: only a blocked jack on the
 //            network), tactions (know or forget, close); for an alert
 //            tactions (dismiss, know for a new device whose jack is not
-//            known, open when a jack or related jack exists, close); last
+//            known, open when its jack, or the ARP spoof's second card's, is
+//            on the board: the mockup's alert ticket has no Close, Esc and
+//            the call's own row close it); last
 //            pin (set, cancel while it is open; else change, clear when a PIN
 //            is set; else set).
 //            ctx: { view: "watchdog", flip, ticket: { kind: "device" | "alert",
@@ -2353,6 +2586,11 @@ if (typeof module !== "undefined") {
     normalizeWatchdog: normalizeWatchdog, watchdogPresent: watchdogPresent, holdOrder: holdOrder,
     bayLayout: bayLayout, gateLeft: gateLeft, formatGate: formatGate, jackOf: jackOf, callOf: callOf,
     lampKey: lampKey, jackWord: jackWord, jackReadout: jackReadout, bayCursorMac: bayCursorMac, strong: strong, sentenceRuns: sentenceRuns, boardHead: boardHead,
+    lit: lit, alertOf: alertOf, callTitle: callTitle, callBrief: callBrief, callJackName: callJackName, callWho: callWho,
+    callMeta: callMeta, callWhy: callWhy, callSubject: callSubject, alertOpenTarget: alertOpenTarget, alertActions: alertActions,
+    deviceActions: deviceActions, newDeviceCalls: newDeviceCalls, quietLine: quietLine, ticketWord: ticketWord,
+    deviceMeta: deviceMeta, patchCaption: patchCaption, jackNote: jackNote, gateRow: gateRow, labelEdit: labelEdit,
+    patchWanted: patchWanted, validPin: validPin, LABEL_MAX: LABEL_MAX,
     parseStateLine: parseStateLine, backoffMs: backoffMs, restartAttempt: restartAttempt,
     formatCountdown: formatCountdown, groupDigits: groupDigits, formatCount: formatCount,
     formatPercent: formatPercent, formatLatency: formatLatency, formatRate: formatRate,

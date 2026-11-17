@@ -8,7 +8,9 @@ import qs.Commons
 // cursor, the mouse moves it) and shrinks to pressScale while pressed. A
 // quiet one is dim and comes up to `hotColor` under the cursor or pointer.
 // `cursorRow` and `cursorItem` name its stop in Model.focusRows; empty for a
-// button the keyboard does not reach.
+// button the keyboard does not reach. A button that has a ground of its own
+// (the tickets' primary one) gives `restColor`, and `hoverFilled` has the
+// pointer take the hover fill as the cursor does.
 CursorSurface {
   id: btn
 
@@ -19,6 +21,8 @@ CursorSurface {
   property string cursorRow: ""
   property int cursorItem: 0
   property bool filled: false
+  property color restColor: hub.restFill
+  property bool hoverFilled: false
   property int padX: Style.space(10)
   property int padY: Style.space(6)
   property int size: hub.typeSmall
@@ -33,7 +37,7 @@ CursorSurface {
   onHasCursorChanged: if (hasCursor) hub.ensureCursorVisible(btn)
   foreground: hub.fg
   fill: hub.hoverFill
-  color: hasCursor ? hub.hoverFill : (filled ? hub.restFill : "transparent")
+  color: hasCursor || (hoverFilled && area.containsMouse && enabled) ? hub.hoverFill : (filled ? restColor : "transparent")
   opacity: enabled ? 1 : hub.disabledOpacity
   scale: area.pressed ? hub.pressScale : 1
   Behavior on scale { NumberAnimation { duration: Style.duration(80); easing.type: Easing.OutCubic } }

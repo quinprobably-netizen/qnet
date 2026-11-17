@@ -17,10 +17,14 @@ import "../Model.js" as Model
 //             ("Flip normal to ADS PASS? 4 devices will see ads."), or the
 //             note of a failed action; on its right the pager
 //
-// T5b adds, under the readout: the calls waiting, the open ticket and the PIN
-// footer (see the marker at the bottom). The board draws at the full 488 of
-// the content column, which is why the card is wider on this view
-// (Panel.qml: contentWidth).
+//   calls     the calls waiting, newest first (CallQueue.qml)
+//   ticket    the open ticket, one at a time: a device's (DeviceTicket.qml) or
+//             a call's trouble ticket (AlertTicket.qml); the board shrinks to
+//             the one bay it belongs to while one is open
+//   lock      the PIN of the Pi's screen (PinFooter.qml)
+//
+// The board draws at the full 488 of the content column, which is why the card
+// is wider on this view (Panel.qml: contentWidth).
 //
 // The words are the catalog's (wd.*); Model.jackReadout, sentenceRuns and
 // boardHead say what to put in them.
@@ -112,7 +116,7 @@ Column {
     var jack = readoutMac !== "" ? board.byMac[readoutMac] || null : null
     if (h.wdFlip && !normalPass) {
       var n = wd.bay.flipCount
-      return { kind: "confirm", tone: h.warning, runs: Model.sentenceRuns(h.strings.tn("wd.flipQ", n).arg(n)) }
+      return { kind: "confirm", tone: h.warning, runs: Model.sentenceRuns(h.strings.tn("wd.flipQ", n).arg(n) + " ") }
     }
     if (jack !== null) {
       var r = Model.jackReadout(jack, h.nowMs / 1000)
@@ -168,34 +172,39 @@ Column {
         onClicked: page.hub.wdPressKey()
       }
 
-      // the confirm: Flip, Cancel (together, so a line that wraps takes both)
-      Row {
+      // the confirm: Flip and Cancel follow the sentence as two more words,
+      // so they sit on its line while they fit and wrap with it when they do not
+      TextButton {
         visible: page.readout.kind === "confirm"
-        TextButton {
-          hub: page.hub
-          text: page.t("wd.flipYes")
-          textColor: page.hub.bright
-          weight: Font.Bold
-          size: Style.font.caption
-          padX: Style.space(8)
-          padY: Style.space(2)
-          filled: true
-          cursorRow: "flip"
-          cursorItem: 0
-          onClicked: page.hub.wdConfirmFlip()
-        }
-        TextButton {
-          hub: page.hub
-          text: page.t("wd.flipNo")
-          textColor: page.hub.dim
-          hotColor: page.hub.fg
-          size: Style.font.caption
-          padX: Style.space(8)
-          padY: Style.space(2)
-          cursorRow: "flip"
-          cursorItem: 1
-          onClicked: page.hub.wdCancelFlip()
-        }
+        hub: page.hub
+        text: page.t("wd.flipYes")
+        textColor: page.hub.bright
+        weight: Font.Bold
+        size: Style.font.caption
+        padX: Style.space(8)
+        padY: Style.space(3)
+        filled: true
+        restColor: page.hub.sel
+        hoverFilled: true
+        radius: Math.min(Style.cornerRadius, Style.space(3))
+        cursorRow: "flip"
+        cursorItem: 0
+        onClicked: page.hub.wdConfirmFlip()
+      }
+      TextButton {
+        visible: page.readout.kind === "confirm"
+        hub: page.hub
+        text: page.t("wd.flipNo")
+        textColor: page.hub.dim
+        hotColor: page.hub.fg
+        size: Style.font.caption
+        padX: Style.space(8)
+        padY: Style.space(3)
+        hoverFilled: true
+        radius: Math.min(Style.cornerRadius, Style.space(3))
+        cursorRow: "flip"
+        cursorItem: 1
+        onClicked: page.hub.wdCancelFlip()
       }
     }
 
@@ -285,9 +294,25 @@ Column {
     }
   }
 
-  // T5b: the calls waiting (CallQueue), the open ticket (DeviceTicket for
-  // hub.wdTicket.kind === "device", AlertTicket for "alert") and the PIN footer
-  // (PinFooter, hub.wdPinOpen) go here, in that order, each reading and
-  // setting its state on the hub (wdTicket, wdPinOpen, wdNote) and running its
-  // actions through hub.wdAction(verb, args).
+  // ------------------------------------------------- calls, ticket, lock
+  // The jack or the call whose ticket is open: one at a time, in the same
+  // place, between the calls and the lock.
+  readonly property var ticketJack: hub.wdTicket !== null && hub.wdTicket.kind === "device" ? Model.jackOf(hub.view, hub.wdTicket.mac) : null
+  readonly property var ticketCall: hub.wdTicket !== null && hub.wdTicket.kind === "alert" ? Model.callOf(hub.view, hub.wdTicket.alertId) : null
+
+  CallQueue { hub: page.hub }
+
+  Loader {
+    width: page.width
+    active: page.ticketJack !== null
+    sourceComponent: Component { DeviceTicket { hub: page.hub; jack: page.ticketJack } }
+  }
+
+  Loader {
+    width: page.width
+    active: page.ticketCall !== null
+    sourceComponent: Component { AlertTicket { hub: page.hub; call: page.ticketCall } }
+  }
+
+  PinFooter { hub: page.hub }
 }
