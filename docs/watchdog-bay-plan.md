@@ -216,3 +216,14 @@ under `docs/shots/watchdog-bay/`, compared by eye with the stills.
 
 ### Review
 One Opus whole-branch review, then one fix wave for Critical/Important.
+
+## Amendment (after T4): the width
+
+The real `KeyboardPanel` makes qnet's card `Style.space(488)` wide, and its
+padding (14) and border leave a content column of 456, not the 488 the mockup
+assumed ("520 px card, 488 px content, as Panel.qml" was a misreading). The
+board needs 70 + 418 = 488. Decision: while the watchdog view is up the card is
+`Style.space(520)` wide (content 488, the mockup's geometry at 1:1); the other
+views keep 488. The owner is told (a card that widens by 32 px on entering the
+tab). `tools/shot` must draw the card at the panel's own `contentWidth` (the
+real geometry), not a fixed 520.
