@@ -1679,6 +1679,19 @@ mod tests {
         f
     }
 
+    /// The fake machine's own addresses (192.168.1.x, from `FakeNet` and
+    /// `fake_cfg`) as the documentation range the sample network lives in:
+    /// this PC is ·10 on the board, the gateway ·1, the Pi-hole (qbp) ·2. Only
+    /// the golden watchdog fixtures get this; every other test keeps its own.
+    fn on_the_sample_network(text: &str) -> String {
+        let out = text
+            .replace("192.168.1.153", "192.0.2.2")
+            .replace("192.168.1.242", "192.0.2.10")
+            .replace("192.168.1.1", "192.0.2.1");
+        assert!(!out.contains("192.168."), "an address was left over");
+        out
+    }
+
     #[test]
     fn the_watchdog_fixtures_are_what_the_state_says_for_the_bays_sample_data() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures");
@@ -1687,7 +1700,7 @@ mod tests {
         for (name, report) in crate::bayfix::reports() {
             let st = build_at(&golden_inputs(report), NOW_S);
             assert_eq!(st.watchdog.status, "ok", "{name}");
-            let text = serde_json::to_string_pretty(&st).unwrap() + "\n";
+            let text = on_the_sample_network(&serde_json::to_string_pretty(&st).unwrap()) + "\n";
             let path = dir.join(format!("watchdog-{name}.json"));
             if update {
                 std::fs::write(&path, &text).unwrap();

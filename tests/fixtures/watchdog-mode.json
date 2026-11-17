@@ -13,8 +13,8 @@
     "frequencyMhz": 5180,
     "prefix": 24,
     "signalDbm": null,
-    "ip4": "192.168.1.242",
-    "gateway": "192.168.1.1",
+    "ip4": "192.0.2.10",
+    "gateway": "192.0.2.1",
     "gatewayMs": 3.8,
     "connectivity": "full",
     "portalUrl": ""
@@ -94,7 +94,7 @@
     "modeSource": "profile",
     "servers": [
       {
-        "addr": "192.168.1.153",
+        "addr": "192.0.2.2",
         "link": "wlp7s0",
         "current": true,
         "role": "pihole"
@@ -127,8 +127,8 @@
   },
   "pihole": {
     "configured": true,
-    "address": "192.168.1.153",
-    "adminUrl": "https://192.168.1.153/admin/",
+    "address": "192.0.2.2",
+    "adminUrl": "https://192.0.2.2/admin/",
     "reachable": true,
     "latencyMs": 3.6,
     "blocking": "enabled",
@@ -647,28 +647,6 @@
           "lamp": "",
           "alertId": null,
           "rank": 1
-        },
-        {
-          "mac": "02:00:00:00:00:0e",
-          "ip": "",
-          "tail": ":0e",
-          "hostname": "",
-          "name": "Tablet",
-          "strip": [
-            "Tablet"
-          ],
-          "known": false,
-          "isNew": false,
-          "offline": true,
-          "firstUnix": 1793642888,
-          "lastUnix": 0,
-          "patch": "blocked",
-          "row": "blocked",
-          "cord": true,
-          "gateUntil": null,
-          "lamp": "",
-          "alertId": null,
-          "rank": 3
         }
       ],
       "flipCount": 0,

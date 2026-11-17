@@ -75,8 +75,9 @@ const FIRST_SEEN: [u64; 4] = [1_793_642_400, 1_793_728_800, 1_793_901_600, 1_794
 
 /// The mockup's ADS PASS list (with the mode off).
 const ADS_PASS: [u32; 3] = [40, 44, 46];
-/// The mockup's block list (it only counts with the mode on).
-const BLOCKED: [u32; 3] = [10, 12, 14];
+/// The block list (it only counts with the mode on): this PC and the work
+/// laptop, both on the 8-device board.
+const BLOCKED: [u32; 2] = [10, 12];
 /// The device that is new, and the one that has a gate open.
 const NEW: u32 = 216;
 const GATED: u32 = 23;
@@ -258,7 +259,6 @@ fn report_of(s: &Screen) -> WatchdogReport {
     }
     if s.mode {
         store.exempt_default = true;
-        // The tablet is on the block list whether or not it is on the network.
         for (index, &(n, label, ..)) in RAW.iter().enumerate() {
             if BLOCKED.contains(&n) {
                 store.add_block(&mac_of(n), Some(label), first_seen(index, n));
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_wires_the_normal_to_ads_pass_with_three_cords_to_blocked() {
+    fn mode_wires_the_normal_to_ads_pass_with_two_cords_to_blocked() {
         let b = bay_of("mode");
         assert_eq!(b.flip_count, 0);
         assert_eq!(patch_of(&b, "·10"), ("blocked", "blocked", true));
@@ -447,14 +447,12 @@ mod tests {
             "its ADS PASS entry counts for nothing"
         );
         assert_eq!(patch_of(&b, "·1"), ("always", "blocked", false));
-        // The tablet is on the block list but not on the network: an offline jack.
-        let tablet = b.jacks.last().unwrap();
         assert_eq!(
-            (tablet.tail.as_str(), tablet.name.as_str(), tablet.offline),
-            (":0e", "Tablet", true)
+            b.jacks.len(),
+            8,
+            "every device on the block list is on the board"
         );
-        assert_eq!(patch_of(&b, ":0e"), ("blocked", "blocked", true));
-        assert!(!tablet.known);
+        assert!(b.jacks.iter().all(|j| !j.offline));
         let r = &reports()[4].1;
         assert!(r.exempt_default && r.exempt_default_on_pi && r.pin_set);
     }
