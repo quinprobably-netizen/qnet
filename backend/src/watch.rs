@@ -1,7 +1,7 @@
 //! `qnet watch`: the long-lived process behind the panel.
 //!
 //! Threads (all feeding one event channel; see `threads.rs`):
-//!   * stdin reader   - `open` / `closed` / `refresh`;
+//!   * stdin reader   - `open` / `closed` / `refresh` / `devices`;
 //!   * signals        - SIGTERM / SIGINT / SIGHUP;
 //!   * NM watcher     - NetworkManager D-Bus signals;
 //!   * prober         - raw UDP DNS probes to the Pi-hole, an upstream
@@ -630,14 +630,21 @@ impl Watch {
                     let _ = tx.send(ApiCtl::Open(false));
                 }
             }
-            "refresh" => {
+            // `devices` is `refresh` that also has the Pi's devices read again
+            // at once, so that the panel sees its own edit of a device (a
+            // patch, a gate, a name) without waiting for the next slow read.
+            "refresh" | "devices" => {
                 self.mark_all_dirty();
                 self.load_config();
                 if let Some(tx) = &self.probe_tx {
                     let _ = tx.send(ProbeCtl::Kick);
                 }
                 if let Some(tx) = &self.api_tx {
-                    let _ = tx.send(ApiCtl::Kick);
+                    let _ = tx.send(if cmd == "devices" {
+                        ApiCtl::Devices
+                    } else {
+                        ApiCtl::Kick
+                    });
                 }
             }
             _ => {}
@@ -2386,6 +2393,54 @@ mod tests {
         r.w.handle(Event::Watchdog(acked), 240_400);
         let st = state_of(r.w.next_emission(240_400).unwrap());
         assert_eq!(st.watchdog.unacked, 0);
+    }
+
+    /// What the API thread was told since the last look, as `kick` and
+    /// `devices` (the rest is not the commands' doing).
+    fn api_kicks(rx: &Receiver<ApiCtl>) -> Vec<&'static str> {
+        rx.try_iter()
+            .filter_map(|c| match c {
+                ApiCtl::Kick => Some("kick"),
+                ApiCtl::Devices => Some("devices"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_devices_command_is_refresh_that_also_has_the_devices_read_at_once() {
+        let mut r = rig();
+        let (probe_tx, probe_rx) = mpsc::channel();
+        let (api_tx, api_rx) = mpsc::channel();
+        r.w.attach_threads(probe_tx, api_tx);
+        // `refresh` kicks both threads.
+        r.w.handle(Event::Cmd("refresh".into()), 200);
+        assert_eq!(api_kicks(&api_rx), ["kick"]);
+        assert!(probe_rx.try_iter().any(|c| matches!(c, ProbeCtl::Kick)));
+        // `devices` kicks the prober the same way, and tells the API thread to
+        // read the Pi's devices at the next poll (which is a kick as well).
+        r.w.handle(Event::Cmd("devices".into()), 300);
+        assert_eq!(api_kicks(&api_rx), ["devices"]);
+        assert!(probe_rx.try_iter().any(|c| matches!(c, ProbeCtl::Kick)));
+        // Whitespace around the word does not matter; other words do nothing.
+        r.w.handle(Event::Cmd("  devices \n".into()), 400);
+        assert_eq!(api_kicks(&api_rx), ["devices"]);
+        r.w.handle(Event::Cmd("device".into()), 500);
+        assert!(api_kicks(&api_rx).is_empty());
+
+        // It reads the configuration again, as `refresh` does: a change of
+        // Pi-hole drops what the watchdog reported of the old one.
+        r.w.handle(Event::Watchdog(wd_report(1_800_000_100, 2)), 600);
+        assert_eq!(r.w.state(false).watchdog.alerts.len(), 2);
+        let other = config_text("enabled = true\nfallback = \"router\"").replace(
+            &crate::util::format_fingerprint(&[1; 32]),
+            &crate::util::format_fingerprint(&[2; 32]),
+        );
+        std::fs::write(r.dir.path().join("config.toml"), other).unwrap();
+        r.w.handle(Event::Cmd("devices".into()), 700);
+        r.w.process_dirty(1_400);
+        assert_eq!(r.w.state(false).watchdog.status, "unknown");
+        assert!(r.w.state(false).watchdog.alerts.is_empty());
     }
 
     #[test]

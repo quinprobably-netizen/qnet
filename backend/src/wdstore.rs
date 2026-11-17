@@ -485,6 +485,35 @@ impl Store {
         true
     }
 
+    /// Set the label of `mac` on every list that holds it (the known list, the
+    /// ADS PASS list and the block list): `Some` replaces what each has (cleaned
+    /// by [`clean_label`]), `None`, or a label that is empty after cleaning,
+    /// takes it away. A device on none of the lists, or a MAC that does not
+    /// parse, is not touched, and no entry is added. True when any label
+    /// changed. No generation goes up: the lists as they are pushed hold
+    /// addresses only, and the labels are pushed (and noticed as changed) on
+    /// their own.
+    pub fn relabel(&mut self, mac: &str, label: Option<&str>) -> bool {
+        let Some(mac) = normalize_mac(mac) else {
+            return false;
+        };
+        let label = label.and_then(clean_label);
+        let mut changed = false;
+        for entry in self
+            .known
+            .iter_mut()
+            .chain(self.exempt.iter_mut())
+            .chain(self.block.iter_mut())
+            .filter(|e| e.mac == mac)
+        {
+            if entry.label != label {
+                entry.label.clone_from(&label);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Take `mac` off the list; true (and `known_gen` up) when it was there.
     pub fn forget(&mut self, mac: &str) -> bool {
         let Some(mac) = normalize_mac(mac) else {
@@ -1082,6 +1111,43 @@ mod tests {
         // A cut that lands on a space does not leave it trailing.
         let spaced = format!("{} {}", "a".repeat(63), "b".repeat(10));
         assert_eq!(clean_label(&spaced), Some("a".repeat(63)));
+    }
+
+    #[test]
+    fn relabel_sets_or_clears_the_label_on_every_list_that_holds_the_device() {
+        let mut s = Store::default();
+        s.know(&mac(1), Some("A"), 1);
+        s.add_exempt(&mac(1), Some("B"), 1);
+        s.add_block(&mac(1), None, 1);
+        s.know(&mac(2), Some("Other"), 1);
+        let gens = (s.known_gen, s.exempt_gen, s.policy_gen);
+        let labels = |s: &Store| {
+            (
+                s.known[0].label.clone(),
+                s.exempt[0].label.clone(),
+                s.block[0].label.clone(),
+            )
+        };
+
+        assert!(s.relabel(&mac(1), Some(" Desk \t")));
+        let desk = Some("Desk".to_string());
+        assert_eq!(labels(&s), (desk.clone(), desk.clone(), desk.clone()));
+        assert_eq!(s.known[1].label.as_deref(), Some("Other"), "another device");
+        // The same label again changes nothing.
+        assert!(!s.relabel(&mac(1), Some("Desk")));
+        // No label (or nothing left of it) takes it away everywhere.
+        assert!(s.relabel(&mac(1), None));
+        assert_eq!(labels(&s), (None, None, None));
+        assert!(!s.relabel(&mac(1), Some("\u{7}")), "nothing to clear");
+        assert_eq!(s.known[1].label.as_deref(), Some("Other"));
+        // No list gains or loses a device, and no generation moves: the lists
+        // that are pushed hold addresses only.
+        assert_eq!((s.known.len(), s.exempt.len(), s.block.len()), (2, 1, 1));
+        assert_eq!((s.known_gen, s.exempt_gen, s.policy_gen), gens);
+        // A device on no list, and an address that does not parse, are left alone.
+        assert!(!s.relabel(&mac(9), Some("Nobody")));
+        assert!(!s.relabel("nonsense", Some("Nobody")));
+        assert_eq!(s.known.len(), 2);
     }
 
     #[test]

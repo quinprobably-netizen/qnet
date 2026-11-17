@@ -52,6 +52,17 @@ knows about the Pi-hole on the LAN. It is a thin QML panel over a Rust binary,
   - **Names:** the labels given with `know`, `ads-pass` and `block` are pushed
     to the Pi (in this PC's order, at most 64, plain ASCII, 24 characters) for
     the panel to show, after each session push, a Pi restart and each edit.
+  - **Cords and gates:** `patch <mac> pass|blocked` is the one verb for a
+    device's cord: with the exempt-by-default mode off it is `exempt` or
+    `unexempt`, with it on `unblock` or `block`, and a device that is where it
+    was told to go already is fine. It then shuts the device's gate if the Pi
+    says it is open. `gate <mac> <secs>` opens a gate (ads pass for that long,
+    at most an hour, in either mode) or shuts it with 0; gates live on the Pi,
+    in its memory, and this PC keeps nothing of them. `label <mac> [label...]`
+    renames a device on every list that holds it, `ack-all` acknowledges every
+    alert at once. The watcher takes the line `devices` on stdin as `refresh`
+    that also has the Pi's devices read at the next poll, so the panel sees its
+    own edit at once.
   - **Panel PIN:** `qnet watchdog pin set` asks for four digits (on stdin,
     never on the command line, no echo on a terminal) and keeps only their
     hash, which it pushes to the Pi after every login and restart so that the
@@ -68,15 +79,19 @@ omarchy restart shell        # QML hot-reload is unreliable; restart to load edi
 qnet pihole setup [address]  # once, in a terminal: pins the cert, stores an app password in the keyring
 qnet watchdog alerts         # qberrypi only: its alerts, one JSON line
 qnet watchdog ack <id>       # acknowledge an alert
+qnet watchdog ack-all        # acknowledge every alert that is not acknowledged yet, in one call
 qnet watchdog devices        # its devices (also its labels, gates, fixed/always, revision), and what this PC knows of them
 qnet watchdog know <mac> [label...]   # add to the known list; pushed to the Pi
 qnet watchdog forget <mac>   # take a device off the list
+qnet watchdog label <mac> [label...]  # this PC's name for a device, on every list that holds it; no words clear it
 qnet watchdog exempt <mac> [label...]   # ADS PASS for it (also marks it known); pushed to the Pi. Alias: ads-pass
 qnet watchdog unexempt <mac> # ads blocked again; the device stays known. Alias: ads-block
 qnet watchdog exempt-default on|off   # every device has ADS PASS but the blocked ones (threats stay blocked)
 qnet watchdog block <mac> [label...]  # keep it fully blocked in that mode (also marks it known, takes it off the ADS PASS list)
 qnet watchdog unblock <mac>  # take it off the block list
 qnet watchdog block-this     # block this computer: the interface of the default route, labelled with the hostname
+qnet watchdog patch <mac> pass|blocked  # one device's cord, in either mode: ADS PASS or blocked; shuts its open gate
+qnet watchdog gate <mac> <secs>         # ADS PASS for a while: 1 to 3600 seconds, 0 shuts the gate (the Pi keeps it in memory)
 qnet watchdog know-all       # add every device the Pi has seen
 qnet watchdog pin set        # the panel's PIN: four digits on stdin (no echo on a terminal); only the hash is kept
 qnet watchdog pin clear      # take the PIN off the running Pi

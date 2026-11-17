@@ -9,12 +9,15 @@
 //!   qnet wifi down|scan|radio on|off|forget <uuid>
 //!   qnet portal                    captive-portal browser, throwaway profile
 //!   qnet watchdog alerts|devices|know-all
-//!   qnet watchdog ack <id>         acknowledge a watchdog alert on the Pi
+//!   qnet watchdog ack <id>|ack-all acknowledge a watchdog alert (or all) on the Pi
 //!   qnet watchdog know <mac> [label...]|forget <mac>   known-device list
+//!   qnet watchdog label <mac> [label...]   this PC's name for a device, on every list
 //!   qnet watchdog exempt <mac> [label...]|unexempt <mac>   ADS PASS list
 //!                                  (aliases: ads-pass, ads-block)
 //!   qnet watchdog exempt-default on|off   every device has ADS PASS but the blocked
 //!   qnet watchdog block <mac> [label...]|unblock <mac>|block-this   block list
+//!   qnet watchdog patch <mac> pass|blocked   one device's cord, in either mode
+//!   qnet watchdog gate <mac> <secs>   ADS PASS for a while (0 shuts it)
 //!   qnet watchdog pin set|clear    the Pi front panel's PIN (digits on stdin)
 //!
 //! One-shot verbs print one JSON line and exit 0 (`ok`) or 1.
@@ -55,10 +58,12 @@ use actions::{ActionErr, ActionResult, Ctx};
 
 const USAGE: &str = "usage: qnet watch | state | dns pihole|auto [--force] | dns pin <uuid> [--force] | \
 pihole pause [secs]|resume|setup <addr> | wifi connect <ap-path>|down|scan|forget <uuid>|radio on|off | portal | \
-watchdog alerts|devices|know-all | watchdog ack <id> | watchdog know <mac> [label...] | watchdog forget <mac> | \
+watchdog alerts|devices|know-all | watchdog ack <id> | watchdog ack-all | watchdog know <mac> [label...] | \
+watchdog forget <mac> | watchdog label <mac> [label...] | \
 watchdog exempt|ads-pass <mac> [label...] | watchdog unexempt|ads-block <mac> | \
 watchdog exempt-default on|off | watchdog block <mac> [label...] | watchdog unblock <mac> | \
-watchdog block-this | watchdog pin set|clear";
+watchdog block-this | watchdog patch <mac> pass|blocked | watchdog gate <mac> <secs> | \
+watchdog pin set|clear";
 
 fn usage() -> ActionErr {
     ActionErr::new("usage", USAGE)
@@ -846,6 +851,130 @@ mod tests {
             p(&["watchdog", "block", M, &long]),
             Ok(block(M, Some(&"x".repeat(64))))
         );
+    }
+
+    fn label(mac: &str, label: Option<&str>) -> Cmd {
+        Cmd::Watchdog(WdCmd::Label {
+            mac: mac.into(),
+            label: label.map(String::from),
+        })
+    }
+
+    #[test]
+    fn the_panels_watchdog_verbs_parse() {
+        assert_eq!(
+            p(&["watchdog", "ack-all"]),
+            Ok(Cmd::Watchdog(WdCmd::AckAll))
+        );
+        for (word, pass) in [("pass", true), ("blocked", false)] {
+            assert_eq!(
+                p(&["watchdog", "patch", M, word]),
+                Ok(Cmd::Watchdog(WdCmd::Patch {
+                    mac: M.into(),
+                    pass
+                }))
+            );
+        }
+        for (secs, want) in [
+            ("0", 0),
+            ("1", 1),
+            ("300", 300),
+            ("3600", 3600),
+            ("0300", 300),
+        ] {
+            assert_eq!(
+                p(&["watchdog", "gate", M, secs]),
+                Ok(Cmd::Watchdog(WdCmd::Gate {
+                    mac: M.into(),
+                    secs: want
+                })),
+                "gate {secs}"
+            );
+        }
+        // The MAC is normalised, as for the other verbs.
+        assert_eq!(
+            p(&["watchdog", "patch", "02-00-00-AA-BB-CC", "pass"]),
+            Ok(Cmd::Watchdog(WdCmd::Patch {
+                mac: "02:00:00:aa:bb:cc".into(),
+                pass: true
+            }))
+        );
+    }
+
+    #[test]
+    fn a_label_verb_label_is_handled_like_a_known_label_and_may_be_empty() {
+        assert_eq!(
+            p(&["watchdog", "label", M, "Living", "room", "TV"]),
+            Ok(label(M, Some("Living room TV")))
+        );
+        assert_eq!(
+            p(&["watchdog", "label", M, "--force", "--if-stale", "x"]),
+            Ok(label(M, Some("--force --if-stale x")))
+        );
+        assert_eq!(
+            p(&["watchdog", "label", M, "  Hall\u{7}way", "cam\t"]),
+            Ok(label(M, Some("Hallway cam")))
+        );
+        // No words, or nothing left of them: clear the label.
+        assert_eq!(p(&["watchdog", "label", M]), Ok(label(M, None)));
+        assert_eq!(p(&["watchdog", "label", M, "", " "]), Ok(label(M, None)));
+        let long = "x".repeat(100);
+        assert_eq!(
+            p(&["watchdog", "label", M, &long]),
+            Ok(label(M, Some(&"x".repeat(64))))
+        );
+    }
+
+    #[test]
+    fn bad_input_for_the_panels_watchdog_verbs_is_rejected_before_anything_runs() {
+        // A gate's time is a whole number of seconds, 0 to 3600.
+        for secs in [
+            "3601",
+            "-1",
+            "+5",
+            "1.5",
+            "",
+            " 60",
+            "60 ",
+            "0x10",
+            "1e3",
+            "abc",
+            "65536",
+            "99999999999999999999999",
+        ] {
+            let e = p(&["watchdog", "gate", M, secs]).unwrap_err();
+            assert_eq!(e.code, "invalid", "gate {secs:?}");
+            assert!(e.detail.contains("3600"), "{}", e.detail);
+        }
+        for mac in ["02:00:00:00:00", "zz:00:00:00:00:01", "020000000001", ""] {
+            for args in [
+                &["watchdog", "gate", mac, "60"][..],
+                &["watchdog", "patch", mac, "pass"],
+                &["watchdog", "label", mac, "Desk"],
+                &["watchdog", "label", mac],
+            ] {
+                let e = p(args).unwrap_err();
+                assert_eq!(e.code, "invalid", "{args:?}");
+            }
+        }
+        for bad in [
+            &["watchdog", "ack-all", "now"][..],
+            &["watchdog", "ack-all", "7"],
+            &["watchdog", "gate"],
+            &["watchdog", "gate", M],
+            &["watchdog", "gate", "60"],
+            &["watchdog", "gate", M, "60", "extra"],
+            &["watchdog", "patch"],
+            &["watchdog", "patch", M],
+            &["watchdog", "patch", M, "maybe"],
+            &["watchdog", "patch", M, "PASS"],
+            &["watchdog", "patch", M, "exempt"],
+            &["watchdog", "patch", M, "pass", "blocked"],
+            &["watchdog", "label"],
+        ] {
+            let e = p(bad).unwrap_err();
+            assert_eq!(e.code, "usage", "{bad:?} -> {e:?}");
+        }
     }
 
     #[test]

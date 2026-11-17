@@ -1,6 +1,6 @@
 //! A fake Pi for the watchdog tests: the Pi-hole login and stats endpoints
 //! plus qberrypi's `/api/qbp/` watchdog (alerts, ack, acked, devices, known,
-//! exempt, policy, labels, panel), behind the throwaway TLS server of
+//! exempt, policy, labels, gate, panel), behind the throwaway TLS server of
 //! `https::testutil`.
 //!
 //! The model lives in [`PiState`], shared with the test through [`FakePi`], so
@@ -18,8 +18,10 @@
 //! moves with every change of the pushed lists, the labels and the gates,
 //! whoever makes it ([`FakePi::panel_ads_pass`] is the front panel's tap), and
 //! `PUT devices/exempt` and `devices/policy` answer 409 with the revision
-//! that is when they are given an `if_rev` that is not it. Test data uses
-//! documentation addresses (192.0.2.x) and locally administered MACs
+//! that is when they are given an `if_rev` that is not it. `PUT devices/gate`
+//! opens or shuts one device's gate, 404 for a device the Pi does not list and
+//! 409 with the word `fixed` or `always` for one it will not gate. Test data
+//! uses documentation addresses (192.0.2.x) and locally administered MACs
 //! (02:00:00:...) only.
 
 use std::sync::{Arc, Mutex};
@@ -146,6 +148,9 @@ pub struct PiState {
     staged_labels: Vec<(String, String)>,
     /// The seconds that the open gates have left, by MAC (memory only).
     pub gates: Vec<(String, u16)>,
+    /// The devices that are the router or the Pi (or claim their addresses):
+    /// never exempt, and `PUT devices/gate` refuses them.
+    pub always: Vec<String>,
     /// The PIN hash the desktop pushed for this boot, if it did (memory only).
     pub pin_hash: Option<String>,
     /// Panel taps that happen right after the next `GET devices` is answered:
@@ -184,6 +189,9 @@ pub struct PiState {
     /// The bodies of `PUT panel`, every one that reached the route (also the
     /// ones answered 400 or 500).
     pub panel_puts: Vec<Value>,
+    /// The bodies of `PUT devices/gate`, every one that reached the route
+    /// (also the ones answered 400, 404 or 409).
+    pub gate_puts: Vec<Value>,
     /// How many pushes were answered 409.
     pub conflicts: u64,
     /// The `since` of every `GET alerts`.
@@ -220,6 +228,7 @@ impl PiState {
             labels: Vec::new(),
             staged_labels: Vec::new(),
             gates: Vec::new(),
+            always: Vec::new(),
             pin_hash: None,
             taps_after_next_get: Vec::new(),
             churn: false,
@@ -235,6 +244,7 @@ impl PiState {
             policy_puts: Vec::new(),
             label_puts: Vec::new(),
             panel_puts: Vec::new(),
+            gate_puts: Vec::new(),
             conflicts: 0,
             since: Vec::new(),
         }
@@ -272,6 +282,9 @@ impl PiState {
     /// mode every device but the blocked ones, otherwise the ones on the
     /// effective exempt list.
     pub fn is_exempt(&self, mac: &str) -> bool {
+        if self.always.iter().any(|m| m == mac) {
+            return false;
+        }
         if self.gates.iter().any(|(m, _)| m == mac) {
             return true;
         }
@@ -306,6 +319,12 @@ impl PiState {
         }
     }
 
+    /// The Pi's configuration decides the device: it names it on the list of
+    /// the mode in force (the fake has a configured exempt list only).
+    fn is_fixed(&self, mac: &str) -> bool {
+        !self.exempt_default && self.exempt_config.iter().any(|m| m == mac)
+    }
+
     fn devices_json(&self) -> Value {
         let effective = self.exempt_macs();
         let devices: Vec<Value> = self
@@ -327,15 +346,10 @@ impl PiState {
                 if self.panel_support {
                     let label = self.labels.iter().find(|(l, _)| l == m).map(|(_, n)| n);
                     let gate = self.gates.iter().find(|(g, _)| g == m).map(|(_, s)| s);
-                    let fixed = if self.exempt_default {
-                        false
-                    } else {
-                        self.exempt_config.contains(m)
-                    };
                     d["label"] = json!(label);
                     d["gate_left_secs"] = json!(gate);
-                    d["fixed"] = json!(fixed);
-                    d["always"] = json!(false);
+                    d["fixed"] = json!(self.is_fixed(m));
+                    d["always"] = json!(self.always.contains(m));
                 }
                 d
             })
@@ -369,20 +383,31 @@ impl PiState {
             return None;
         }
         self.conflicts += 1;
-        let answer = json!({
+        Some(conflict(json!({
             "error": {"key": "stale", "message": "The lists changed since this revision; read them again", "hint": null},
             "rev": self.dev_rev,
             "took": 0.0,
-        })
-        .to_string();
-        Some(
-            format!(
-                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{answer}",
-                answer.len()
-            )
-            .into_bytes(),
-        )
+        })))
     }
+}
+
+/// A 409 with `answer` as its body.
+fn conflict(answer: Value) -> Vec<u8> {
+    let answer = answer.to_string();
+    format!(
+        "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{answer}",
+        answer.len()
+    )
+    .into_bytes()
+}
+
+/// The 409 of a gate that the Pi refuses: the Pi's error object, with a word
+/// for the reason and no address.
+fn refused(key: &str, message: &str) -> Vec<u8> {
+    conflict(json!({
+        "error": {"key": key, "message": message, "hint": null},
+        "took": 0.0,
+    }))
 }
 
 /// The request's first line and its JSON body (null when it has none).
@@ -678,6 +703,40 @@ fn respond(st: &mut PiState, req: &str) -> Vec<u8> {
             st.dev_rev += 1;
         }
         return ok_json(&json!({"labels": kept, "rev": st.dev_rev}).to_string());
+    }
+    if method == "PUT" && path == "/api/qbp/devices/gate" {
+        if !st.panel_support {
+            return NOT_FOUND.to_vec();
+        }
+        st.gate_puts.push(body.clone());
+        // The Pi refuses a body that is not `{"mac": <address>, "secs": 0 to
+        // 3600}` (400), a device it does not list (404), and a device that its
+        // configuration decides or that is the router or the Pi (409).
+        let mac = body["mac"]
+            .as_str()
+            .filter(|m| crate::watchdog::normalize_mac(m).as_deref() == Some(*m));
+        let secs = body["secs"].as_u64().filter(|&s| s <= 3600);
+        let (Some(mac), Some(secs)) = (mac, secs) else {
+            return BAD_REQUEST.to_vec();
+        };
+        if !st.devices.iter().any(|(m, _)| m == mac) {
+            return NOT_FOUND.to_vec();
+        }
+        if st.always.iter().any(|m| m == mac) {
+            return refused("always", "The router and the Pi are never exempt");
+        }
+        if st.is_fixed(mac) {
+            return refused("fixed", "The configuration decides this device");
+        }
+        let before = st.gates.clone();
+        st.gates.retain(|(m, _)| m != mac);
+        if secs > 0 {
+            st.gates.push((mac.to_string(), secs as u16));
+        }
+        if st.gates != before {
+            st.dev_rev += 1;
+        }
+        return ok_json(&json!({"gate_left_secs": secs, "rev": st.dev_rev}).to_string());
     }
     if method == "PUT" && path == "/api/qbp/panel" {
         if !st.panel_support {

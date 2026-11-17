@@ -3,7 +3,11 @@
 //! devices that are exempt from ad blocking; threat blocking stays) and the
 //! exempt-by-default policy (the mode in which every device has ADS PASS
 //! except the ones on a block list) of this PC, which are then pushed to the
-//! Pi, and set or clear the PIN of the Pi's front panel.
+//! Pi, and set or clear the PIN of the Pi's front panel. A few verbs are the
+//! front panel's own (the "patch bay" of the watchdog tab): `patch` puts one
+//! device on ADS PASS or back to blocked whatever the mode, `gate` opens a
+//! device's gate for a while or shuts it, `label` names a device and `ack-all`
+//! acknowledges every alert at once.
 //!
 //! Each verb is a function of the API client, the path of the PC-side store
 //! and the time (unix seconds), so tests run against the fake Pi and a
@@ -49,13 +53,13 @@ use crate::actions::{ActionErr, ActionResult};
 use crate::pihole::Pihole;
 use crate::pinhash::PinHash;
 use crate::state::{WatchdogAlertOut, WatchdogDeviceOut};
-use crate::watchdog::{self, normalize_mac, Inventory, ListPut, Qbp};
+use crate::watchdog::{self, normalize_mac, GatePut, Inventory, ListPut, Qbp};
 use crate::wdstore::{self, clean_label, Store};
 
-pub const USAGE: &str = "usage: qnet watchdog alerts | devices | know-all | ack <id> | \
-know <mac> [label...] | forget <mac> | exempt|ads-pass <mac> [label...] | \
+pub const USAGE: &str = "usage: qnet watchdog alerts | devices | know-all | ack <id> | ack-all | \
+know <mac> [label...] | forget <mac> | label <mac> [label...] | exempt|ads-pass <mac> [label...] | \
 unexempt|ads-block <mac> | exempt-default on|off | block <mac> [label...] | \
-unblock <mac> | block-this | pin set|clear";
+unblock <mac> | block-this | patch <mac> pass|blocked | gate <mac> <secs> | pin set|clear";
 
 /// What an ADS PASS push says when the Pi answered 404 for the route (an older
 /// Pi, or a Pi-hole that is not a qberrypi at all).
@@ -73,6 +77,10 @@ const UNSUPPORTED_LABELS: &str = "the Pi's software does not show device names y
 /// What a PIN push says when the Pi answered 404 for the route.
 const UNSUPPORTED_PANEL: &str = "the Pi's software does not take a panel PIN yet";
 
+/// What `gate` says when the Pi answered 404 for the route although it has a
+/// watchdog and lists the device (a Pi from before the front panel).
+const UNSUPPORTED_GATE: &str = "the Pi's software does not take gates yet";
+
 /// The warning that goes with turning the exempt-by-default mode on.
 const EXEMPT_DEFAULT_NOTE: &str = "every device that is not on the block list now has ADS PASS \
 (threat blocking stays); keep a device's ads blocked with `qnet watchdog block <mac>`";
@@ -89,6 +97,8 @@ pub enum WdCmd {
     Ack {
         id: u64,
     },
+    /// Acknowledge every alert that is not acknowledged yet, in one call.
+    AckAll,
     Devices,
     /// `mac` in lower-case colon form, `label` already cleaned (at most 64
     /// characters; longer is cut, not refused).
@@ -100,6 +110,26 @@ pub enum WdCmd {
         mac: String,
     },
     KnowAll,
+    /// Set this PC's label on every list that holds the device (none: take it
+    /// away); a device on no list is put on the known list as `Know` does.
+    /// `label` already cleaned, as for `Know`.
+    Label {
+        mac: String,
+        label: Option<String>,
+    },
+    /// Open the gate of a device (the panel's ADS PASS for a while) for `secs`
+    /// seconds, or shut it with 0: whole seconds from 0 to 3600.
+    Gate {
+        mac: String,
+        secs: u16,
+    },
+    /// The panel's one verb for a device's cord: `pass` gives it ADS PASS (the
+    /// `Exempt` logic, or `Unblock` in the exempt-by-default mode), otherwise
+    /// it is blocked (`Unexempt`, or `Block`); and its gate is shut.
+    Patch {
+        mac: String,
+        pass: bool,
+    },
     /// As `Know`, and the device is put on the ADS PASS list as well
     /// (`exempt`, or `ads-pass`).
     Exempt {
@@ -154,6 +184,23 @@ fn parse_mac(s: &str) -> Result<String, ActionErr> {
     })
 }
 
+/// Whole seconds of a gate, 0 to [`watchdog::GATE_MAX_SECS`] (no sign, no
+/// spaces).
+fn parse_secs(s: &str) -> Result<u16, ActionErr> {
+    parse_id(s)
+        .and_then(|n| u16::try_from(n).ok())
+        .filter(|&n| n <= watchdog::GATE_MAX_SECS)
+        .ok_or_else(|| {
+            ActionErr::new(
+                "invalid",
+                format!(
+                    "a gate's time is a whole number of seconds from 0 to {} (0 shuts it)",
+                    watchdog::GATE_MAX_SECS
+                ),
+            )
+        })
+}
+
 /// Parse what follows `watchdog` on the command line. The words are taken as
 /// typed (a label may hold anything, even words that look like flags); bad
 /// shapes are `usage`, a bad id or MAC is `invalid`.
@@ -163,6 +210,7 @@ pub fn parse(args: &[String]) -> Result<WdCmd, ActionErr> {
         ["alerts"] => Ok(WdCmd::Alerts),
         ["devices"] => Ok(WdCmd::Devices),
         ["know-all"] => Ok(WdCmd::KnowAll),
+        ["ack-all"] => Ok(WdCmd::AckAll),
         ["ack", id] => parse_id(id).map(|id| WdCmd::Ack { id }).ok_or_else(|| {
             ActionErr::new(
                 "invalid",
@@ -175,6 +223,18 @@ pub fn parse(args: &[String]) -> Result<WdCmd, ActionErr> {
         ["know", mac, label @ ..] => Ok(WdCmd::Know {
             mac: parse_mac(mac)?,
             label: clean_label(&label.join(" ")),
+        }),
+        ["label", mac, label @ ..] => Ok(WdCmd::Label {
+            mac: parse_mac(mac)?,
+            label: clean_label(&label.join(" ")),
+        }),
+        ["gate", mac, secs] => Ok(WdCmd::Gate {
+            mac: parse_mac(mac)?,
+            secs: parse_secs(secs)?,
+        }),
+        ["patch", mac, state @ ("pass" | "blocked")] => Ok(WdCmd::Patch {
+            mac: parse_mac(mac)?,
+            pass: *state == "pass",
         }),
         ["unexempt" | "ads-block", mac] => Ok(WdCmd::Unexempt {
             mac: parse_mac(mac)?,
@@ -215,10 +275,14 @@ pub fn run_with(
     match cmd {
         WdCmd::Alerts => alerts(api),
         WdCmd::Ack { id } => ack(api, store_path, now, *id),
+        WdCmd::AckAll => ack_all(api, store_path, now),
         WdCmd::Devices => devices(api, store_path),
         WdCmd::Know { mac, label } => know(api, store_path, now, mac, label.as_deref()),
         WdCmd::Forget { mac } => forget(api, store_path, mac),
         WdCmd::KnowAll => know_all(api, store_path, now),
+        WdCmd::Label { mac, label } => set_label(api, store_path, now, mac, label.as_deref()),
+        WdCmd::Gate { mac, secs } => gate(api, mac, *secs),
+        WdCmd::Patch { mac, pass } => patch(api, store_path, now, mac, *pass),
         WdCmd::Exempt { mac, label } => exempt(api, store_path, now, mac, label.as_deref()),
         WdCmd::Unexempt { mac } => unexempt(api, store_path, now, mac),
         WdCmd::ExemptDefault { on } => exempt_default(api, store_path, now, *on),
@@ -247,6 +311,10 @@ fn store_err(e: std::io::Error) -> ActionErr {
 
 fn exempt_store_err(e: std::io::Error) -> ActionErr {
     ActionErr::new("store", format!("could not save the ADS PASS list: {e}"))
+}
+
+fn label_store_err(e: std::io::Error) -> ActionErr {
+    ActionErr::new("store", format!("could not save the label: {e}"))
 }
 
 fn pin_store_err(e: std::io::Error) -> ActionErr {
@@ -610,6 +678,39 @@ pub fn ack(api: &mut Pihole, store_path: &Path, now: u64, id: u64) -> ActionResu
     Ok(json!({ "ok": true, "id": id, "key": key, "saved": saved }))
 }
 
+/// `watchdog ack-all`: acknowledge every alert that the Pi holds and that is not
+/// acknowledged yet, in one `PUT alerts/acked` with their keys, and remember the
+/// keys here as [`ack`] does. Nothing unacknowledged: `acked: 0`, and no
+/// request but the read. The result is `{"ok":true,"acked":n,"saved":bool}`;
+/// `acked` counts the keys sent, and `saved: false` means the Pi took them but
+/// this PC could not record them.
+pub fn ack_all(api: &mut Pihole, store_path: &Path, now: u64) -> ActionResult {
+    let page = match watchdog::get_alerts(api, 0)? {
+        Qbp::Absent => return Err(absent()),
+        Qbp::Present(p) => p,
+    };
+    let keys: Vec<String> = page
+        .alerts
+        .iter()
+        .filter(|a| !a.acked)
+        .map(|a| a.key.clone())
+        .collect();
+    if keys.is_empty() {
+        return Ok(json!({ "ok": true, "acked": 0, "saved": true }));
+    }
+    // The watchdog was there a moment ago, so a 404 now means it went away.
+    if watchdog::restore_acked(api, &keys)? == Qbp::Absent {
+        return Err(absent());
+    }
+    let saved = wdstore::update(store_path, |s| {
+        for key in &keys {
+            s.add_acked(key, now);
+        }
+    })
+    .is_ok();
+    Ok(json!({ "ok": true, "acked": keys.len(), "saved": saved }))
+}
+
 // -- devices ------------------------------------------------------------------
 
 /// `watchdog devices`: the Pi's inventory, last seen first, with what this PC
@@ -816,6 +917,45 @@ pub fn forget(api: &mut Pihole, store_path: &Path, mac: &str) -> ActionResult {
         .ok_or_else(|| ActionErr::new("not-found", "that device is not on the known list"))?;
     let mut out = json!({ "ok": true, "mac": mac, "known": snap.macs.len() });
     push(api, store_path, &snap).add_to(&mut out);
+    push_labels(api, store_path).add_as(&mut out, "labelsPushed", "labelsPushError");
+    Ok(out)
+}
+
+/// `watchdog label <mac> [label]`: set this PC's label of the device on every
+/// list of this PC that holds it (the known list, the ADS PASS list and the
+/// block list), or take it away without a label, and push the names. Only the
+/// labels change: no list gets a device it did not hold, nothing is
+/// pushed but the names. A device that is on none of the lists is put on the
+/// known list exactly as [`know`] does (its result is the answer), but only
+/// when there is a label to give: clearing the label of a device that has none
+/// to clear is an `ok` that changes nothing. The result is `{"ok":true,"mac",
+/// "label"?,"labelsPushed":bool,"labelsPushError"?}` (`label` is left out when
+/// it was cleared).
+pub fn set_label(
+    api: &mut Pihole,
+    store_path: &Path,
+    now: u64,
+    mac: &str,
+    label: Option<&str>,
+) -> ActionResult {
+    let mac =
+        normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
+    let label = label.and_then(clean_label);
+    let listed = wdstore::update(store_path, |s| {
+        let listed = s.is_known(&mac) || s.is_exempt(&mac) || s.is_blocked(&mac);
+        if listed {
+            s.relabel(&mac, label.as_deref());
+        }
+        listed
+    })
+    .map_err(label_store_err)?;
+    if !listed && label.is_some() {
+        return know(api, store_path, now, &mac, label.as_deref());
+    }
+    let mut out = json!({ "ok": true, "mac": mac });
+    if let Some(l) = label {
+        out["label"] = json!(l);
+    }
     push_labels(api, store_path).add_as(&mut out, "labelsPushed", "labelsPushError");
     Ok(out)
 }
@@ -1089,6 +1229,105 @@ pub fn unblock(api: &mut Pihole, store_path: &Path, now: u64, mac: &str) -> Acti
     );
     push_labels(api, store_path).add_as(&mut out, "labelsPushed", "labelsPushError");
     Ok(out)
+}
+
+// -- gates and patches --------------------------------------------------------
+
+/// `watchdog gate <mac> <secs>`: open the device's gate (ads pass for it for a
+/// while, in either mode) for `secs` seconds, 1 to 3600, or shut it with 0
+/// (`PUT devices/gate`). The gate lives on the Pi, in memory, and shuts by
+/// itself; this PC keeps nothing. The result is `{"ok":true,"mac",
+/// "gateLeftSecs":n|null}`: the seconds the Pi says the gate has left, `null`
+/// once it is shut. Errors: `invalid`, `absent` (no watchdog), `unsupported`
+/// (a Pi from before the front panel: 404 for the route although it has a
+/// watchdog and lists the device), `not-found` (a Pi with a front panel that
+/// lists no such device: a device that is offline has no gate), and `refused`
+/// with the Pi's own words when it will not gate the device (the configuration
+/// decides it, it is the router or the Pi, or too many gates are open).
+pub fn gate(api: &mut Pihole, mac: &str, secs: u16) -> ActionResult {
+    let mac =
+        normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
+    if secs > watchdog::GATE_MAX_SECS {
+        return Err(ActionErr::new(
+            "invalid",
+            "a gate's time is a whole number of seconds from 0 to 3600",
+        ));
+    }
+    match watchdog::put_gate(api, &mac, secs)? {
+        GatePut::Done { left, .. } => Ok(json!({ "ok": true, "mac": mac, "gateLeftSecs": left })),
+        GatePut::Refused(why) => Err(ActionErr::new("refused", why)),
+        // A 404 is a route the Pi does not have, a device it does not list, or
+        // no watchdog at all: the devices say which.
+        GatePut::NotFound => match watchdog::get_devices(api)? {
+            Qbp::Absent => Err(absent()),
+            Qbp::Present(inv) if inv.rev.is_some() && !inv.devices.iter().any(|d| d.mac == mac) => {
+                Err(ActionErr::new(
+                    "not-found",
+                    "the Pi lists no device with that address",
+                ))
+            }
+            Qbp::Present(_) => Err(ActionErr::new("unsupported", UNSUPPORTED_GATE)),
+        },
+    }
+}
+
+/// `watchdog patch <mac> pass|blocked`: the panel's one verb for a device's
+/// cord, whichever mode this PC is in. With the exempt-by-default mode off,
+/// `pass` is [`exempt`] and `blocked` is [`unexempt`]; with it on, `blocked` is
+/// [`block`] and `pass` is [`unblock`]. A device that is where it was asked to
+/// go already (`not-found` from `unexempt` or `unblock`: it is not on the list)
+/// is `ok`. Then, if the Pi says the device's gate is open, the gate is shut
+/// (see [`gate`]), so that a cord decides and not a timer. The result is the
+/// verb's own result (`{"ok":true,"mac"}` alone when there was nothing to do)
+/// plus `"patch":"pass"|"blocked"` and `"gateShut":bool`; a gate that could not
+/// be read or shut leaves the edit and says why in `gateShutError`. A Pi with
+/// no watchdog has no gate to shut: `gateShut` is false and there is no error.
+pub fn patch(api: &mut Pihole, store_path: &Path, now: u64, mac: &str, pass: bool) -> ActionResult {
+    let mac =
+        normalize_mac(mac).ok_or_else(|| ActionErr::new("invalid", "not a hardware address"))?;
+    let by_default = Store::load(store_path).exempt_default;
+    let done = match (by_default, pass) {
+        (false, true) => exempt(api, store_path, now, &mac, None),
+        (false, false) => unexempt(api, store_path, now, &mac),
+        (true, false) => block(api, store_path, now, &mac, None),
+        (true, true) => unblock(api, store_path, now, &mac),
+    };
+    let mut out = match done {
+        Ok(out) => out,
+        Err(e) if e.code == "not-found" => json!({ "ok": true, "mac": mac }),
+        Err(e) => return Err(e),
+    };
+    out["patch"] = json!(if pass { "pass" } else { "blocked" });
+    match shut_gate(api, &mac) {
+        Ok(shut) => out["gateShut"] = json!(shut),
+        Err(why) => {
+            out["gateShut"] = json!(false);
+            out["gateShutError"] = json!(why);
+        }
+    }
+    Ok(out)
+}
+
+/// Shut the gate of `mac` if the Pi says it is open: `Ok(true)` when it did,
+/// `Ok(false)` when there was nothing to shut (no watchdog, the device not
+/// listed, its gate shut), the reason when the devices could not be read or the
+/// gate could not be shut.
+fn shut_gate(api: &mut Pihole, mac: &str) -> Result<bool, String> {
+    let inv = match watchdog::get_devices(api) {
+        Ok(Qbp::Present(inv)) => inv,
+        Ok(Qbp::Absent) => return Ok(false),
+        Err(e) => return Err(e.message().to_string()),
+    };
+    let open = inv
+        .devices
+        .iter()
+        .find(|d| d.mac == mac)
+        .and_then(|d| d.gate_left_secs)
+        .is_some_and(|left| left > 0);
+    if !open {
+        return Ok(false);
+    }
+    gate(api, mac, 0).map(|_| true).map_err(|e| e.detail)
 }
 
 // -- the panel's PIN ----------------------------------------------------------
@@ -3807,5 +4046,603 @@ mod tests {
         let e = pin_clear(&mut rig.api, &bad).unwrap_err();
         assert_eq!(e.code, "store");
         assert_eq!(rig.pi.with(|s| s.panel_puts.len()), 0);
+    }
+
+    // -- the patch bay's verbs: ack-all, label, gate, patch -----------------------
+
+    impl Rig {
+        fn ack_all(&mut self) -> ActionResult {
+            let path = self.path();
+            ack_all(&mut self.api, &path, T0 + 500)
+        }
+        fn set_label(&mut self, mac: &str, label: Option<&str>) -> ActionResult {
+            let path = self.path();
+            set_label(&mut self.api, &path, T0 + 999, mac, label)
+        }
+        fn patch(&mut self, mac: &str, pass: bool) -> ActionResult {
+            let path = self.path();
+            patch(&mut self.api, &path, T0 + 999, mac, pass)
+        }
+        fn gates(&self) -> Vec<(String, u16)> {
+            self.pi.with(|s| s.gates.clone())
+        }
+        fn gate_puts(&self) -> Vec<Value> {
+            self.pi.with(|s| s.gate_puts.clone())
+        }
+        fn pi_labels(&self) -> Vec<(String, String)> {
+            self.pi.with(|s| s.labels.clone())
+        }
+    }
+
+    // ack-all
+
+    #[test]
+    fn ack_all_acknowledges_every_unacknowledged_alert_in_one_call_and_remembers_the_keys() {
+        let mut rig = Rig::new();
+        rig.pi.raise("new_device", "02:00:00:00:00:07", None, 1);
+        rig.pi.raise("dga", "x.example", Some("192.0.2.5"), 2);
+        rig.pi.raise("tunnel", "y.example", Some("192.0.2.6"), 3);
+        rig.pi.ack(2);
+        let v = rig.ack_all().unwrap();
+        assert_eq!(v, json!({"ok": true, "acked": 2, "saved": true}));
+        assert_eq!(
+            rig.pi.with(|s| s.acked_puts.clone()),
+            vec![json!({"acked": [key(1), key(3)]})],
+            "one call with the keys that were not acknowledged"
+        );
+        assert_eq!(rig.pi.count("POST /api/qbp/alerts"), 0);
+        assert!(rig.pi.with(|s| s.alerts.iter().all(|a| a.acked)));
+        let store = rig.store();
+        assert_eq!(store.acked_keys(), vec![key(1), key(3)]);
+        assert!(store.acked.iter().all(|a| a.at == T0 + 500));
+    }
+
+    #[test]
+    fn ack_all_with_nothing_unacknowledged_sends_nothing() {
+        let mut rig = Rig::new();
+        let quiet = json!({"ok": true, "acked": 0, "saved": true});
+        assert_eq!(rig.ack_all().unwrap(), quiet);
+        rig.pi.raise("dga", "x.example", None, 1);
+        rig.pi.ack(1);
+        assert_eq!(rig.ack_all().unwrap(), quiet);
+        assert_eq!(rig.pi.count("PUT /api/qbp/alerts/acked"), 0);
+        assert!(!rig.path().exists(), "nothing was written");
+    }
+
+    #[test]
+    fn ack_all_goes_out_in_chunks_when_the_keys_do_not_fit_one_body() {
+        let mut rig = Rig::new();
+        for n in 1..=250 {
+            rig.pi.raise("dga", "x.example", None, n);
+        }
+        let v = rig.ack_all().unwrap();
+        assert_eq!(v, json!({"ok": true, "acked": 250, "saved": true}));
+        assert_eq!(rig.pi.with(|s| s.acked_puts.len()), 2);
+        assert!(rig.pi.with(|s| s.alerts.iter().all(|a| a.acked)));
+        assert_eq!(rig.store().acked.len(), 250);
+    }
+
+    #[test]
+    fn ack_all_says_saved_false_when_only_the_pi_took_them() {
+        let mut rig = Rig::new();
+        rig.pi.raise("dga", "x.example", None, 1);
+        let bad = unwritable(rig.dir.path());
+        let v = ack_all(&mut rig.api, &bad, T0).unwrap();
+        assert_eq!(v, json!({"ok": true, "acked": 1, "saved": false}));
+        assert!(rig.pi.with(|s| s.alerts[0].acked), "the Pi has it");
+    }
+
+    #[test]
+    fn ack_all_on_a_real_pihole_is_absent_and_puts_nothing() {
+        let mut rig = Rig::on(FakePi::pihole_only(20));
+        assert_eq!(err(rig.ack_all()).code, "absent");
+        assert_eq!(rig.pi.count("PUT /api/qbp"), 0);
+        assert!(!rig.path().exists());
+    }
+
+    // label
+
+    /// A rig whose store has one device, `mac(2)`, on all three lists with a
+    /// label of each, and `mac(3)` on the known list only.
+    fn rig_with_labels() -> Rig {
+        let rig = Rig::new();
+        rig.edit(|s| {
+            s.know(&mac(2), Some("Old"), T0);
+            s.add_exempt(&mac(2), Some("Older"), T0);
+            s.add_block(&mac(2), None, T0);
+            s.know(&mac(3), Some("Other"), T0);
+        });
+        rig
+    }
+
+    #[test]
+    fn label_sets_the_label_on_every_list_that_holds_the_device_and_pushes_only_the_names() {
+        let mut rig = rig_with_labels();
+        let before = rig.store();
+        let v = rig.set_label(&mac(2), Some("Desk PC")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "label": "Desk PC", "labelsPushed": true})
+        );
+        let store = rig.store();
+        let label_of = |l: &[wdstore::Known], m: String| {
+            l.iter().find(|k| k.mac == m).and_then(|k| k.label.clone())
+        };
+        assert_eq!(label_of(&store.known, mac(2)).as_deref(), Some("Desk PC"));
+        assert_eq!(label_of(&store.exempt, mac(2)).as_deref(), Some("Desk PC"));
+        assert_eq!(label_of(&store.block, mac(2)).as_deref(), Some("Desk PC"));
+        assert_eq!(label_of(&store.known, mac(3)).as_deref(), Some("Other"));
+        assert_eq!(
+            (store.known_gen, store.exempt_gen, store.policy_gen),
+            (before.known_gen, before.exempt_gen, before.policy_gen),
+            "no list changed"
+        );
+        assert_eq!(
+            rig.pi_labels(),
+            vec![
+                (mac(2), "Desk PC".to_string()),
+                (mac(3), "Other".to_string())
+            ]
+        );
+        for route in ["known", "exempt", "policy"] {
+            assert_eq!(rig.pi.count(&format!("PUT /api/qbp/devices/{route}")), 0);
+        }
+    }
+
+    #[test]
+    fn label_without_words_clears_it_on_every_list_and_keeps_the_device_listed() {
+        let mut rig = rig_with_labels();
+        let v = rig.set_label(&mac(2), None).unwrap();
+        assert_eq!(v, json!({"ok": true, "mac": mac(2), "labelsPushed": true}));
+        let store = rig.store();
+        assert!(store
+            .known
+            .iter()
+            .all(|k| k.mac != mac(2) || k.label.is_none()));
+        assert!(store.exempt[0].label.is_none() && store.block[0].label.is_none());
+        assert!(store.is_known(&mac(2)) && store.is_exempt(&mac(2)) && store.is_blocked(&mac(2)));
+        assert_eq!(rig.pi_labels(), vec![(mac(3), "Other".to_string())]);
+    }
+
+    #[test]
+    fn label_of_a_device_on_no_list_puts_it_on_the_known_list_as_know_does() {
+        let mut rig = Rig::new();
+        let v = rig.set_label(&mac(2), Some("Printer")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "label": "Printer", "known": 1,
+                   "pushed": true, "labelsPushed": true})
+        );
+        let store = rig.store();
+        assert_eq!(store.known_macs(), vec![mac(2)]);
+        assert_eq!(store.known[0].label.as_deref(), Some("Printer"));
+        assert_eq!(store.known[0].first_seen, T0, "when the Pi first saw it");
+        assert!(store.exempt.is_empty() && store.block.is_empty());
+        assert_eq!(rig.pi_known(), vec![mac(2)]);
+        assert_eq!(rig.pi_labels(), vec![(mac(2), "Printer".to_string())]);
+    }
+
+    #[test]
+    fn clearing_the_label_of_a_device_on_no_list_changes_nothing() {
+        let mut rig = Rig::new();
+        let v = rig.set_label(&mac(2), None).unwrap();
+        assert_eq!(v, json!({"ok": true, "mac": mac(2), "labelsPushed": true}));
+        assert!(!rig.path().exists(), "nothing was written");
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/known"), 0);
+    }
+
+    #[test]
+    fn a_label_is_cleaned_and_cut_at_64_characters_on_every_list() {
+        let mut rig = rig_with_labels();
+        let v = rig.set_label(&mac(2), Some(&"x".repeat(100))).unwrap();
+        assert_eq!(v["label"].as_str().unwrap().chars().count(), 64);
+        let store = rig.store();
+        assert_eq!(store.exempt[0].label, store.known[0].label);
+        assert_eq!(rig.pi_labels()[0].1.len(), 24, "the Pi's own limit");
+    }
+
+    #[test]
+    fn label_on_a_real_pihole_still_edits_this_pcs_lists() {
+        let mut rig = Rig::on(FakePi::pihole_only(20));
+        rig.edit(|s| s.know(&mac(2), Some("Old"), T0));
+        let v = rig.set_label(&mac(2), Some("New")).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "label": "New", "labelsPushed": false,
+                   "labelsPushError": "the Pi's software does not show device names yet"})
+        );
+        assert_eq!(rig.store().known[0].label.as_deref(), Some("New"));
+    }
+
+    #[test]
+    fn label_needs_a_writable_store_and_a_full_known_list_refuses_a_new_device() {
+        let mut rig = Rig::new();
+        let bad = unwritable(rig.dir.path());
+        let e = set_label(&mut rig.api, &bad, T0, &mac(1), Some("A")).unwrap_err();
+        assert_eq!(e.code, "store");
+        assert!(e.detail.contains("label"), "{}", e.detail);
+        assert_eq!(rig.pi.qbp_requests(), 0);
+        rig.edit(|s| {
+            for i in 1..=wdstore::MAX_ENTRIES {
+                s.know(&mac(i), None, T0);
+            }
+        });
+        assert_eq!(
+            err(rig.set_label(&mac(5000), Some("One too many"))).code,
+            "full"
+        );
+        assert_eq!(
+            rig.set_label(&mac(7), Some("Seventh")).unwrap()["label"],
+            "Seventh"
+        );
+    }
+
+    // gate
+
+    #[test]
+    fn gate_opens_a_gate_and_shuts_it_with_zero() {
+        let mut rig = Rig::new();
+        let v = gate(&mut rig.api, &mac(2), 300).unwrap();
+        assert_eq!(v, json!({"ok": true, "mac": mac(2), "gateLeftSecs": 300}));
+        assert_eq!(rig.gates(), vec![(mac(2), 300)]);
+        // A new time replaces the old, and an hour is the most.
+        let v = gate(&mut rig.api, &mac(2), 3600).unwrap();
+        assert_eq!(v["gateLeftSecs"], 3600);
+        assert_eq!(rig.gates(), vec![(mac(2), 3600)]);
+        // 0 shuts it: no time left.
+        let v = gate(&mut rig.api, &mac(2), 0).unwrap();
+        assert_eq!(v, json!({"ok": true, "mac": mac(2), "gateLeftSecs": null}));
+        assert!(rig.gates().is_empty());
+        // Shutting a gate that is shut is fine.
+        assert_eq!(
+            gate(&mut rig.api, &mac(2), 0).unwrap()["gateLeftSecs"],
+            json!(null)
+        );
+        assert_eq!(
+            rig.gate_puts(),
+            vec![
+                json!({"mac": mac(2), "secs": 300}),
+                json!({"mac": mac(2), "secs": 3600}),
+                json!({"mac": mac(2), "secs": 0}),
+                json!({"mac": mac(2), "secs": 0}),
+            ]
+        );
+        assert!(!rig.path().exists(), "this PC keeps nothing of a gate");
+    }
+
+    #[test]
+    fn the_devices_verb_shows_an_open_gate() {
+        let mut rig = Rig::new();
+        gate(&mut rig.api, &mac(2), 300).unwrap();
+        let v = rig.devices().unwrap();
+        let d = v["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["mac"] == mac(2))
+            .unwrap();
+        assert_eq!(d["gateLeftSecs"], 300);
+    }
+
+    #[test]
+    fn a_gate_the_pi_refuses_is_refused_with_its_words() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| {
+            s.exempt_config = vec![mac(1)];
+            s.always = vec![mac(2)];
+        });
+        let e = gate(&mut rig.api, &mac(1), 60).unwrap_err();
+        assert_eq!(
+            e.to_json(),
+            json!({"ok": false, "error": "refused",
+                   "detail": "The configuration decides this device"})
+        );
+        let e = gate(&mut rig.api, &mac(2), 60).unwrap_err();
+        assert_eq!(
+            e.to_json(),
+            json!({"ok": false, "error": "refused",
+                   "detail": "The router and the Pi are never exempt"})
+        );
+        assert!(rig.gates().is_empty());
+        // The words are the Pi's, cleaned of control characters.
+        let srv = serve(5, |_, req| {
+            let first = req.lines().next().unwrap_or("");
+            Some(if first.starts_with("POST /api/auth") {
+                ok_json(r#"{"session":{"valid":true,"sid":"S","validity":300}}"#)
+            } else if first.starts_with("DELETE /api/auth") {
+                b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()
+            } else {
+                let body = r#"{"error":{"key":"full","message":"No room\u0007 for another\n","hint":null}}"#;
+                format!(
+                    "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            })
+        });
+        let mut api = Pihole::at(
+            srv.addr,
+            srv.fingerprint,
+            Box::new(|| Ok(Zeroizing::new("pw".to_string()))),
+        )
+        .unwrap();
+        let e = gate(&mut api, &mac(1), 60).unwrap_err();
+        assert_eq!(
+            (e.code.as_str(), e.detail.as_str()),
+            ("refused", "No room for another")
+        );
+    }
+
+    #[test]
+    fn a_gate_on_a_device_the_pi_does_not_list_is_not_found_and_on_an_older_pi_unsupported() {
+        let mut rig = Rig::new();
+        let e = gate(&mut rig.api, &mac(50), 60).unwrap_err();
+        assert_eq!(e.code, "not-found");
+        assert!(e.detail.contains("no device"), "{}", e.detail);
+        // A Pi from before the front panel has no gate route, whatever the device.
+        let mut old = Rig::on(FakePi::without_panel(20));
+        let e = gate(&mut old.api, &mac(2), 60).unwrap_err();
+        assert_eq!(
+            e.to_json(),
+            json!({"ok": false, "error": "unsupported",
+                   "detail": "the Pi's software does not take gates yet"})
+        );
+        assert_eq!(old.pi.count("PUT /api/qbp/devices/gate"), 1);
+    }
+
+    #[test]
+    fn a_gate_on_a_real_pihole_is_absent() {
+        let mut rig = Rig::on(FakePi::pihole_only(20));
+        let e = gate(&mut rig.api, &mac(2), 60).unwrap_err();
+        assert_eq!(e, absent());
+        assert_eq!(
+            rig.pi.count("PUT /api/qbp/devices/gate"),
+            1,
+            "one try, then a look"
+        );
+        assert_eq!(rig.pi.count("GET /api/qbp/devices"), 1);
+    }
+
+    #[test]
+    fn a_gate_time_that_is_out_of_range_or_a_bad_address_asks_nothing() {
+        let mut rig = Rig::new();
+        assert_eq!(
+            gate(&mut rig.api, &mac(2), 3601).unwrap_err().code,
+            "invalid"
+        );
+        assert_eq!(
+            gate(&mut rig.api, "nonsense", 60).unwrap_err().code,
+            "invalid"
+        );
+        assert_eq!(rig.pi.qbp_requests(), 0);
+    }
+
+    #[test]
+    fn a_failing_pi_and_an_answer_without_the_time_are_api_errors() {
+        let mut rig = Rig::new();
+        rig.pi.with(|s| s.fail_puts = true);
+        let e = gate(&mut rig.api, &mac(2), 60).unwrap_err();
+        assert_eq!(e.code, "api");
+        assert!(e.detail.contains("500"), "{}", e.detail);
+        let srv = serve(5, |_, req| {
+            let first = req.lines().next().unwrap_or("");
+            Some(if first.starts_with("POST /api/auth") {
+                ok_json(r#"{"session":{"valid":true,"sid":"S","validity":300}}"#)
+            } else if first.starts_with("DELETE /api/auth") {
+                b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()
+            } else {
+                ok_json(r#"{"rev":4}"#)
+            })
+        });
+        let mut api = Pihole::at(
+            srv.addr,
+            srv.fingerprint,
+            Box::new(|| Ok(Zeroizing::new("pw".to_string()))),
+        )
+        .unwrap();
+        assert_eq!(gate(&mut api, &mac(2), 60).unwrap_err().code, "api");
+    }
+
+    // patch
+
+    #[test]
+    fn patch_in_the_list_mode_is_exempt_for_pass_and_unexempt_for_blocked() {
+        let mut rig = Rig::new();
+        let v = rig.patch(&mac(2), true).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "known": 1, "exempt": 1, "pushed": true,
+                   "exemptPushed": true, "labelsPushed": true,
+                   "patch": "pass", "gateShut": false})
+        );
+        assert_eq!(rig.pi_exempt(), vec![mac(2)]);
+        assert_eq!(rig.store().exempt_macs(), vec![mac(2)]);
+        let v = rig.patch(&mac(2), false).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "exempt": 0, "exemptPushed": true,
+                   "labelsPushed": true, "patch": "blocked", "gateShut": false})
+        );
+        assert!(rig.pi_exempt().is_empty());
+        assert_eq!(rig.store().known_macs(), vec![mac(2)], "it stays known");
+    }
+
+    #[test]
+    fn patch_keeps_the_label_the_device_has() {
+        let mut rig = Rig::new();
+        rig.edit(|s| s.know(&mac(2), Some("Smart TV"), T0));
+        let v = rig.patch(&mac(2), true).unwrap();
+        assert_eq!(v["label"], "Smart TV");
+        assert_eq!(rig.store().known[0].label.as_deref(), Some("Smart TV"));
+        assert_eq!(rig.pi_labels(), vec![(mac(2), "Smart TV".to_string())]);
+    }
+
+    #[test]
+    fn patch_to_where_the_device_is_already_is_ok_and_changes_nothing() {
+        // The list mode: not on the ADS PASS list is already blocked.
+        let mut rig = Rig::new();
+        let v = rig.patch(&mac(3), false).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(3), "patch": "blocked", "gateShut": false})
+        );
+        assert_eq!(rig.pi.count("PUT /api/qbp"), 0);
+        // The exempt-by-default mode: not on the block list already passes.
+        rig.exempt_default(true).unwrap();
+        let puts = rig.pi.count("PUT /api/qbp");
+        let v = rig.patch(&mac(3), true).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(3), "patch": "pass", "gateShut": false})
+        );
+        assert_eq!(rig.pi.count("PUT /api/qbp"), puts);
+    }
+
+    #[test]
+    fn patch_in_the_exempt_by_default_mode_is_block_for_blocked_and_unblock_for_pass() {
+        let mut rig = Rig::new();
+        rig.exempt_default(true).unwrap();
+        let v = rig.patch(&mac(2), false).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "known": 1, "block": 1, "pushed": true,
+                   "policyPushed": true, "labelsPushed": true,
+                   "patch": "blocked", "gateShut": false})
+        );
+        assert_eq!(rig.pi_block(), vec![mac(2)]);
+        let v = rig.patch(&mac(2), true).unwrap();
+        assert_eq!(
+            v,
+            json!({"ok": true, "mac": mac(2), "block": 0, "policyPushed": true,
+                   "labelsPushed": true, "patch": "pass", "gateShut": false})
+        );
+        assert!(rig.pi_block().is_empty());
+        assert_eq!(
+            rig.pi.count("PUT /api/qbp/devices/exempt"),
+            0,
+            "the other list is left alone"
+        );
+    }
+
+    #[test]
+    fn patch_shuts_a_gate_that_is_open_for_either_word() {
+        let mut rig = Rig::new();
+        rig.pi.panel_gate(&mac(2), 900);
+        rig.pi.panel_gate(&mac(3), 120);
+        let v = rig.patch(&mac(2), false).unwrap();
+        assert_eq!(v["patch"], "blocked");
+        assert_eq!(v["gateShut"], true);
+        assert!(v.get("gateShutError").is_none());
+        assert_eq!(rig.gates(), vec![(mac(3), 120)], "only this device's gate");
+        assert_eq!(rig.gate_puts(), vec![json!({"mac": mac(2), "secs": 0})]);
+        let v = rig.patch(&mac(3), true).unwrap();
+        assert_eq!(
+            (v["patch"].clone(), v["gateShut"].clone()),
+            (json!("pass"), json!(true))
+        );
+        assert!(rig.gates().is_empty());
+        // A device whose gate is shut gets no gate call.
+        rig.patch(&mac(1), false).unwrap();
+        assert_eq!(rig.gate_puts().len(), 2);
+    }
+
+    #[test]
+    fn a_gate_that_cannot_be_shut_is_said_and_the_edit_stays() {
+        let mut rig = Rig::new();
+        rig.pi.panel_gate(&mac(2), 900);
+        rig.pi.with(|s| s.fail_puts = true);
+        let v = rig.patch(&mac(2), true).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(
+            (v["patch"].clone(), v["gateShut"].clone()),
+            (json!("pass"), json!(false))
+        );
+        assert!(v["gateShutError"].as_str().unwrap().contains("500"), "{v}");
+        assert_eq!(rig.gates(), vec![(mac(2), 900)]);
+        assert_eq!(rig.store().exempt_macs(), vec![mac(2)], "the edit stays");
+        // The devices could not be read: the same.
+        rig.pi.with(|s| {
+            s.fail_puts = false;
+            s.fail_devices_get = true;
+        });
+        let v = rig.patch(&mac(2), false).unwrap();
+        assert_eq!(v["gateShut"], false);
+        assert!(v["gateShutError"].as_str().unwrap().contains("500"), "{v}");
+    }
+
+    #[test]
+    fn patch_on_a_real_pihole_edits_the_lists_and_has_no_gate_to_shut() {
+        let mut rig = Rig::on(FakePi::pihole_only(20));
+        let v = rig.patch(&mac(2), true).unwrap();
+        assert_eq!(v["patch"], "pass");
+        assert_eq!(v["gateShut"], false);
+        assert!(v.get("gateShutError").is_none(), "{v}");
+        assert_eq!(v["exemptPushed"], false);
+        assert_eq!(rig.store().exempt_macs(), vec![mac(2)]);
+        assert_eq!(rig.pi.count("PUT /api/qbp/devices/gate"), 0);
+    }
+
+    #[test]
+    fn patch_passes_on_what_the_underlying_verb_refuses() {
+        let mut rig = Rig::new();
+        rig.edit(|s| {
+            for i in 10..10 + wdstore::MAX_EXEMPT {
+                s.add_exempt(&mac(i), None, T0);
+            }
+        });
+        let e = err(rig.patch(&mac(2), true));
+        assert_eq!(e.code, "full");
+        assert_eq!(err(rig.patch("nonsense", true)).code, "invalid");
+    }
+
+    #[test]
+    fn run_dispatches_the_panels_verbs() {
+        let mut rig = Rig::new();
+        rig.pi.raise("dga", "x.example", None, 1);
+        let path = rig.path();
+        let mut go = |cmd: WdCmd| run(&mut rig.api, &path, T0, &cmd).unwrap();
+        assert_eq!(go(WdCmd::AckAll)["acked"], 1);
+        assert_eq!(
+            go(WdCmd::Gate {
+                mac: mac(2),
+                secs: 60
+            })["gateLeftSecs"],
+            60
+        );
+        let patch = go(WdCmd::Patch {
+            mac: mac(2),
+            pass: true,
+        });
+        assert_eq!(
+            (patch["patch"].clone(), patch["gateShut"].clone()),
+            (json!("pass"), json!(true))
+        );
+        let label = WdCmd::Label {
+            mac: mac(2),
+            label: Some("Desk".into()),
+        };
+        assert_eq!(go(label)["label"], "Desk");
+    }
+
+    #[test]
+    fn the_panels_verbs_are_in_the_usage_and_parse() {
+        assert!(USAGE.contains("ack-all") && USAGE.contains("label <mac> [label...]"));
+        assert!(USAGE.contains("patch <mac> pass|blocked") && USAGE.contains("gate <mac> <secs>"));
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse(&words(&["ack-all"])), Ok(WdCmd::AckAll));
+        assert_eq!(
+            parse(&words(&["gate", &mac(1), "3600"])),
+            Ok(WdCmd::Gate {
+                mac: mac(1),
+                secs: 3600
+            })
+        );
+        assert_eq!(
+            parse(&words(&["patch", &mac(1), "blocked"])),
+            Ok(WdCmd::Patch {
+                mac: mac(1),
+                pass: false
+            })
+        );
     }
 }

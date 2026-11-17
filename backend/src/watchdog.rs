@@ -8,7 +8,8 @@
 //! that stay blocked); a Pi that answers 404 for either (an older one) is
 //! simply not sent it again in that session. So are the names that this PC
 //! gives its devices (`PUT devices/labels`) and the panel's PIN hash (`PUT
-//! panel`).
+//! panel`). A device's gate (ADS PASS for a while, `PUT devices/gate`) is
+//! opened or shut by a verb on demand and is never pushed by the watcher.
 //!
 //! The Pi's device inventory has a revision, `rev`, that moves with every
 //! change of the pushed lists, the labels and the gates, also those that the
@@ -592,6 +593,70 @@ pub fn put_panel(api: &mut Pihole, pin_hash: Option<&PinHash>) -> Result<Qbp<()>
         None => Qbp::Absent,
         Some(_) => Qbp::Present(()),
     })
+}
+
+/// The longest a gate may stay open, in seconds (the Pi refuses more).
+pub const GATE_MAX_SECS: u16 = 3600;
+
+/// How a `PUT devices/gate` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatePut {
+    /// The Pi took it: the seconds the gate has left (`None` once it is shut)
+    /// and the revision after the change (`None` from a Pi that does not say).
+    Done { left: Option<u64>, rev: Option<u64> },
+    /// 409: the Pi refuses a gate on this device (the configuration decides
+    /// it, it is the router or the Pi, or the gates are full). The Pi's own
+    /// words, cleaned.
+    Refused(String),
+    /// 404: the Pi has no such route (an older one), or lists no such device,
+    /// or there is no watchdog at all: the caller tells these apart.
+    NotFound,
+}
+
+/// `PUT /api/qbp/devices/gate`: open the gate of the device `mac` (lower-case
+/// colon form) for `secs` seconds, 1 to [`GATE_MAX_SECS`], so that its ads pass
+/// for a while, or shut it with 0. The body is `{"mac","secs"}`, the answer
+/// `{"gate_left_secs","rev"}`. A 2xx answer that does not say how long the gate
+/// stays open is an error, not `NotFound`; a gate that is open for 0 seconds
+/// is shut. Gates live in the Pi's memory only and shut by themselves.
+pub fn put_gate(api: &mut Pihole, mac: &str, secs: u16) -> Result<GatePut, ApiError> {
+    let body = json!({ "mac": mac, "secs": secs });
+    Ok(
+        match api.json_checked("PUT", "/api/qbp/devices/gate", Some(&body))? {
+            Checked::NotFound => GatePut::NotFound,
+            Checked::Conflict(v) => GatePut::Refused(refusal(&v)),
+            Checked::Ok(v) => {
+                let left = match v.get("gate_left_secs") {
+                    Some(Value::Null) => None,
+                    Some(n) => match whole(n) {
+                        Some(0) => None,
+                        Some(n) => Some(n),
+                        None => return Err(odd("gate")),
+                    },
+                    None => return Err(odd("gate")),
+                };
+                GatePut::Done {
+                    left,
+                    rev: v.get("rev").and_then(whole),
+                }
+            }
+        },
+    )
+}
+
+/// The message of a Pi-hole style error object (`{"error":{"message":…}}`)
+/// without control characters, at most 200 bytes.
+fn refusal(v: &Value) -> String {
+    let message = v
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .map(|m| clean_text(m, 200))
+        .unwrap_or_default();
+    if message.is_empty() {
+        "the Pi refused it".to_string()
+    } else {
+        message
+    }
 }
 
 /// What this PC calls its devices, as the Pi takes them: `(mac, label)` in this

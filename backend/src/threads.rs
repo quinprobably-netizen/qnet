@@ -177,6 +177,9 @@ pub enum ApiCtl {
     Config(Option<ApiCfg>),
     Open(bool),
     Kick,
+    /// `Kick`, and the next poll reads the Pi's devices whether they are due
+    /// or not (the panel just edited one).
+    Devices,
     Stop,
 }
 
@@ -765,11 +768,11 @@ impl WdRun {
 ///
 /// The watchdog rides on it. While open, every good stats poll is followed
 /// by a watchdog cycle on the same connection (with the device list on open
-/// and then on the `history_every` cadence). While closed there is a poll of
-/// its own, `wd_first_delay` after the configuration and then every
-/// `wd_closed_every`, that sends no stats and no `Event::Api`: see
-/// [`WdRun::closed_cycle`]. Its failures only ever show in the
-/// `Event::Watchdog` status, except an auth failure, which drops the client
+/// and then on the `history_every` cadence, or at once after `ApiCtl::Devices`).
+/// While closed there is a poll of its own, `wd_first_delay` after the
+/// configuration and then every `wd_closed_every`, that sends no stats and no
+/// `Event::Api`: see [`WdRun::closed_cycle`]. Its failures only ever show in
+/// the `Event::Watchdog` status, except an auth failure, which drops the client
 /// like a failed stats poll does.
 pub fn spawn_api(
     tx: Sender<Event>,
@@ -835,7 +838,10 @@ pub fn spawn_api(
                         wd.schedule_closed(cfg.is_some(), timing.wd_closed_every);
                     }
                 }
-                Ok(ApiCtl::Kick) => {
+                Ok(ctl @ (ApiCtl::Kick | ApiCtl::Devices)) => {
+                    if matches!(ctl, ApiCtl::Devices) {
+                        wd.last_devices = None;
+                    }
                     let floor = backoff_until.unwrap_or_else(Instant::now);
                     next_poll = (last_poll + timing.min_gap).max(Instant::now()).max(floor);
                 }
@@ -2508,6 +2514,54 @@ mod tests {
         assert!(wait_for(3000, || pi.count("GET /api/qbp/alerts") >= alerts + 3));
         assert_eq!(pi.count("GET /api/stats/summary"), frozen);
         assert_eq!(pi.count("GET /api/qbp/devices"), devices);
+        ctl.send(ApiCtl::Stop).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn devices_after_an_edit_are_read_at_once_and_not_on_the_slow_cadence() {
+        let pi = FakePi::start(600);
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _notes) = deps_in(&dir);
+        let (tx, rx) = mpsc::channel();
+        let mut seen = Arrived::new(rx);
+        // The devices are due on open and then only after an hour.
+        let timing = ApiTiming {
+            history_every: Duration::from_secs(3600),
+            ..wd_timing()
+        };
+        let (ctl, h) = spawn_api(tx, timing, factory_for(&pi.srv), deps);
+        ctl.send(ApiCtl::Config(Some(cfg()))).unwrap();
+        ctl.send(ApiCtl::Open(true)).unwrap();
+        assert!(seen.wait(3000, |s| s.wd.last().is_some_and(|r| r.devices.len() == 3)));
+        assert!(wait_for(3000, || pi.count("GET /api/stats/summary") >= 4));
+        // On open: one read for the push of the session's lists (on the
+        // revision that it has) and one for the cycle itself.
+        let reads = pi.count("GET /api/qbp/devices");
+        assert_eq!(reads, 2, "on open only");
+
+        // A kick polls at once but does not read the devices again.
+        let polls = pi.count("GET /api/stats/summary");
+        ctl.send(ApiCtl::Kick).unwrap();
+        assert!(wait_for(3000, || pi.count("GET /api/stats/summary") > polls));
+        assert_eq!(pi.count("GET /api/qbp/devices"), reads);
+
+        // The panel edited a device: the next poll reads them, and the report
+        // that follows has what the Pi has now.
+        pi.with(|s| s.devices.push((fakeqbp::mac(9), "192.0.2.9".to_string())));
+        let t0 = Instant::now();
+        ctl.send(ApiCtl::Devices).unwrap();
+        assert!(wait_for(3000, || pi.count("GET /api/qbp/devices") == reads + 1));
+        assert!(seen.wait(3000, |s| s.wd.last().is_some_and(|r| r.devices.len() == 4)));
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "within a second: {:?}",
+            t0.elapsed()
+        );
+        // Once, not on every poll after it.
+        let polls = pi.count("GET /api/stats/summary");
+        assert!(wait_for(3000, || pi.count("GET /api/stats/summary") >= polls + 3));
+        assert_eq!(pi.count("GET /api/qbp/devices"), reads + 1);
         ctl.send(ApiCtl::Stop).unwrap();
         h.join().unwrap();
     }
