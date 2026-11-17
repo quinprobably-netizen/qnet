@@ -11,5 +11,5 @@ per-task review; one Opus whole-branch review and one fix wave at the end.
 | T4 offscreen harness | done | 3a9d5bb | `tools/shot`; 222 node tests. Found: the real card is 488 wide, content 456 (the mockup assumed 488 content) |
 | T5a the board | done | 56c4b20 | 283 node tests; shots rest, n30, calm, mode, flip, after-*; card 520 on this view |
 | T5b queue, tickets, PIN | done | 309cb71 | 308 node tests; 12 shots; no "recent" section (no per-device log on the Pi) |
-| Review | running | | Opus, whole branch d0a119d..HEAD |
-| Fix wave | | | |
+| Review | done | | Opus, whole branch: 0 Critical, 2 Important (label lost in the settle window; label cut to 24 on blur), Minors |
+| Fix wave | done | d2f7578 | both Important + held order per panel open, PIN secret cleared, sayWord, docs scrubbed; 322 node, 791 cargo. Deferred to owner: PIN Clear without confirm; labelling an unknown device does not dismiss its new-device call; an expired gate counts out of flipCount until the next read |
