@@ -273,23 +273,24 @@ test("offline and radio off: the PC and a dim AP at the end of a dashed link, sa
 
 // ---- the route is the navigation -----------------------------------------
 
-test("the AP opens Wi-Fi and the Pi-hole's place opens DNS, in every state that has them", () => {
+test("the AP opens Wi-Fi, the Pi-hole's place DNS (no watchdog here) and the resolver beyond it DNS, in every state that has them", () => {
   for (const n of ["healthy", "paused", "fallback", "bypassed", "unreachable", "degraded", "custom", "unconfigured", "none", "unknown", "ethernet"]) {
     const r = route(n)
     assert.equal(node(r, "ap").open, "wifi", n)
-    assert.equal(node(r, "ph").open, "dns", n)
+    assert.equal(node(r, "ph").open, "dns", n + ": no watchdog, so the Pi-hole's place opens DNS")
     assert.equal(node(r, "pc").open, "", n)
-    if (node(r, "up")) assert.equal(node(r, "up").open, "", n + ": the upstream is a tooltip, not a door")
+    if (node(r, "up")) assert.equal(node(r, "up").open, "dns", n + ": the resolver beyond is a door to DNS")
   }
 })
 
-test("leaks are a count on the Pi-hole's node: warning for profiles, urgent for a bypass", () => {
-  assert.equal(node(route("healthy"), "ph").badge, null)
-  assert.deepEqual(node(route("leaks"), "ph").badge, { n: 2, tone: "warning" })
-  assert.deepEqual(node(route("bypassed"), "ph").badge, { n: 1, tone: "urgent" })
+test("leaks are a count on the resolver's node: warning for profiles, urgent for a bypass; none on the Pi-hole's", () => {
+  assert.equal(node(route("healthy"), "up").badge, null)
+  assert.deepEqual(node(route("leaks"), "up").badge, { n: 2, tone: "warning" })
+  assert.deepEqual(node(route("bypassed"), "up").badge, { n: 1, tone: "urgent" })
+  for (const n of ["healthy", "leaks", "bypassed"]) assert.equal(node(route(n), "ph").badge, null, n + ": the Pi-hole's node has no watchdog to count here")
   const pend = Model.withPending(Model.emptyPending(), { pinUuid: Model.leakGroups(view("leaks")).profiles.uuids.join(" ") }, NOW_MS)
-  assert.equal(node(Model.routeModel(view("leaks", pend), NOW_S, pend), "ph").badge, null, "pinned: gone at once")
-  assert.equal(node(route("custom"), "ph").badge, null, "no Pi-hole in the path, no count")
+  assert.equal(node(Model.routeModel(view("leaks", pend), NOW_S, pend), "up").badge, null, "pinned: gone at once")
+  assert.equal(node(route("custom"), "up").badge, null, "no Pi-hole in the path, no count")
 })
 
 test("before the first probe: the same route, dim, nothing flowing", () => {

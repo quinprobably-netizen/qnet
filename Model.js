@@ -28,6 +28,14 @@ var MAX_LEAKS = 8
 var HISTORY_BUCKET_S = 600
 var HISTORY_SPAN_S = 86400
 var MAX_UPSTREAMS = 4
+var MAX_ALERTS = 50            // watchdog.alerts
+var MAX_DEVICES = 128          // watchdog.devices
+var MAX_JACKS = 256            // bay.jacks: 128 of the Pi's, plus the offline ones
+var MAX_CALLS = 50             // bay.calls
+var MAX_UNIX = 4102444800      // 2100-01-01: no honest time is later
+var BAY_SIZE = 8               // jacks in a bay
+var GATE_SECS = [300, 1800, 3600]   // the gate lengths the panel offers (5, 30, 60 min)
+var LABEL_MAX = 24             // a device label the panel sends
 var STABLE_UPTIME_MS = 30000   // a watch child must live this long to reset the backoff
 var PAUSE_SECONDS = 300
 var LATENCY_BAD_MS = 100
@@ -43,6 +51,12 @@ var AP_PATH_RE = /^\/org\/freedesktop\/NetworkManager\/AccessPoint\/\d+$/
 var UUID_RE = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/
 var ADDR_RE = /^[0-9A-Za-z.:\-]{1,64}$/
 var IP_RE = /^[0-9A-Fa-f:.]{1,64}$/
+var MAC_RE = /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/
+var KEY_RE = /^[0-9a-f]{16}$/
+var IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+var TAIL_RE = /^(\u00b7\d{1,3}|:[0-9a-f]{2})$/
+var LAMP_KINDS = ["threat", "new_device", "arp_spoof", "rebind", "lookups"]
+var WD_STATUS = ["unknown", "ok", "absent", "auth", "tls", "unreachable", "unconfigured"]
 
 // -------------------------------------------------------------- glyphs
 // Nerd Font (Material Design) code points, written as escapes: private-use
@@ -111,6 +125,165 @@ function addr(v) {
 function safeUrl(v) {
   var s = v === null || v === undefined ? "" : String(v)
   return /^https?:\/\/[0-9A-Za-z.\-]+(:\d{1,5})?(\/[0-9A-Za-z._~\-\/]*)?$/.test(s) && s.length <= 200 ? s : ""
+}
+
+// ------------------------------------------------------- the watchdog
+
+// A MAC as the backend writes it (lower-case, colons), else null.
+function macOf(v) { return typeof v === "string" && MAC_RE.test(v) ? v : null }
+
+// An alert id: a whole number the backend sent as a number, else null.
+function idOf(v) {
+  return typeof v === "number" && isFinite(v) && Math.floor(v) === v && v >= 0 && v <= 9007199254740991 ? v : null
+}
+
+// A unix time in seconds, 0 for none.
+function unixOf(v) { return clamp(Math.floor(num(v, 0)), 0, MAX_UNIX) }
+
+function countOf(v) { return clamp(toInt(v, 0), 0, 999999) }
+
+// A dotted IPv4 address (each part 0..255), else "".
+function ipv4(v) {
+  var m = IPV4_RE.exec(typeof v === "string" ? v : "")
+  if (!m) return ""
+  for (var i = 1; i <= 4; i++) if (parseInt(m[i], 10) > 255) return ""
+  return m[1] + "." + m[2] + "." + m[3] + "." + m[4]
+}
+
+// The lamp a kind of alert rings (the backend says it; this is the way back
+// for a call that did not).
+function lampOfKind(kind) {
+  return LAMP_KINDS.indexOf(kind) >= 0 ? kind : "lookups"
+}
+
+// The label on a column's head: ·40 from an address, :d8 from the MAC's last
+// byte when there is no IPv4.
+function tailOf(v, address, mac) {
+  if (typeof v === "string" && TAIL_RE.test(v)) return v
+  var m = IPV4_RE.exec(address)
+  return m ? "\u00b7" + parseInt(m[4], 10) : ":" + mac.substring(mac.length - 2)
+}
+
+function normalizeAlert(a) {
+  if (!isObj(a)) return null
+  var id = idOf(a.id)
+  var key = typeof a.key === "string" && KEY_RE.test(a.key) ? a.key : ""
+  var kind = clean(a.kind, 32)
+  if (id === null || key === "" || kind === "") return null
+  var client = ip(a.client)
+  return {
+    id: id, key: key, kind: kind, severity: oneOf(a.severity, ["info", "warn", "high"], "info"),
+    title: clean(a.title, 80), client: client !== "" ? client : null, subject: clean(a.subject, 255),
+    firstUnix: unixOf(a.firstUnix), lastUnix: unixOf(a.lastUnix), count: countOf(a.count), acked: a.acked === true
+  }
+}
+
+function normalizeDevice(d) {
+  if (!isObj(d)) return null
+  var mac = macOf(d.mac)
+  if (mac === null) return null
+  var addrs = []
+  var list = Array.isArray(d.ipv4) ? d.ipv4 : []
+  for (var i = 0; i < list.length && addrs.length < 4; i++) if (ipv4(list[i]) !== "") addrs.push(ipv4(list[i]))
+  return {
+    mac: mac, ipv4: addrs, hostname: clean(d.hostname, 64), firstUnix: unixOf(d.firstUnix), lastUnix: unixOf(d.lastUnix),
+    knownOnPi: d.knownOnPi === true, known: d.known === true, label: clean(d.label, 64),
+    exemptOnPi: d.exemptOnPi === true, exempt: d.exempt === true, blockedOnPi: d.blockedOnPi === true, blocked: d.blocked === true
+  }
+}
+
+function normalizeJack(j) {
+  if (!isObj(j)) return null
+  var mac = macOf(j.mac)
+  if (mac === null) return null
+  var address = ipv4(j.ip)
+  var offline = j.offline === true
+  var patch = oneOf(j.patch, ["blocked", "pass", "always", "fixed"], "blocked")
+  var strip = []
+  var sl = Array.isArray(j.strip) ? j.strip : []
+  for (var i = 0; i < sl.length && strip.length < 2; i++) {
+    var line = typeof sl[i] === "string" ? clean(sl[i], 16) : ""
+    if (line !== "") strip.push(line)
+  }
+  var until = unixOf(j.gateUntil)
+  return {
+    mac: mac, ip: address, tail: tailOf(j.tail, address, mac), hostname: clean(j.hostname, 64),
+    name: clean(j.name, 64), strip: strip, known: j.known === true, isNew: j.isNew === true, offline: offline,
+    firstUnix: unixOf(j.firstUnix), lastUnix: unixOf(j.lastUnix), patch: patch,
+    row: oneOf(j.row, ["blocked", "pass"], patch === "pass" ? "pass" : "blocked"), cord: j.cord === true,
+    gateUntil: until > 0 ? until : null, lamp: oneOf(j.lamp, ["", "warn", "high"], ""), alertId: idOf(j.alertId),
+    rank: oneOf(j.rank, [0, 1, 2, 3], offline ? 3 : 2)
+  }
+}
+
+function normalizeCall(c) {
+  if (!isObj(c)) return null
+  var id = idOf(c.id)
+  var key = typeof c.key === "string" && KEY_RE.test(c.key) ? c.key : ""
+  var kind = clean(c.kind, 32)
+  if (id === null || key === "" || kind === "") return null
+  var severity = oneOf(c.severity, ["info", "warn", "high"], "info")
+  return {
+    id: id, key: key, kind: kind, lamp: oneOf(c.lamp, LAMP_KINDS, lampOfKind(kind)), severity: severity,
+    tone: oneOf(c.tone, ["warn", "high"], severity === "high" ? "high" : "warn"),
+    mac: macOf(c.mac), relatedMac: macOf(c.relatedMac), subject: clean(c.subject, 255),
+    count: countOf(c.count), firstUnix: unixOf(c.firstUnix), lastUnix: unixOf(c.lastUnix)
+  }
+}
+
+// The valid entries of a list (one() gives null for a bad one), at most max of
+// them; with a uniqueKey, the first entry of a value wins and a repeat is
+// dropped.
+function normalizeList(list, one, max, uniqueKey) {
+  var out = []
+  var seen = Object.create(null)
+  var src = Array.isArray(list) ? list : []
+  for (var i = 0; i < src.length && out.length < max; i++) {
+    var e = one(src[i])
+    if (e === null) continue
+    if (uniqueKey !== "") {
+      var k = String(e[uniqueKey])
+      if (seen[k]) continue
+      seen[k] = true
+    }
+    out.push(e)
+  }
+  return out
+}
+
+// SPEC "State JSON" `watchdog`: every field, bounded, so that the panel never
+// reads the raw JSON. Anything the backend does not say reads as nothing
+// there: status unknown, no jacks, no calls, the five lamps dark.
+function normalizeWatchdog(raw) {
+  var w = isObj(raw) ? raw : {}
+  var b = isObj(w.bay) ? w.bay : {}
+  var lampsIn = Array.isArray(b.lamps) ? b.lamps : []
+  var lamps = []
+  for (var k = 0; k < LAMP_KINDS.length; k++) {
+    var found = null
+    for (var m = 0; m < lampsIn.length; m++) if (isObj(lampsIn[m]) && lampsIn[m].kind === LAMP_KINDS[k]) { found = lampsIn[m]; break }
+    lamps.push(found === null ? { kind: LAMP_KINDS[k], count: 0, tone: "", alertId: null } : {
+      kind: LAMP_KINDS[k], count: countOf(found.count), tone: oneOf(found.tone, ["", "warn", "high"], ""), alertId: idOf(found.alertId)
+    })
+  }
+  // newest first, whatever order they came in (a stable sort: ties keep theirs)
+  var calls = normalizeList(b.calls, normalizeCall, MAX_CALLS, "id")
+  var indexed = calls.map(function(c, i) { return { c: c, i: i } })
+  indexed.sort(function(x, y) { return y.c.lastUnix - x.c.lastUnix || x.i - y.i })
+  calls = indexed.map(function(e) { return e.c })
+  return {
+    status: oneOf(w.status, WD_STATUS, "unknown"), rev: countOf(w.rev), suppressed: countOf(w.suppressed),
+    unacked: countOf(w.unacked), alerts: normalizeList(w.alerts, normalizeAlert, MAX_ALERTS, "id"),
+    knownList: oneOf(w.knownList, ["waiting", "learned", "received"], ""),
+    devices: normalizeList(w.devices, normalizeDevice, MAX_DEVICES, "mac"),
+    knownCount: countOf(w.knownCount), pushedAt: unixOf(w.pushedAt), pushError: clean(w.pushError, 120),
+    polledAt: unixOf(w.polledAt), exemptDefault: w.exemptDefault === true, exemptDefaultOnPi: w.exemptDefaultOnPi === true,
+    pinSet: w.pinSet === true, devicesAt: unixOf(w.devicesAt),
+    bay: {
+      jacks: normalizeList(b.jacks, normalizeJack, MAX_JACKS, "mac"), flipCount: clamp(countOf(b.flipCount), 0, MAX_JACKS),
+      lamps: lamps, calls: calls, quietSince: unixOf(b.quietSince)
+    }
+  }
 }
 
 // ------------------------------------------------------------ the state
@@ -264,6 +437,7 @@ function normalizeState(raw) {
       },
       history: history, probes: probes
     },
+    watchdog: normalizeWatchdog(r.watchdog),
     error: clean(r.error, 160)
   }
 }
@@ -368,7 +542,7 @@ function copyState(s) {
   return {
     backendDown: false,
     seq: s.seq, link: s.link, radio: s.radio, networks: s.networks, scan: s.scan,
-    dns: s.dns, pihole: s.pihole, error: s.error
+    dns: s.dns, pihole: s.pihole, watchdog: s.watchdog, error: s.error
   }
 }
 
@@ -652,10 +826,12 @@ function heroState(v, nowS) {
 }
 
 // Whether the panel's clock must tick while it is open: a pause counting
-// down, a failover countdown, or a request waiting for the backend.
-function needsClock(v, pending, nowS) {
+// down, a failover countdown, a request waiting for the backend, or, on the
+// watchdog view (ctx { view }), a gate that is still open and counting down.
+function needsClock(v, pending, nowS, ctx) {
   if (hasPending(pending)) return true
   if (v.pihole.blocking === "disabled") return true
+  if (ctx && ctx.view === "watchdog" && anyGateOpen(v, nowS)) return true
   return failoverIn(v, nowS) !== null && !v.pihole.reachable && v.dns.mode === "pihole"
 }
 
@@ -740,6 +916,33 @@ function leakCount(v, pending) {
   return (g.profiles ? g.profiles.count : 0) + (g.bypass ? 1 : 0)
 }
 
+// Whether this Pi-hole has a watchdog to open: the last cycle was answered
+// well, or it failed since (auth, tls, unreachable: the data stays) after one
+// was. Never for `absent` (a real Pi-hole: polledAt moves there too, but there
+// is nothing to show), `unconfigured` or `unknown`.
+function watchdogPresent(v) {
+  var w = v && v.watchdog
+  if (!w) return false
+  return w.status === "ok" || (w.polledAt > 0 && (w.status === "auth" || w.status === "tls" || w.status === "unreachable"))
+}
+
+// The calls waiting, as the badge on the Pi-hole's node: null for none.
+function callsBadge(v) {
+  var calls = v.watchdog.bay.calls
+  if (calls.length === 0) return null
+  var high = false
+  for (var i = 0; i < calls.length; i++) if (calls[i].tone === "high") high = true
+  return { n: calls.length, tone: high ? "urgent" : "warning" }
+}
+
+// The Pi-hole's node opens the watchdog tab when there is one (and carries
+// the calls waiting), else the DNS view.
+function phDoor(v, n) {
+  n.open = watchdogPresent(v) ? "watchdog" : "dns"
+  n.badge = n.open === "watchdog" ? callsBadge(v) : null
+  return n
+}
+
 // The hero's picture, as data: the route a DNS query takes from this machine
 // out to the internet, hop by hop, and what state each hop is in. HeroViz
 // only draws it. Slots, left to right: pc, ap, ph (the Pi-hole's place), up
@@ -755,11 +958,14 @@ function leakCount(v, pending) {
 //   nodes    [{ id, glyph, tone, label, stat, statTone, mark, tip, open, badge }]
 //            label and stat are parts: { text } or { key, args } to be worded
 //            by the panel; tone accent | dim | warning | urgent
-//            open  "wifi" | "dns" | "": the view the node opens (the route is
-//                  the navigation: the AP opens Wi-Fi, the Pi-hole's place
-//                  opens DNS)
-//            badge null or { n, tone }: the count of things that bypass the
-//                  Pi-hole, on its node
+//            open  "wifi" | "dns" | "watchdog" | "": the view the node opens
+//                  (the route is the navigation: the AP opens Wi-Fi, the
+//                  Pi-hole's place opens the watchdog when it has one, else
+//                  DNS; the resolver beyond it opens DNS)
+//            badge null or { n, tone }: on the Pi-hole's node (when it opens
+//                  the watchdog) the calls waiting, urgent when any is high,
+//                  else warning; on the resolver beyond (the up node) the
+//                  count of things that bypass the Pi-hole
 //   links    [{ a, b, state, tone, thin }] state flow | stalled | dim |
 //            dashed; thin: after the Pi-hole, where the blocked share has
 //            peeled off
@@ -817,6 +1023,7 @@ function routeModel(v, nowS, pending) {
 
   if (h.kind === "none") {
     out.kind = "none"
+    // no resolver is beyond this node, so it is the only door to the DNS view
     node("ph", "shieldOff", "urgent", part(""), null, { mark: "\u2715", open: "dns" })
     out.links.push({ a: "pc", b: "ap", state: "flow", tone: "accent", thin: false, flow: false })
     out.links.push({ a: "ap", b: "ph", state: "dashed", tone: "urgent", thin: false, flow: false })
@@ -830,14 +1037,14 @@ function routeModel(v, nowS, pending) {
   function resolverNode(tone) {
     var a = cur ? cur.addr : ""
     var role = cur ? cur.role : "other"
-    var n = node("up", "earth", tone, part(a !== "" ? shortAddr(a) : "—"), role !== "other" && role !== "pihole" ? word("route.role." + role) : null, { tip: a })
+    var n = node("up", "earth", tone, part(a !== "" ? shortAddr(a) : "—"), role !== "other" && role !== "pihole" ? word("route.role." + role) : null, { tip: a, open: "dns" })
     return n
   }
 
   if (h.kind === "checking") {
     out.kind = "route"
-    node("ph", "shield", "dim", part(p.address !== "" ? shortAddr(p.address) : "…"), null, { open: "dns" })
-    node("up", "earth", "dim", part("…"), null, {})
+    phDoor(v, node("ph", "shield", "dim", part(p.address !== "" ? shortAddr(p.address) : "…"), null, {}))
+    node("up", "earth", "dim", part("…"), null, { open: "dns" })
     out.links.push({ a: "pc", b: "ap", state: "dim", tone: "dim", thin: false }, { a: "ap", b: "ph", state: "dim", tone: "dim", thin: false },
       { a: "ph", b: "up", state: "dim", tone: "dim", thin: false }, { a: "up", b: "end", state: "dim", tone: "dim", thin: false })
     out.flow.density = 0
@@ -853,7 +1060,7 @@ function routeModel(v, nowS, pending) {
       out.ghost = true
       node("ph", "ghost", "dim", part(p.detected !== "" ? shortAddr(p.detected) + "?" : ""), null, { tip: p.detected, open: "dns" })
     } else {
-      node("ph", "shield", "dim", part(shortAddr(p.address)), word("route.idle", [], ""), { tip: p.address, open: "dns" })
+      phDoor(v, node("ph", "shield", "dim", part(shortAddr(p.address)), word("route.idle", [], ""), { tip: p.address }))
     }
     resolverNode(bypassed ? "urgent" : "accent")
     var liveDirect = out.flow.density > 0 || p.today.total > 0
@@ -867,10 +1074,8 @@ function routeModel(v, nowS, pending) {
 
   // the Pi-hole is the resolver
   var look = piholeLook(v, h)
-  var ph = node("ph", look.glyph, look.tone, part(look.text), look.stat, { mark: look.mark, tip: p.address, open: "dns" })
+  var ph = phDoor(v, node("ph", look.glyph, look.tone, part(look.text), look.stat, { mark: look.mark, tip: p.address }))
   ph.statTone = look.statTone
-  var nLeaks = leakCount(v, pending)
-  if (nLeaks > 0) ph.badge = { n: nLeaks, tone: h.kind === "bypassed" ? "urgent" : "warning" }
 
   // the resolver beyond: the Pi-hole's busiest upstream
   var upstream = p.upstreams.length ? p.upstreams[0] : null
@@ -889,8 +1094,11 @@ function routeModel(v, nowS, pending) {
   }
   var up = node("up", "earth", h.kind === "fallback" || h.kind === "unreachable" ? "dim" : upTone,
     upstream ? part(upstream.ip !== "" ? upstream.ip : upstream.name) : word("route.upstream", []), upStat,
-    { tip: tips.join("\n") })
+    { tip: tips.join("\n"), open: "dns" })
   up.statTone = upStatTone
+  // what bypasses the Pi-hole is told on the resolver's node, which opens DNS
+  var nLeaks = leakCount(v, pending)
+  if (nLeaks > 0) up.badge = { n: nLeaks, tone: h.kind === "bypassed" ? "urgent" : "warning" }
 
   var thin = h.kind === "paused" || h.kind === "fallback" || h.kind === "unreachable" ? false : share > 0
   var flowing = live
@@ -934,8 +1142,8 @@ function routeModel(v, nowS, pending) {
 }
 
 // The route's stops for the keyboard, left to right: the nodes that open a
-// view ("ap" opens Wi-Fi, "ph" opens DNS; offline only the AP). Nothing when
-// there is no route to draw.
+// view ("ap" opens Wi-Fi, "ph" the watchdog or DNS, "up" DNS; offline only the
+// AP). Nothing when there is no route to draw.
 function routeStops(v) {
   var nodes = routeModel(v, 0).nodes
   var ids = []
@@ -943,7 +1151,7 @@ function routeStops(v) {
   return ids
 }
 
-// The view a route node opens: "wifi" | "dns" | "".
+// The view a route node opens: "wifi" | "dns" | "watchdog" | "".
 function routeTarget(v, id) {
   var nodes = routeModel(v, 0).nodes
   for (var i = 0; i < nodes.length; i++) if (nodes[i].id === id) return nodes[i].open
@@ -1569,6 +1777,54 @@ function argvCopy(text) {
   return IP_RE.test(t) ? ["wl-copy", "--", t] : null
 }
 
+// `qnet watchdog <verb> ...` for the patch bay, or null for anything that does
+// not validate. args is a list:
+//   patch <mac> pass|blocked      gate <mac> <0|300|1800|3600>
+//   label <mac> [text]            (text cleaned and cut to 24; none left = clear)
+//   know <mac>   forget <mac>   ack <id>   ack-all   exempt-default on|off
+//   pin set | pin clear           (verb "pin", args ["set"] or ["clear"]: never
+//                                  a PIN: it goes to `pin set` on stdin)
+function argvWatchdog(bin, verb, args) {
+  if (!okBin(bin) || typeof verb !== "string") return null
+  var a = args === undefined || args === null ? [] : args
+  if (!Array.isArray(a) || a.length > 2) return null
+  var out = [bin, "watchdog", verb]
+  var mac
+  switch (verb) {
+  case "patch":
+    if (a.length !== 2 || (a[1] !== "pass" && a[1] !== "blocked") || (mac = macOf(a[0])) === null) return null
+    return out.concat([mac, a[1]])
+  case "gate":
+    if (a.length !== 2 || (mac = macOf(a[0])) === null) return null
+    var secs = typeof a[1] === "number" ? a[1] : (typeof a[1] === "string" && /^\d{1,4}$/.test(a[1]) ? parseInt(a[1], 10) : -1)
+    if (secs !== 0 && GATE_SECS.indexOf(secs) < 0) return null
+    return out.concat([mac, String(secs)])
+  case "label":
+    if (a.length < 1 || (mac = macOf(a[0])) === null) return null
+    if (a.length === 2) {
+      if (typeof a[1] !== "string") return null
+      var text = clean(a[1], 1000).trim().substring(0, LABEL_MAX).trim()
+      if (text !== "") return out.concat([mac, text])
+    }
+    return out.concat([mac])
+  case "know":
+  case "forget":
+    if (a.length !== 1 || (mac = macOf(a[0])) === null) return null
+    return out.concat([mac])
+  case "ack":
+    if (a.length !== 1) return null
+    var id = typeof a[0] === "number" ? idOf(a[0]) : (typeof a[0] === "string" && /^\d{1,15}$/.test(a[0]) ? parseInt(a[0], 10) : null)
+    return id === null ? null : out.concat([String(id)])
+  case "ack-all":
+    return a.length === 0 ? out : null
+  case "exempt-default":
+    return a.length === 1 && (a[0] === "on" || a[0] === "off") ? out.concat([a[0]]) : null
+  case "pin":
+    return a.length === 1 && (a[0] === "set" || a[0] === "clear") ? out.concat([a[0]]) : null
+  }
+  return null
+}
+
 // The last JSON object line of an action's stdout, as
 // { ok, error, detail, verifiedVia, blocked, verifyError }. Anything
 // unreadable is a failure with error "noanswer". `qnet dns pihole` reports
@@ -1648,6 +1904,179 @@ function failoverInfo(v) {
   }
 }
 
+// ------------------------------------------------------- the patch bay
+
+// Seconds until the jack's gate shuts, 0 when it has none or it is past.
+function gateLeft(jack, nowS) {
+  if (!jack || typeof jack.gateUntil !== "number" || jack.gateUntil <= 0) return 0
+  return Math.max(0, Math.ceil(jack.gateUntil - num(nowS, 0)))
+}
+
+// 872 -> "14:32", 3600 -> "60:00": minutes unpadded, seconds to two digits.
+function formatGate(sec) {
+  var s = Math.max(0, Math.floor(num(sec, 0)))
+  var r = s % 60
+  return Math.floor(s / 60) + ":" + (r < 10 ? "0" + r : r)
+}
+
+// Whether any jack's gate is still open at nowS.
+function anyGateOpen(v, nowS) {
+  var jacks = v && v.watchdog ? v.watchdog.bay.jacks : []
+  for (var i = 0; i < jacks.length; i++) if (gateLeft(jacks[i], nowS) > 0) return true
+  return false
+}
+
+// The order the board keeps while the panel is open: the macs in the order
+// the jacks come in (alerting and new first, then labelled, then by address,
+// offline last) when there is no held order yet; after that the held ones
+// that still exist, in their places, then the new ones at the end. So a jack
+// does not jump when an alert rings or a label changes under the cursor.
+function holdOrder(prev, jacks) {
+  var list = Array.isArray(jacks) ? jacks : []
+  var macs = []
+  var live = Object.create(null)
+  for (var i = 0; i < list.length; i++) {
+    var m = list[i] && typeof list[i].mac === "string" ? list[i].mac : ""
+    if (m === "" || live[m]) continue
+    live[m] = true
+    macs.push(m)
+  }
+  var held = Array.isArray(prev) ? prev : []
+  if (held.length === 0) return macs
+  var out = []
+  var placed = Object.create(null)
+  for (var j = 0; j < held.length; j++) {
+    var h = held[j]
+    if (typeof h !== "string" || !live[h] || placed[h]) continue
+    placed[h] = true
+    out.push(h)
+  }
+  for (var k = 0; k < macs.length; k++) if (!placed[macs[k]]) out.push(macs[k])
+  return out
+}
+
+// The board as bays of eight, and which of them are in view.
+//   order  the held order (holdOrder): macs
+//   ui     { ticketMac, scroll, ticket? }: ticketMac is the jack whose ticket
+//          is open ("" for none); ticket: true says a ticket is open that
+//          has no jack (the ARP spoof's), which shrinks the board as well
+//   jacks  optional, the jacks: only the rings (a jack with a lamp) need them
+// -> { bays: [[mac...]...] (all of them), shown: [first, count], scroll,
+//      pager: null | { from, to, total, upRing, downRing, canUp, canDown } }
+// Two bays are in view, one while a ticket is open (the ticket's own bay, the
+// scroll it asks for); scroll is clamped to what exists. No pager when every
+// bay is in view. The rings are true while a jack with a lamp lit sits in a
+// bay above (upRing) or below (downRing) the ones in view.
+function bayLayout(order, ui, jacks) {
+  var macs = Array.isArray(order) ? order : []
+  var u = ui || {}
+  var bays = []
+  for (var i = 0; i < macs.length; i += BAY_SIZE) bays.push(macs.slice(i, i + BAY_SIZE))
+  var ticketMac = typeof u.ticketMac === "string" ? u.ticketMac : ""
+  var ticket = ticketMac !== "" || u.ticket === true
+  var count = Math.min(ticket ? 1 : 2, bays.length)
+  var scroll = Math.floor(num(u.scroll, 0))
+  var at = ticketMac !== "" ? macs.indexOf(ticketMac) : -1
+  if (at >= 0) scroll = Math.floor(at / BAY_SIZE)
+  scroll = clamp(scroll, 0, Math.max(0, bays.length - count))
+  var pager = null
+  if (bays.length > count) {
+    var lit = Object.create(null)
+    var js = Array.isArray(jacks) ? jacks : []
+    for (var j = 0; j < js.length; j++) if (js[j] && js[j].lamp !== undefined && js[j].lamp !== "") lit[js[j].mac] = true
+    var up = false
+    var down = false
+    for (var b = 0; b < bays.length; b++) {
+      for (var k = 0; k < bays[b].length; k++) {
+        if (!lit[bays[b][k]]) continue
+        if (b < scroll) up = true
+        else if (b >= scroll + count) down = true
+      }
+    }
+    pager = {
+      from: scroll + 1, to: scroll + count, total: bays.length, upRing: up, downRing: down,
+      canUp: scroll > 0, canDown: scroll < bays.length - count
+    }
+  }
+  return { bays: bays, shown: [scroll, count], scroll: scroll, pager: pager }
+}
+
+// The jack of a mac, or null.
+function jackOf(v, mac) {
+  var jacks = v.watchdog.bay.jacks
+  for (var i = 0; i < jacks.length; i++) if (jacks[i].mac === mac) return jacks[i]
+  return null
+}
+
+// The call (alert waiting) with an id, or null.
+function callOf(v, id) {
+  var calls = v.watchdog.bay.calls
+  for (var i = 0; i < calls.length; i++) if (calls[i].id === id) return calls[i]
+  return null
+}
+
+// The focusable rows of the watchdog view; ctx: { view, flip, ticket, pinOpen,
+// layout, order, nowS } (see focusRows).
+function watchdogRows(v, ctx) {
+  var c = ctx || {}
+  var w = v.watchdog
+  var rows = [{ id: "back", items: ["back"] }]
+  var lit = []
+  for (var i = 0; i < w.bay.lamps.length; i++) if (w.bay.lamps[i].count > 0) lit.push(w.bay.lamps[i].kind)
+  if (lit.length) rows.push({ id: "lamps", items: lit })
+
+  var ticket = c.ticket && (c.ticket.kind === "device" || c.ticket.kind === "alert") ? c.ticket : null
+  var layout = c.layout
+  if (!layout) {
+    var order = Array.isArray(c.order) ? c.order : holdOrder([], w.bay.jacks)
+    layout = bayLayout(order, { ticketMac: ticket && ticket.kind === "device" && ticket.mac ? ticket.mac : "", scroll: 0 }, w.bay.jacks)
+  }
+  for (var b = layout.shown[0]; b < layout.shown[0] + layout.shown[1] && b < layout.bays.length; b++) {
+    rows.push({ id: "bay:" + b, items: layout.bays[b].slice() })
+  }
+  rows.push({ id: "normal", items: ["key"] })
+  if (c.flip) rows.push({ id: "flip", items: ["flip", "cancel"] })
+  if (layout.pager) rows.push({ id: "pager", items: ["up", "down"] })
+  if (w.bay.calls.length) {
+    rows.push({ id: "queue", items: ["dismissall"] })
+    for (var k = 0; k < w.bay.calls.length; k++) rows.push({ id: "call:" + w.bay.calls[k].id, items: ["open"] })
+  }
+
+  if (ticket && ticket.kind === "device") {
+    var jack = jackOf(v, String(ticket.mac || ""))
+    if (jack) {
+      var free = jack.patch !== "always" && jack.patch !== "fixed"
+      rows.push({ id: "label", items: ["edit"] })
+      if (free) rows.push({ id: "patch", items: ["blocked", "pass"] })
+      // a gate opens only on a jack that is blocked and on the network: the Pi
+      // refuses one for an offline device (not-found)
+      if (free && jack.patch === "blocked" && !jack.offline) {
+        var open = jack.gateUntil !== null && (c.nowS === undefined || gateLeft(jack, c.nowS) > 0)
+        rows.push({ id: "gate", items: open ? ["shut"] : GATE_SECS.map(String) })
+      }
+      var acts = []
+      if (!jack.known) acts.push("know")
+      else if (jack.patch !== "always") acts.push("forget")
+      acts.push("close")
+      rows.push({ id: "tactions", items: acts })
+    } else rows.push({ id: "tactions", items: ["close"] })
+  } else if (ticket) {
+    var call = callOf(v, ticket.alertId)
+    var tacts = []
+    if (call) {
+      tacts.push("dismiss")
+      var rung = call.mac !== null ? jackOf(v, call.mac) : null
+      if (call.kind === "new_device" && rung && !rung.known) tacts.push("know")
+      if (call.mac !== null || call.relatedMac !== null) tacts.push("open")
+    }
+    tacts.push("close")
+    rows.push({ id: "tactions", items: tacts })
+  }
+
+  rows.push({ id: "pin", items: c.pinOpen ? ["set", "cancel"] : (w.pinSet ? ["change", "clear"] : ["set"]) })
+  return rows
+}
+
 // ----------------------------------------------------------- the views
 
 // Which view is up: the main one, or a drill-down the main one pushed (DNS,
@@ -1655,10 +2084,11 @@ function failoverInfo(v) {
 // the main view, put back when the drill-down is left.
 function navInit() { return { view: "main", returnCursor: null } }
 
-// Open a drill-down. effects says what entering it does: the Wi-Fi view runs
-// `qnet wifi scan --if-stale 60` (never on opening the panel itself).
+// Open a drill-down (dns, wifi or watchdog). effects says what entering it
+// does: the Wi-Fi view runs `qnet wifi scan --if-stale 60` (never on opening
+// the panel itself); the others run nothing.
 function navOpen(nav, name, cursor) {
-  if ((name !== "dns" && name !== "wifi") || nav.view === name) return { nav: nav, effects: [] }
+  if ((name !== "dns" && name !== "wifi" && name !== "watchdog") || nav.view === name) return { nav: nav, effects: [] }
   var ret = nav.view === "main" ? (cursor || null) : nav.returnCursor
   return {
     nav: { view: name, returnCursor: ret },
@@ -1674,12 +2104,18 @@ function navBack(nav) {
 }
 
 // What Esc does, one level at a time: an armed Forget, the DNS confirm, the
-// passphrase row, a drill-down (back), then the panel (close).
+// passphrase row, the watchdog's PIN field, its NORMAL confirm, a device or
+// alert ticket, a drill-down (back), then the panel (close). ctx: { armed,
+// confirm, password, pin (or pinOpen), flip, ticket, view }, each truthy while
+// that is up.
 function escapeStep(ctx) {
   var c = ctx || {}
   if (c.armed) return "disarm"
   if (c.confirm) return "confirm"
   if (c.password) return "password"
+  if (c.pin || c.pinOpen) return "pin"
+  if (c.flip) return "flip"
+  if (c.ticket) return "ticket"
   if (c.view && c.view !== "main") return "back"
   return "close"
 }
@@ -1687,7 +2123,8 @@ function escapeStep(ctx) {
 // ------------------------------------------------------------ keyboard
 
 // The focusable rows in order, top to bottom, each with the items that
-// left/right walk, for the view that is up. ctx: { view, confirm }.
+// left/right walk, for the view that is up. ctx: { view, confirm } (the
+// watchdog view's ctx is below).
 //   main     header: portal?, qr?, speed?, radio
 //            hero: the one corrective action, when the state has one
 //            route: the nodes that open a view, left to right (ap -> Wi-Fi,
@@ -1698,9 +2135,26 @@ function escapeStep(ctx) {
 //            confirm? (replace, cancel), bypass? (fix), leak:N (pin) one per
 //            profile, pinall? (two or more), admin?
 //   wifi     back, card? (disconnect), scan, net:N one per nearby network
+//   watchdog back; lamps? (the kinds of the lit lamps); bay:I for each bay in
+//            view (items: its macs; I counts from 0 over all the bays);
+//            normal (key); flip? (flip, cancel: the NORMAL confirm); pager?
+//            (up, down); queue? and call:ID, newest first (when there are
+//            calls); the open ticket's rows: for a device label (edit),
+//            patch? (blocked, pass: not for always or fixed), gate? (300,
+//            1800, 3600, or shut while open: only a blocked jack on the
+//            network), tactions (know or forget, close); for an alert
+//            tactions (dismiss, know for a new device whose jack is not
+//            known, open when a jack or related jack exists, close); last
+//            pin (set, cancel while it is open; else change, clear when a PIN
+//            is set; else set).
+//            ctx: { view: "watchdog", flip, ticket: { kind: "device" | "alert",
+//            mac, alertId } | null, pinOpen, layout (bayLayout's), order (the
+//            held order, when there is no layout), nowS (a gate that has run
+//            out reads as shut) }
 function focusRows(v, ctx, pending, nets) {
   var c = ctx || {}
   var rows = []
+  if (c.view === "watchdog") return watchdogRows(v, c)
   if (c.view === "dns") {
     rows.push({ id: "back", items: ["back"] })
     rows.push({ id: "choice:pihole", items: ["pick"] })
@@ -1743,12 +2197,12 @@ function rowIndex(rows, id) {
 }
 
 // Where the cursor starts: on the route of the main view (the first node
-// only opens the Wi-Fi view), the way back on the DNS view (never on a
-// resolver choice: a stray Enter or Space as the view opens must not change
-// DNS) and the scan button on the Wi-Fi view (never on a network, the card's
+// only opens the Wi-Fi view), the way back on the DNS and watchdog views (never
+// on a resolver choice or a cord: a stray Enter or Space as the view opens
+// must not change anything) and the scan button on the Wi-Fi view (never on a network, the card's
 // Disconnect or anything else that changes the connection).
 function initialCursor(rows, view) {
-  var order = view === "dns" ? ["back"] : (view === "wifi" ? ["scan", "back"] : ["route", "pause", "header"])
+  var order = view === "dns" || view === "watchdog" ? ["back"] : (view === "wifi" ? ["scan", "back"] : ["route", "pause", "header"])
   for (var i = 0; i < order.length; i++) {
     var at = rowIndex(rows, order[i])
     if (at >= 0) return { row: rows[at].id, item: 0 }
@@ -1808,6 +2262,8 @@ if (typeof module !== "undefined") {
     FAILOVER_AFTER_S: FAILOVER_AFTER_S, ACTION_DEADLINE_MS: ACTION_DEADLINE_MS, GW_SLOW_MS: GW_SLOW_MS,
     LATENCY_BAD_MS: LATENCY_BAD_MS, PENDING_TTL_MS: PENDING_TTL_MS, SCAN_SPIN_MS: SCAN_SPIN_MS, GLYPH: GLYPH,
     clean: clean, safeUrl: safeUrl, emptyState: emptyState, normalizeState: normalizeState,
+    normalizeWatchdog: normalizeWatchdog, watchdogPresent: watchdogPresent, holdOrder: holdOrder,
+    bayLayout: bayLayout, gateLeft: gateLeft, formatGate: formatGate,
     parseStateLine: parseStateLine, backoffMs: backoffMs, restartAttempt: restartAttempt,
     formatCountdown: formatCountdown, groupDigits: groupDigits, formatCount: formatCount,
     formatPercent: formatPercent, formatLatency: formatLatency, formatRate: formatRate,
@@ -1828,7 +2284,7 @@ if (typeof module !== "undefined") {
     argvDns: argvDns, argvPin: argvPin, argvPause: argvPause, argvResume: argvResume,
     argvConnect: argvConnect, argvDown: argvDown, argvForget: argvForget, argvScan: argvScan,
     argvRadio: argvRadio, argvPortal: argvPortal, argvTerminal: argvTerminal, argvOpenUrl: argvOpenUrl,
-    argvCopy: argvCopy, parseResult: parseResult, failure: failure, verifyNote: verifyNote,
+    argvCopy: argvCopy, argvWatchdog: argvWatchdog, parseResult: parseResult, failure: failure, verifyNote: verifyNote,
     focusRows: focusRows, rowIndex: rowIndex, initialCursor: initialCursor, moveFocus: moveFocus,
     settleCursor: settleCursor, freshGate: freshGate
   }

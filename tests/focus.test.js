@@ -14,26 +14,26 @@ test("main view, top to bottom: header, the route, pause, the footer; no drill-d
   const rows = main("healthy")
   assert.deepEqual(ids(rows), ["header", "route", "pause", "ip"])
   assert.deepEqual(rows[0].items, ["qr", "speed", "radio"], "the header no longer carries a Disconnect")
-  assert.deepEqual(rows[1].items, ["ap", "ph"], "the route's nodes are the navigation, left to right")
+  assert.deepEqual(rows[1].items, ["ap", "ph", "up"], "the route's nodes are the navigation, left to right")
   assert.deepEqual(rows[2].items, ["pause"])
   for (const n of ["healthy", "paused", "bypassed", "fallback", "none", "unconfigured", "offline", "radio-off", "ethernet", "api-auth"]) {
     assert.equal(ids(main(n)).some((id) => id.indexOf("goto:") === 0), false, n + ": the DNS and Wi-Fi rows are gone")
   }
 })
 
-test("the route's stops are the nodes that open a view: the AP, the Pi-hole's place", () => {
-  assert.deepEqual(main("healthy")[1].items, ["ap", "ph"])
-  assert.deepEqual(main("unconfigured").filter((r) => r.id === "route")[0].items, ["ap", "ph"], "the ghost node opens DNS")
-  assert.deepEqual(main("none").filter((r) => r.id === "route")[0].items, ["ap", "ph"], "so does the DNS node of no-DNS")
+test("the route's stops are the nodes that open a view: the AP, the Pi-hole's place, the resolver beyond", () => {
+  assert.deepEqual(main("healthy")[1].items, ["ap", "ph", "up"])
+  assert.deepEqual(main("unconfigured").filter((r) => r.id === "route")[0].items, ["ap", "ph", "up"], "the ghost node opens DNS, and so does the resolver")
+  assert.deepEqual(main("none").filter((r) => r.id === "route")[0].items, ["ap", "ph"], "the DNS node of no-DNS opens DNS; nothing is beyond it")
   assert.deepEqual(main("offline").filter((r) => r.id === "route")[0].items, ["ap"], "offline: the dim AP still opens Wi-Fi")
   assert.deepEqual(main("radio-off").filter((r) => r.id === "route")[0].items, ["ap"])
-  assert.deepEqual(main("ethernet").filter((r) => r.id === "route")[0].items, ["ap", "ph"])
+  assert.deepEqual(main("ethernet").filter((r) => r.id === "route")[0].items, ["ap", "ph", "up"])
   const down = Model.effective(state("healthy"), Model.emptyPending(), 0, NOW_MS, true)
   assert.equal(ids(Model.focusRows(down, { view: "main" })).includes("route"), false, "no route without the backend")
   assert.equal(Model.routeTarget(view("healthy"), "ap"), "wifi")
   assert.equal(Model.routeTarget(view("healthy"), "ph"), "dns")
   assert.equal(Model.routeTarget(view("healthy"), "pc"), "")
-  assert.equal(Model.routeTarget(view("healthy"), "up"), "")
+  assert.equal(Model.routeTarget(view("healthy"), "up"), "dns", "the resolver beyond opens DNS now that the Pi-hole's place can open the watchdog")
 })
 
 test("a portal puts its sign-in link first among the header's stops", () => {
@@ -88,11 +88,13 @@ test("left and right walk along the route's nodes and stop at its ends", () => {
   const rows = main("healthy")
   let r = Model.moveFocus(rows, { row: "route", item: 0 }, 1, 0, {})
   assert.deepEqual(r.cursor, { row: "route", item: 1 })
-  assert.equal(Model.moveFocus(rows, r.cursor, 1, 0, r.memory).cursor.item, 1, "no wrap at the Pi-hole")
+  r = Model.moveFocus(rows, r.cursor, 1, 0, r.memory)
+  assert.deepEqual(r.cursor, { row: "route", item: 2 })
+  assert.equal(Model.moveFocus(rows, r.cursor, 1, 0, r.memory).cursor.item, 2, "no wrap at the resolver")
   assert.equal(Model.moveFocus(rows, { row: "route", item: 0 }, -1, 0, {}).cursor.item, 0)
   r = Model.moveFocus(rows, r.cursor, 0, 1, r.memory)
   assert.equal(r.cursor.row, "pause")
-  assert.deepEqual(Model.moveFocus(rows, r.cursor, 0, -1, r.memory).cursor, { row: "route", item: 1 }, "it remembers the node")
+  assert.deepEqual(Model.moveFocus(rows, r.cursor, 0, -1, r.memory).cursor, { row: "route", item: 2 }, "it remembers the node")
 })
 
 test("a row remembers which of its items the cursor was on", () => {
@@ -244,6 +246,7 @@ test("Esc steps back one level: armed Forget, confirm, passphrase, the drill-dow
   assert.equal(Model.escapeStep({ confirm: true, password: true, view: "dns" }), "confirm")
   assert.equal(Model.escapeStep({ password: true, view: "wifi" }), "password")
   assert.equal(Model.escapeStep({ view: "wifi" }), "back")
+  assert.equal(Model.escapeStep({ view: "watchdog" }), "back")
   assert.equal(Model.escapeStep({ view: "dns" }), "back")
   assert.equal(Model.escapeStep({ view: "main" }), "close")
   assert.equal(Model.escapeStep({}), "close")
