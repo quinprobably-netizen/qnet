@@ -92,6 +92,38 @@ that mode the block list decides, so use `block` and `unblock` there.
 - Run cargo from inside `backend/`, or `.cargo/config.toml` is skipped and
   `backend/target` lands in the watched plugin tree.
 
+## Offscreen shots
+
+```
+tools/shot [--scale N] <fixture.json> <out.png> [ui.json]
+tools/shot --scale 2 tests/fixtures/healthy.json docs/shots/x.png tools/harness/ui/wifi.json
+```
+
+Renders the whole panel to a PNG without the shell (`/usr/bin/qml6`, offscreen,
+software). `Panel.qml`, `QnetService.qml` and `components/` are the real ones;
+what the shell provides (`qs.Ui`, `qs.Commons`, `Quickshell`, `Quickshell.Io`)
+is a stub in `tools/harness/imports/`: the Amethyst colours, JetBrainsMono Nerd
+Font at the shell's `Style.font` sizes, `i18n/en.json` for the words, motion off
+(so a shot repeats byte for byte). The card is 520 px wide on the page colour
+with a 24 px margin: the 488 px content column, 16 px of padding. The real
+KeyboardPanel makes the card as wide as the width asked for (488), so its content
+is 456; `{"realWidth": true}` draws that. `--scale 2` gives the 2x of the mockup
+stills.
+
+- **Fixture:** a full state JSON. The fake `qnet watch` (the `Process` stub) says
+  it as its one state line. Its unix times are moved by `now - 1794122700` (the
+  tests' clock), so ages and countdowns read as when it was written. A time is a
+  number over 1e9 named `*Unix`, `*At`, `*Until`, `*Since`, `since`, `until` or
+  `t`; `seq`, `lastScanAgeS`, `pauseRemainingS` and the like are relative and stay.
+  Any other command (an action) is logged and answers `{"ok":true}`.
+- **ui.json:** `{"view": "main|dns|wifi|…", "call": [["functionName", arg, …], …]}`.
+  `view` runs `openView(view, false)` (as the IPC does, so the keyboard cursor
+  shows); each `call` runs `functionName(args)` on the panel, in order. A view
+  that does not open, or an unknown function, fails. `{"call": [["openView",
+  "dns", true]]}` opens it as a click does, without the cursor.
+- Exits 1 on any QML warning. Nothing of the live shell is touched, no input is
+  sent, nothing leaves the machine.
+
 ## Review history
 
 Blind council: Opus/Sonnet seats plus a Fable security seat, with an Opus chair.

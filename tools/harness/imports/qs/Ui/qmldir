@@ -1,0 +1,11 @@
+module qs.Ui
+Panel 1.0 Panel.qml
+KeyboardPanel 1.0 KeyboardPanel.qml
+PanelKeyCatcher 1.0 PanelKeyCatcher.qml
+PointerMoveGate 1.0 PointerMoveGate.qml
+BorderSurface 1.0 BorderSurface.qml
+CursorSurface 1.0 CursorSurface.qml
+PanelActionButton 1.0 PanelActionButton.qml
+PanelToolTip 1.0 PanelToolTip.qml
+BarIconButton 1.0 BarIconButton.qml
+TextField 1.0 TextField.qml

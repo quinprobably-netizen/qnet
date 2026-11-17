@@ -1,0 +1,2 @@
+module Harness
+singleton Harness 1.0 Harness.qml

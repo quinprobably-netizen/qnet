@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Renders the whole panel to a PNG, offscreen, from a state fixture:
+#   tools/shot [--scale N] <fixture.json> <out.png> [ui.json]
+# <fixture.json> is a full state (tests/fixtures/healthy.json is one); the fake
+# `qnet watch` says it as its one state line, with its unix times moved so that
+# ages and countdowns read as when the fixture was made. ui.json, optional, says
+# what to do once the panel is up (see tools/harness/Shot.qml):
+#   {"view": "main|dns|wifi", "call": [["functionName", arg, ...], ...]}
+# --scale 2 renders at 2x (the mockup stills are 2x). Messages are printed with
+# their type; the exit status is 1 when QML logged any warning or critical, or
+# the render failed. Nothing of the live shell is touched.
+set -u
+
+usage() { echo "usage: tools/shot [--scale N] <fixture.json> <out.png> [ui.json]" >&2; exit 2; }
+
+scale=1
+pos=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --scale) [ "$#" -ge 2 ] || usage; scale="$2"; shift 2 ;;
+    --scale=*) scale="${1#--scale=}"; shift ;;
+    -h|--help) usage ;;
+    -*) echo "shot: unknown option $1" >&2; usage ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+{ [ "${#pos[@]}" -ge 2 ] && [ "${#pos[@]}" -le 3 ]; } || usage
+case "$scale" in
+  ''|*[!0-9.]*|.|*.*.*) echo "shot: --scale must be a number, got '$scale'" >&2; exit 2 ;;
+esac
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fixture="$(realpath -m -- "${pos[0]}")"
+out="$(realpath -m -- "${pos[1]}")"
+ui=""
+[ "${#pos[@]}" -eq 3 ] && ui="$(realpath -m -- "${pos[2]}")"
+
+[ -f "$fixture" ] || { echo "shot: no fixture $fixture" >&2; exit 2; }
+[ -z "$ui" ] || [ -f "$ui" ] || { echo "shot: no ui file $ui" >&2; exit 2; }
+mkdir -p "$(dirname "$out")"
+
+# Software rendering, offscreen. The stubs (imports/) come first on the import
+# path, ahead of any Quickshell the machine has installed. Every message is
+# prefixed with its type so a warning can be told from a console.log.
+log="$(QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_SCALE_FACTOR="$scale" \
+       QT_QUICK_CONTROLS_STYLE=Basic QT_FORCE_STDERR_LOGGING=1 QML_XHR_ALLOW_FILE_READ=1 \
+       QT_MESSAGE_PATTERN='[%{type}] %{message}' \
+       /usr/bin/qml6 -I "$root/tools/harness/imports" "$root/tools/harness/Shot.qml" \
+       -- "$fixture" "$out" "$ui" 2>&1)"
+code=$?
+[ -n "$log" ] && printf '%s\n' "$log"
+
+if grep -qE '^\[(warning|critical|fatal)\]' <<<"$log"; then
+  echo "shot: FAILED, QML logged warnings (above)" >&2
+  exit 1
+fi
+[ "$code" -eq 0 ] || { echo "shot: FAILED (exit $code)" >&2; exit 1; }
