@@ -19,13 +19,14 @@ import "components"
 // shell shares; the bar makes one widget per monitor, and each of them reads
 // that one service and tells it when its panel opens and closes.
 //
-// Three views: the main one (components/MainView.qml: connection, the hero
-// with its route, Pause, the address) and two it pushes, DNS (DnsView.qml)
-// and Wi-Fi (WifiView.qml). The route is the navigation: its AP node opens
-// the Wi-Fi view and its Pi-hole node the DNS view. Which view is up, and
-// what entering it does, is Model.navOpen/navBack. One keyboard cursor runs
-// through the rows of the view that is up (Model.focusRows), and the pointer
-// moves the same cursor.
+// Four views: the main one (components/MainView.qml: connection, the hero
+// with its route, Pause, the address) and three it pushes, DNS (DnsView.qml),
+// Wi-Fi (WifiView.qml) and the watchdog (WatchdogView.qml: a qberrypi's patch
+// bay). The route is the navigation: its AP node opens the Wi-Fi view, its
+// Pi-hole node the watchdog (the DNS view when there is no watchdog) and the
+// resolver beyond it the DNS view. Which view is up, and what entering it
+// does, is Model.navOpen/navBack. One keyboard cursor runs through the rows of
+// the view that is up (Model.focusRows), and the pointer moves the same cursor.
 Panel {
   id: root
   moduleName: "qqq.qnet"
@@ -59,12 +60,32 @@ Panel {
   readonly property color restFill: Qt.rgba(fg.r, fg.g, fg.b, Tokens.REST_FILL)
   readonly property color hoverFill: Qt.rgba(fg.r, fg.g, fg.b, Tokens.HOVER_FILL)
   readonly property color lineColor: Qt.rgba(fg.r, fg.g, fg.b, Tokens.LINE_ALPHA)
+  // The patch bay's surfaces and marks (WatchdogView, PatchBay), all
+  // derived from the theme: the card's own colour, a well darker than it, a
+  // raised ring a shade toward the accent, a deep hole, and two tints of the
+  // foreground for what is fixed and what is lit white.
+  readonly property color cardColor: Commons.Color.popups.background
+  readonly property color well: Qt.darker(cardColor, 1.25)
+  readonly property color raise: Qt.tint(cardColor, Qt.rgba(accent.r, accent.g, accent.b, 0.08))
+  readonly property color sel: Qt.tint(cardColor, Qt.rgba(accent.r, accent.g, accent.b, 0.19))
+  readonly property color hole: Qt.darker(cardColor, 3)
+  readonly property color ring: Qt.hsva(accent.hsvHue, Math.min(1, accent.hsvSaturation * 1.2), accent.hsvValue * 0.7, 1)
+  readonly property color muted: Qt.tint(Qt.darker(dim, 1.7), Qt.rgba(accent.r, accent.g, accent.b, 0.3))
+  readonly property color bright: Qt.lighter(fg, 1.1)
   readonly property real pressScale: Tokens.PRESS_SCALE
   readonly property real disabledOpacity: Tokens.DISABLED_OPACITY
   readonly property int gutter: Style.space(8)
 
   function formatNumber(value, decimals) { return Commons.I18n.formatNumber(value, decimals) }
   function formatInt(n) { return Qt.locale(Commons.I18n.formatLocale).toString(n, "f", 0) }
+
+  // A word the model names by key ({ key, args }, as Model.jackReadout's
+  // `how`), in the catalog's words.
+  function say(w) {
+    var s = strings.t(w.key)
+    for (var i = 0; i < w.args.length; i++) s = s.replace("%" + (i + 1), w.args[i])
+    return s
+  }
 
   // -------------------------------------------------------------- state
   // rawState is the newest snapshot from the service; the view is that with
@@ -92,6 +113,7 @@ Panel {
     pending = Model.reconcilePending(pending, rawState, nowMs)
     var p = rawState.pihole
     if (p.api === "ok" && p.reachable && rawState.link.kind !== "none") statsGoodAt = nowMs
+    wdSync()
   }
 
   // Counts a pause or a failover down and lets pending requests expire, only
@@ -99,7 +121,7 @@ Panel {
   Timer {
     interval: 1000
     repeat: true
-    running: root.opened && Model.needsClock(root.view, root.pending, root.nowMs / 1000)
+    running: root.opened && Model.needsClock(root.view, root.pending, root.nowMs / 1000, { view: root.page })
     onTriggered: {
       root.nowMs = Date.now()
       root.pending = Model.reconcilePending(root.pending, root.rawState, root.nowMs)
@@ -112,9 +134,9 @@ Panel {
   Timer { id: settleTimer; interval: 320; onTriggered: root.settled = root.opened }
 
   // ------------------------------------------------------------- views
-  // "main" | "dns" | "wifi"; a view is pushed from the main one (by a click
-  // or Enter on a node of the route) and popped by Esc, Backspace or the back
-  // button, which puts the main view's cursor back where it was.
+  // "main" | "dns" | "wifi" | "watchdog"; a view is pushed from the main one
+  // (by a click or Enter on a node of the route) and popped by Esc, Backspace
+  // or the back button, which puts the main view's cursor back where it was.
   property var nav: Model.navInit()
   readonly property string page: nav.view
   readonly property int headerBackSize: Style.space(30)
@@ -122,10 +144,14 @@ Panel {
   // viaPointer: the route's node was clicked, so the new view shows no
   // keyboard cursor until a key asks for one.
   function openView(name, viaPointer) {
-    if (name !== "dns" && name !== "wifi") return
+    if (name !== "dns" && name !== "wifi" && name !== "watchdog") return
+    // Nothing to open on a Pi-hole that has no watchdog.
+    if (name === "watchdog" && !Model.watchdogPresent(view)) return
     var r = Model.navOpen(nav, name, cursor)
     if (r.nav === nav) return
+    if (nav.view === "watchdog") wdReset()
     nav = r.nav
+    if (name === "watchdog") wdOpen()
     cursorActive = viaPointer !== true
     cursorPointer = false
     cursorMemory = ({})
@@ -215,7 +241,7 @@ Panel {
   // short screen.
   readonly property int listRows: Math.max(3, Math.min(8, Math.floor((panel.availableCardHeight - Style.space(360)) / Style.space(36))))
 
-  Timer { id: noteTimer; interval: 7000; onTriggered: { root.dnsNote = ({ tone: "", text: "" }); root.netNote = ""; root.netFail = ({ id: "", text: "" }) } }
+  Timer { id: noteTimer; interval: 7000; onTriggered: { root.dnsNote = ({ tone: "", text: "" }); root.netNote = ""; root.netFail = ({ id: "", text: "" }); root.wdNote = "" } }
   Timer { id: armTimer; interval: 4000; onTriggered: root.armedUuid = "" }
   Timer { id: copiedTimer; interval: 1300; onTriggered: root.copied = false }
 
@@ -257,12 +283,13 @@ Panel {
   }
 
   // What belongs to the view being left: a passphrase row, an armed Forget,
-  // the DNS confirm.
+  // the DNS confirm, the watchdog's board state.
   function closeTransients() {
     passwordFor = ""
     passwordError = ""
     armedUuid = ""
     confirm = ({ open: false, verb: "", servers: "", kind: "" })
+    wdReset()
   }
 
   function wipeSecrets() {
@@ -308,7 +335,7 @@ Panel {
   readonly property var routeStops: Model.routeStops(view)
   readonly property string routeCursorNode: has("route") && routeStops.length > 0 ? routeStops[Math.min(cursor.item, routeStops.length - 1)] : ""
 
-  readonly property var rows: Model.focusRows(view, { view: page, confirm: confirm.open }, pending, netList)
+  readonly property var rows: Model.focusRows(view, page === "watchdog" ? wdRowsCtx : { view: page, confirm: confirm.open }, pending, netList)
   readonly property string rowsSig: page + ":" + rows.map(function(r) { return r.id }).join(",")
   // The header's own stops, whichever view is up (the header is on the main
   // view's face).
@@ -391,12 +418,19 @@ Panel {
   }
 
   // Esc steps back one level (Model.escapeStep): an armed Forget, the DNS
-  // confirm, the passphrase row, a drill-down, then the panel.
+  // confirm, the passphrase row, the watchdog's PIN field, its NORMAL confirm
+  // and its open ticket, a drill-down, then the panel.
   function handleEscape() {
-    var step = Model.escapeStep({ armed: armedUuid !== "", confirm: confirm.open, password: passwordFor !== "", view: page })
+    var step = Model.escapeStep({
+      armed: armedUuid !== "", confirm: confirm.open, password: passwordFor !== "",
+      pin: wdPinOpen, flip: wdFlip, ticket: wdTicket !== null, view: page
+    })
     if (step === "disarm") disarmForget()
     else if (step === "confirm") confirmCancel()
     else if (step === "password") cancelPassword()
+    else if (step === "pin") wdPinOpen = false
+    else if (step === "flip") wdFlip = false
+    else if (step === "ticket") wdTicket = null
     else if (step === "back") goBack()
     else close()
   }
@@ -426,6 +460,7 @@ Panel {
     else if (id === "scan") scan()
     else if (id.indexOf("net:") === 0) activateNet(parseInt(id.substring(4), 10))
     else if (id === "ip") copyIp()
+    else if (page === "watchdog") wdActivate(id, item)
   }
 
   // Delete asks to forget the saved network under the cursor (the one in
@@ -593,6 +628,166 @@ Panel {
     if (!argv) return
     Quickshell.execDetached(argv)
     close()
+  }
+
+  // -- Watchdog (a qberrypi's patch bay: WatchdogView, PatchBay, LampRow)
+  // The tab's state lives here, as the other views' does: reset when the tab
+  // is left or the panel closes, and nothing but the held order survives a
+  // state update.
+  //   wdOrder     the macs in the order the board keeps while the tab is up
+  //               (Model.holdOrder); set on entering, updated as jacks come
+  //               and go
+  //   wdScroll    the first bay in view (Model.bayLayout clamps it)
+  //   wdTicket    null, { kind: "device", mac } or { kind: "alert", alertId }:
+  //               the open ticket; the board shrinks to its bay
+  //   wdFlip      the NORMAL confirm is open
+  //   wdPinOpen   the PIN field is open
+  //   wdNote      an inline note (a failed action), cleared by noteTimer
+  property var wdOrder: []
+  property int wdScroll: 0
+  property var wdTicket: null
+  property bool wdFlip: false
+  property bool wdPinOpen: false
+  property string wdNote: ""
+
+  // The jack the open ticket belongs to ("" for none, or for a call that
+  // rings no jack: the ARP spoof's).
+  readonly property string wdTicketMac: {
+    if (wdTicket === null) return ""
+    if (wdTicket.kind === "device") return wdTicket.mac
+    var call = Model.callOf(view, wdTicket.alertId)
+    return call !== null && call.mac !== null ? call.mac : ""
+  }
+  // The lamp whose window is lit "on": the open alert ticket's kind.
+  readonly property string wdTicketLamp: {
+    if (wdTicket === null || wdTicket.kind !== "alert") return ""
+    var call = Model.callOf(view, wdTicket.alertId)
+    return call !== null ? call.lamp : ""
+  }
+  readonly property var wdLayout: Model.bayLayout(wdOrder, { ticketMac: wdTicketMac, ticket: wdTicket !== null, scroll: wdScroll }, view.watchdog.bay.jacks)
+  readonly property var wdRowsCtx: ({
+    view: "watchdog", flip: wdFlip, ticket: wdTicket, pinOpen: wdPinOpen, layout: wdLayout, order: wdOrder, nowS: nowMs / 1000
+  })
+
+  function wdReset() {
+    wdOrder = []
+    wdScroll = 0
+    wdTicket = null
+    wdFlip = false
+    wdPinOpen = false
+    wdNote = ""
+  }
+
+  // Entering the tab: the order is the jacks' own (alerting and new first,
+  // labelled, then by address), held from here until the tab is left.
+  function wdOpen() {
+    wdReset()
+    wdOrder = Model.holdOrder([], view.watchdog.bay.jacks)
+  }
+
+  // A new snapshot while the tab is up: jacks that came are added at the end
+  // of the held order, jacks that went are dropped, and an alert ticket whose
+  // call is gone closes.
+  function wdSync() {
+    if (page !== "watchdog") return
+    var next = Model.holdOrder(wdOrder, rawState.watchdog.bay.jacks)
+    if (next.join(",") !== wdOrder.join(",")) wdOrder = next
+    if (wdTicket !== null && wdTicket.kind === "alert" && Model.callOf(rawState, wdTicket.alertId) === null) wdTicket = null
+  }
+
+  // Which bay is in view after a ticket for `mac` opens: its own, which stays
+  // when the ticket closes.
+  function wdSeat(mac) {
+    wdScroll = Model.bayLayout(wdOrder, { ticketMac: mac, scroll: wdScroll }, view.watchdog.bay.jacks).scroll
+  }
+
+  // A click or Enter on a jack's column: its ticket opens, or closes.
+  function wdToggleDevice(mac) {
+    if (typeof mac !== "string" || mac === "") return
+    wdFlip = false
+    if (wdTicket !== null && wdTicket.kind === "device" && wdTicket.mac === mac) { wdTicket = null; return }
+    wdSeat(mac)
+    wdTicket = ({ kind: "device", mac: mac })
+  }
+
+  // A click or Enter on a lit drop lamp, a lit window of the lamp row or a
+  // call: that alert's ticket opens, or closes.
+  function wdOpenAlert(alertId) {
+    if (typeof alertId !== "number") return
+    wdFlip = false
+    if (wdTicket !== null && wdTicket.kind === "alert" && wdTicket.alertId === alertId) { wdTicket = null; return }
+    var call = Model.callOf(view, alertId)
+    if (call === null) return
+    if (call.mac !== null) wdSeat(call.mac)
+    wdTicket = ({ kind: "alert", alertId: alertId })
+  }
+
+  // A lit window of the lamp row opens its kind's newest call.
+  function wdOpenLamp(kind) {
+    var lamps = view.watchdog.bay.lamps
+    for (var i = 0; i < lamps.length; i++) if (lamps[i].kind === kind) { wdOpenAlert(lamps[i].alertId); return }
+  }
+
+  // Put bay `bay` first in view (the shots use it; the pager and the wheel
+  // step with wdPage). Model.bayLayout clamps it to what exists, and an open
+  // ticket's bay wins.
+  function wdScrollTo(bay) {
+    if (wdTicketMac === "") wdScroll = Math.max(0, Math.floor(Number(bay) || 0))
+  }
+
+  function wdPage(dir) {
+    if (wdTicketMac !== "") return
+    wdScroll = Math.max(0, wdLayout.scroll + (dir < 0 ? -1 : 1))
+  }
+
+  // The NORMAL key and "Flip ›": to ADS PASS asks first (the confirm in the
+  // readout); back to BLOCKED is at once.
+  function wdPressKey() {
+    if (view.watchdog.exemptDefault) {
+      wdFlip = false
+      wdAction("exempt-default", ["off"])
+    } else wdFlip = !wdFlip
+  }
+
+  function wdConfirmFlip() {
+    if (!wdFlip) return
+    wdFlip = false
+    wdAction("exempt-default", ["on"])
+  }
+
+  function wdCancelFlip() { wdFlip = false }
+
+  function setWdNote(text) {
+    wdNote = text
+    noteTimer.restart()
+  }
+
+  // One `qnet watchdog <verb>` (Model.argvWatchdog builds it). When it
+  // succeeds the watcher is told to read the devices again so the board shows
+  // the edit at once; when it fails the board says why, inline.
+  function wdAction(verb, args, done) {
+    var argv = Model.argvWatchdog(bin, verb, args)
+    if (!argv) return false
+    wdNote = ""
+    return runCli(argv, {}, function(res) {
+      if (res.ok) QnetService.send("devices")
+      else {
+        var words = failureText(Model.failure(res))
+        if (words !== "") setWdNote(words)
+      }
+      if (typeof done === "function") done(res)
+    })
+  }
+
+  // Enter on a stop of the watchdog view (the back button is handled above).
+  // TODO(T5b): queue (dismissall), call:ID (open its ticket), label, patch,
+  // gate, tactions and pin rows; their actions go through wdAction.
+  function wdActivate(id, item) {
+    if (id === "lamps") wdOpenLamp(item)
+    else if (id.indexOf("bay:") === 0) wdToggleDevice(item)
+    else if (id === "normal") wdPressKey()
+    else if (id === "flip") { if (item === "flip") wdConfirmFlip(); else wdCancelFlip() }
+    else if (id === "pager") wdPage(item === "up" ? -1 : 1)
   }
 
   // -- Wi-Fi
@@ -803,11 +998,11 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    // Open the panel on a view: "main", "dns" or "wifi" (for scripts and
-    // screenshots; no synthetic input needed).
+    // Open the panel on a view: "main", "dns", "wifi" or "watchdog" (for
+    // scripts and screenshots; no synthetic input needed).
     function view(name: string): void {
       root.open()
-      if (name === "dns" || name === "wifi") root.openView(name, false)
+      if (name === "dns" || name === "wifi" || name === "watchdog") root.openView(name, false)
       else if (root.page !== "main") root.goBack(false)
     }
   }
@@ -847,7 +1042,8 @@ Panel {
     return null
   }
 
-  readonly property int topPad: Style.space(8)
+  // The watchdog's board starts at the card's padding, as the mockup's does.
+  readonly property int topPad: page === "watchdog" ? 0 : Style.space(8)
   readonly property int bottomPad: Style.space(2)
 
   KeyboardPanel {
@@ -858,7 +1054,9 @@ Panel {
     open: root.opened
     focusTarget: keyGate
     // As wide as Sound Hub: the width of the overclock panel's page column.
-    contentWidth: panel.fittedContentWidth(Style.space(488))
+    // The board of the watchdog view is 488 wide (a 70 rail and a 418 bay), so
+    // its card is 32 wider (the card's padding and border are 16 a side).
+    contentWidth: panel.fittedContentWidth(Style.space(root.page === "watchdog" ? 520 : 488))
     contentHeight: panel.fittedContentHeight(views.current.implicitHeight + root.topPad + root.bottomPad, Style.space(820))
 
     PanelKeyCatcher {
@@ -893,6 +1091,7 @@ Panel {
         else if (k === "r") { if (root.page === "wifi" && root.fresh("key:r")) root.scan() }
         else if (k === "1") { if (root.fresh("key:1")) root.openView("dns") }
         else if (k === "2") { if (root.fresh("key:2")) root.openView("wifi") }
+        else if (k === "3") { if (root.fresh("key:3")) root.openView("watchdog") }
         // Backspace goes back a view and never closes the panel.
         else if (t === "\b") { if (root.fresh("key:bs")) root.goBack() }
       }
@@ -916,18 +1115,19 @@ Panel {
         anchors.fill: parent
         opacity: root.cardOpaque ? 1 : 0
 
-        // The three views, one up at a time.
+        // The four views, one up at a time.
         Item {
           id: views
           y: root.topPad
           width: parent.width
-          readonly property Item current: root.page === "dns" ? dnsView : root.page === "wifi" ? wifiView : mainView
+          readonly property Item current: root.page === "dns" ? dnsView : root.page === "wifi" ? wifiView : root.page === "watchdog" ? watchdogView : mainView
           implicitHeight: current.implicitHeight
           height: implicitHeight
 
           MainView { id: mainView; hub: root; visible: root.page === "main" }
           DnsView { id: dnsView; hub: root; visible: root.page === "dns" }
           WifiView { id: wifiView; hub: root; visible: root.page === "wifi" }
+          WatchdogView { id: watchdogView; hub: root; visible: root.page === "watchdog" }
         }
       }
     }

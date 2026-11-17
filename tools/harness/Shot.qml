@@ -10,10 +10,14 @@
 // page's height has stood for two frames; then it is grabbed and the process
 // exits 0. Anything that goes wrong is logged as a warning and exits 1.
 //
+// The card is drawn at the width the panel asks for (its contentWidth: 488
+// for the main, DNS and Wi-Fi views, 520 for the watchdog's), with the
+// shell's own padding and border, so every shot shows the real geometry
+// (imports/qs/Ui/KeyboardPanel.qml).
+//
 // ui.json, optional:
-//   { "view": "main|dns|wifi|…",              openView(view, false) on the panel
-//     "call": [["functionName", arg, …], …],  root[functionName](...args), in order
-//     "realWidth": false }                    see imports/qs/Ui/KeyboardPanel.qml
+//   { "view": "main|dns|wifi|watchdog",       openView(view, false) on the panel
+//     "call": [["functionName", arg, …], …] } root[functionName](...args), in order
 // A view that does not open, or a function the panel does not have, fails.
 import QtQuick
 import QtQuick.Window
@@ -42,9 +46,14 @@ Window {
   visible: true
   color: pageColor
 
+  // Sized from the window's own size, not anchored to its content item: that
+  // one follows the platform window's resize a moment later, and a card that
+  // grows after the first frames (a taller view) must not be grabbed at the
+  // old height.
   Rectangle {
     id: page
-    anchors.fill: parent
+    width: win.width
+    height: win.height
     color: win.pageColor
 
     // The panel's own item sits at the host's origin and its card at the

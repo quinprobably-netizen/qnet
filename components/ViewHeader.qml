@@ -5,23 +5,28 @@ import qs.Commons
 
 // The head of a drill-down view: a back button, the title, and, when there
 // is one, a dim line under it. The back button is a cursor stop ("back"); its
-// tooltip names the key. Esc and Backspace go back too (Panel.qml).
+// tooltip names the key. Esc and Backspace go back too (Panel.qml). A view
+// that wants something on the right puts it inside this one (the watchdog's
+// small route); `inset` is the air at both edges (the views' gutter, 0 for a
+// view that spans the whole content column).
 Item {
   id: vh
 
   required property var hub
   property string title: ""
   property string subtitle: ""
+  property real inset: hub.gutter
+  default property alias trailing: tail.data
 
   width: parent ? parent.width : 0
-  implicitHeight: Math.max(backBox.height, labels.implicitHeight) + Style.space(6)
+  implicitHeight: Math.max(backBox.height, labels.implicitHeight, tail.height) + Style.space(6)
 
   CursorSurface {
     id: backBox
     width: vh.hub.headerBackSize
     height: vh.hub.headerBackSize
     anchors.left: parent.left
-    anchors.leftMargin: vh.hub.gutter
+    anchors.leftMargin: vh.inset
     anchors.verticalCenter: parent.verticalCenter
     hasCursor: vh.hub.has("back")
     onHasCursorChanged: if (hasCursor) vh.hub.ensureCursorVisible(backBox)
@@ -58,12 +63,21 @@ Item {
     }
   }
 
+  Item {
+    id: tail
+    anchors.right: parent.right
+    anchors.rightMargin: vh.inset
+    anchors.verticalCenter: parent.verticalCenter
+    width: childrenRect.width
+    height: childrenRect.height
+  }
+
   Column {
     id: labels
     anchors.left: backBox.right
     anchors.leftMargin: Style.space(12)
-    anchors.right: parent.right
-    anchors.rightMargin: vh.hub.gutter
+    anchors.right: tail.left
+    anchors.rightMargin: tail.width > 0 ? Style.space(12) : 0
     anchors.verticalCenter: parent.verticalCenter
     spacing: Style.space(1)
 

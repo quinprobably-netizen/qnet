@@ -2015,6 +2015,94 @@ function callOf(v, id) {
   return null
 }
 
+// The catalog's name for a lamp's kind: wd.lamp.<this> (the kinds have
+// underscores, the keys do not).
+function lampKey(kind) {
+  switch (kind) {
+  case "new_device": return "newDevice"
+  case "arp_spoof": return "arpSpoof"
+  case "rebind": return "rebind"
+  case "lookups": return "lookups"
+  default: return "threat"
+  }
+}
+
+// What the word under a jack says: its kind (blocked, pass, always, fixed, or
+// gate while a gate on a blocked jack is open) and, for a gate, the time left
+// as "14:32".
+//   -> { kind, left (seconds), text ("" unless a gate) }
+function jackWord(jack, nowS) {
+  var left = gateLeft(jack, nowS)
+  if (jack && jack.patch === "blocked" && left > 0) return { kind: "gate", left: left, text: formatGate(left) }
+  return { kind: jack ? jack.patch : "blocked", left: 0, text: "" }
+}
+
+// The line under the board for one jack, which the pointer or the keyboard is
+// on: its full name and what its wiring says. How is a word ({ key, args }) for
+// the panel to say: gate open with the time left, ALWAYS, FIXED to its row,
+// or BLOCKED / ADS PASS, normal (no cord) or by cord.
+//   -> { name ("" when it has none), tail, how, offline, isNew }
+function jackReadout(jack, nowS) {
+  var w = jackWord(jack, nowS)
+  var how
+  if (w.kind === "gate") how = word("wd.how.gate", [w.text])
+  else if (w.kind === "always") how = word("wd.how.always")
+  else if (w.kind === "fixed") how = jack.row === "pass" ? word("wd.how.fixedPass") : word("wd.how.fixedBlocked")
+  else if (w.kind === "pass") how = jack.cord ? word("wd.how.passCord") : word("wd.how.passNormal")
+  else how = jack.cord ? word("wd.how.blockedCord") : word("wd.how.blockedNormal")
+  return { name: jack.name, tail: jack.tail, how: how, offline: jack.offline === true, isNew: jack.isNew === true }
+}
+
+// The mac of the jack the keyboard cursor is on: cursor { row, item } on a
+// "bay:I" row of the layout; "" when it is on anything else (or nowhere).
+function bayCursorMac(layout, cursor) {
+  if (!layout || !Array.isArray(layout.bays) || !cursor || typeof cursor.row !== "string" || cursor.row.indexOf("bay:") !== 0) return ""
+  var macs = layout.bays[parseInt(cursor.row.substring(4), 10)]
+  if (!Array.isArray(macs) || macs.length === 0) return ""
+  return macs[clamp(toInt(cursor.item, 0), 0, macs.length - 1)]
+}
+
+// A sentence with strong parts, as words for a Flow to wrap. The catalog's
+// sentence takes the strong part as its argument, wrapped by strong():
+//   sentenceRuns(t("Normal is %1: no cord.").arg(strong("ADS PASS")))
+//     -> Normal | is | ADS (strong) | PASS (strong) | : | no | cord.
+// Each run is a word with its trailing space (the space that opens a text
+// belongs to the word before it).
+var STRONG_ON = "\u0001"
+var STRONG_OFF = "\u0002"
+
+function strong(text) {
+  return STRONG_ON + String(text === undefined || text === null ? "" : text).replace(/[\u0001\u0002]/g, "") + STRONG_OFF
+}
+
+function sentenceRuns(sentence) {
+  var runs = []
+  var on = false
+  var parts = String(sentence === undefined || sentence === null ? "" : sentence).split(/([\u0001\u0002])/)
+  for (var i = 0; i < parts.length; i++) {
+    var part = parts[i]
+    if (part === STRONG_ON) on = true
+    else if (part === STRONG_OFF) on = false
+    else {
+      var lead = /^\s+/.exec(part)
+      if (lead && runs.length) runs[runs.length - 1].text += lead[0]
+      var toks = part.match(/\S+\s*/g) || []
+      for (var k = 0; k < toks.length; k++) runs.push({ text: toks[k], strong: on })
+    }
+  }
+  return runs
+}
+
+// The head of the watchdog view: "qbp ·2 · 8 devices · 2 offline".
+//   -> { qbp ("·2", "" without an IPv4 address), devices, offline }
+function boardHead(v) {
+  var jacks = v.watchdog.bay.jacks
+  var off = 0
+  for (var i = 0; i < jacks.length; i++) if (jacks[i].offline) off++
+  var oct = lastOctet(v.pihole.address)
+  return { qbp: oct !== "" ? "\u00b7" + oct.substring(1) : "", devices: jacks.length, offline: off }
+}
+
 // The focusable rows of the watchdog view; ctx: { view, flip, ticket, pinOpen,
 // layout, order, nowS } (see focusRows).
 function watchdogRows(v, ctx) {
@@ -2263,7 +2351,8 @@ if (typeof module !== "undefined") {
     LATENCY_BAD_MS: LATENCY_BAD_MS, PENDING_TTL_MS: PENDING_TTL_MS, SCAN_SPIN_MS: SCAN_SPIN_MS, GLYPH: GLYPH,
     clean: clean, safeUrl: safeUrl, emptyState: emptyState, normalizeState: normalizeState,
     normalizeWatchdog: normalizeWatchdog, watchdogPresent: watchdogPresent, holdOrder: holdOrder,
-    bayLayout: bayLayout, gateLeft: gateLeft, formatGate: formatGate,
+    bayLayout: bayLayout, gateLeft: gateLeft, formatGate: formatGate, jackOf: jackOf, callOf: callOf,
+    lampKey: lampKey, jackWord: jackWord, jackReadout: jackReadout, bayCursorMac: bayCursorMac, strong: strong, sentenceRuns: sentenceRuns, boardHead: boardHead,
     parseStateLine: parseStateLine, backoffMs: backoffMs, restartAttempt: restartAttempt,
     formatCountdown: formatCountdown, groupDigits: groupDigits, formatCount: formatCount,
     formatPercent: formatPercent, formatLatency: formatLatency, formatRate: formatRate,

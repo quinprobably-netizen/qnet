@@ -32,7 +32,7 @@ QtObject {
     return x.responseText
   }
 
-  // {view, call, realWidth}; an empty object without a ui.json.
+  // {view, call}; an empty object without a ui.json.
   readonly property var ui: {
     if (uiPath === "") return ({})
     try { return JSON.parse(readFile(uiPath)) } catch (e) {

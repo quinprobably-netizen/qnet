@@ -50,7 +50,8 @@ import "../Model.js" as Model
 //                          in the Pi-hole's place); the host puts the button
 //         nodeMoved(id, area, mouse), nodeClicked(id)   the route is the
 //                    navigation: the nodes that open a view (the AP: Wi-Fi;
-//                    the Pi-hole's place: DNS) take the pointer
+//                    the Pi-hole's place: the watchdog, else DNS; the
+//                    resolver beyond it: DNS) take the pointer
 //         hoveredId  the node under the pointer ("" for none)
 Item {
   id: viz
@@ -107,10 +108,15 @@ Item {
     return p.text
   }
 
-  // What a node's tooltip says: where it goes, or what it is.
+  // What a node's tooltip says: where it goes, then what it is (the resolver
+  // beyond the Pi-hole opens DNS and still lists its upstreams).
   function tipFor(n) {
     if (n.open === "wifi") return tr("route.tip.wifi")
-    if (n.open === "dns") return n.glyph === "ghost" && n.tip !== "" ? tr("route.tip.dns") + "\n" + tr("hero.detected").replace("%1", n.tip) : tr("route.tip.dns")
+    if (n.open === "watchdog") return tr("route.tip.watchdog")
+    if (n.open === "dns") {
+      if (n.glyph === "ghost" && n.tip !== "") return tr("route.tip.dns") + "\n" + tr("hero.detected").replace("%1", n.tip)
+      return n.id === "up" && n.tip !== "" ? tr("route.tip.dns") + "\n" + n.tip : tr("route.tip.dns")
+    }
     return n.tip
   }
 

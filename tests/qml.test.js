@@ -246,6 +246,107 @@ test("the area graph is gone: no history series, no crest, no head dot, no axis"
   assert.doesNotMatch(read("Panel.qml"), /syncSeries|historySig|probeHead/)
 })
 
+// ---- the watchdog view -----------------------------------------------------------
+
+test("the watchdog view is the third pushed view: Panel opens it (key 3, IPC, the route's Pi-hole node), Esc steps back through it", () => {
+  const panel = read("Panel.qml")
+  assert.match(panel, /WatchdogView \{ id: watchdogView; hub: root; visible: root\.page === "watchdog" \}/)
+  assert.match(panel, /root\.page === "watchdog" \? watchdogView : mainView/)
+  assert.match(panel, /if \(name !== "dns" && name !== "wifi" && name !== "watchdog"\) return/)
+  assert.match(panel, /name === "watchdog" && !Model\.watchdogPresent\(view\)\) return/, "no tab on a Pi-hole without a watchdog")
+  assert.match(panel, /else if \(k === "3"\) \{ if \(root\.fresh\("key:3"\)\) root\.openView\("watchdog"\) \}/)
+  assert.match(panel, /name === "dns" \|\| name === "wifi" \|\| name === "watchdog"\) root\.openView\(name, false\)/, "IPC view watchdog")
+  assert.match(panel, /pin: wdPinOpen, flip: wdFlip, ticket: wdTicket !== null, view: page/, "Esc goes through Model.escapeStep with the tab's steps")
+  assert.match(panel, /else if \(step === "pin"\) wdPinOpen = false/)
+  assert.match(panel, /else if \(step === "flip"\) wdFlip = false/)
+  assert.match(panel, /else if \(step === "ticket"\) wdTicket = null/)
+  // the tab's own state, reset when it is left or the panel closes
+  for (const p of ["wdOrder", "wdScroll", "wdTicket", "wdFlip", "wdPinOpen", "wdNote"]) assert.match(panel, new RegExp("property \\w+ " + p + ":"), p)
+  assert.match(panel, /function closeTransients\(\) \{[\s\S]*?wdReset\(\)/)
+  assert.match(panel, /Model\.holdOrder\(\[\], view\.watchdog\.bay\.jacks\)/, "the order is set on entering")
+  assert.match(panel, /Model\.holdOrder\(wdOrder, rawState\.watchdog\.bay\.jacks\)/, "and held as jacks come and go")
+  assert.match(panel, /Model\.needsClock\(root\.view, root\.pending, root\.nowMs \/ 1000, \{ view: root\.page \}\)/, "gates count down")
+  assert.match(panel, /Model\.focusRows\(view, page === "watchdog" \? wdRowsCtx/)
+  assert.match(panel, /else if \(page === "watchdog"\) wdActivate\(id, item\)/)
+  // an action runs through argvWatchdog and tells the watcher to read the devices again
+  assert.match(panel, /Model\.argvWatchdog\(bin, verb, args\)/)
+  assert.match(panel, /QnetService\.send\("devices"\)/)
+  assert.match(panel, /wdAction\("exempt-default", \["on"\]\)/, "the confirm turns the mode on")
+  assert.match(panel, /wdAction\("exempt-default", \["off"\]\)/, "and back is at once")
+  const views = fs.readFileSync(path.join(ROOT, "components", "WatchdogView.qml"), "utf8")
+  for (const piece of ["ViewHeader {", "LampRow {", "PatchBay {"]) assert.ok(views.indexOf(piece) >= 0, piece)
+  const order = ["ViewHeader {", "LampRow {", "PatchBay {"].map((p) => views.indexOf(p))
+  assert.deepEqual(order.slice().sort((a, b) => a - b), order, "head, lamp row, board")
+})
+
+test("the card is 520 wide on the watchdog view (the board is 488), 488 elsewhere", () => {
+  assert.match(read("Panel.qml"), /contentWidth: panel\.fittedContentWidth\(Style\.space\(root\.page === "watchdog" \? 520 : 488\)\)/)
+  const board = read("components/PatchBay.qml")
+  assert.match(board, /readonly property real railW: px\(70\)/)
+  assert.match(board, /readonly property real bayW: px\(418\)/)
+  assert.match(board, /implicitWidth: railW \+ bayW/, "70 + 418 = 488, the content column of a 520 card")
+  const stub = fs.readFileSync(path.join(ROOT, "tools", "harness", "imports", "qs", "Ui", "KeyboardPanel.qml"), "utf8")
+  assert.match(stub, /property int contentWidth: 488/)
+  assert.doesNotMatch(stub, /realWidth|2 \* padding\)/, "the harness draws the real card at the width the panel asks for")
+  assert.match(stub, /readonly property real inset: padding \+ borderWidth/, "content = card - 2 x (padding + border)")
+  assert.doesNotMatch(read("tools/harness/Shot.qml"), /realWidth/)
+})
+
+test("the board is drawn at the mockup's sizes, in the panel's colours and the bar's font", () => {
+  const board = read("components/PatchBay.qml")
+  for (const [name, px] of [["bayH", 192], ["gap", 6], ["colW", 51], ["pad", 5], ["yT", 84], ["yD", 120], ["yB", 156]])
+    assert.match(board, new RegExp("readonly property real " + name + ": px\\(" + px + "\\)"), name)
+  assert.match(board, /function px\(n\) \{ return Style\.spaceReal\(n\) \}/, "every size goes through Style")
+  for (const f of ["components/PatchBay.qml", "components/LampRow.qml", "components/WatchdogView.qml"]) {
+    const src = read(f)
+    assert.doesNotMatch(src, /#[0-9a-fA-F]{3,8}\b/, f + " has no colour of its own")
+    assert.doesNotMatch(src, /Qt\.rgba\(\s*[0-9]/, f + " has no literal colour")
+    assert.doesNotMatch(src, /font\.family:\s*"/, f + " has no font of its own")
+    for (const m of src.matchAll(/font\.family:\s*([^\n]+)/g)) assert.match(m[1], /hub\.fontFamily/, f)
+    for (const m of src.matchAll(/font\.pixelSize:\s*([^\n]+)/g)) assert.match(m[1], /Style\.font\.(caption|bodySmall|body|subtitle|heading)\b/, f + " " + m[1])
+    assert.doesNotMatch(src, /PathPolyline/, f)
+  }
+  // the board's surfaces come from the theme, in the panel
+  const panel = read("Panel.qml")
+  for (const t of ["cardColor", "well", "raise", "sel", "hole", "ring", "muted", "bright"]) assert.match(panel, new RegExp("readonly property color " + t + ":"), t)
+  assert.match(panel, /readonly property color well: Qt\.darker\(cardColor/)
+  // the word under a jack is the model's, in the colours of the mockup's .w-* classes
+  assert.match(board, /Model\.jackWord\(jack, board\.nowS\)/)
+  assert.match(board, /if \(kind === "blocked"\) return board\.hub\.accent/)
+  assert.match(board, /if \(kind === "pass"\) return board\.hub\.bright/)
+  assert.match(board, /if \(kind === "gate"\) return board\.hub\.warning/)
+  assert.match(board, /Model\.jackWord\(jack, board\.nowS\)[\s\S]*return board\.hub\.muted/, "ALWAYS and FIXED are muted")
+})
+
+test("a click on a column opens its ticket, on its lit drop lamp the alert's; the wheel moves a bay; the pointer moves the one cursor", () => {
+  const board = read("components/PatchBay.qml")
+  assert.match(board, /onClicked: board\.hub\.wdToggleDevice\(col\.mac\)/)
+  assert.match(board, /onClicked: board\.hub\.wdOpenAlert\(col\.jack\.alertId\)/)
+  assert.match(board, /onPositionChanged: function\(mouse\) \{ board\.hub\.hoverCursor\(hit, mouse, "bay:" \+ col\.bayIndex, col\.pos\) \}/)
+  assert.match(board, /board\.hub\.has\("bay:" \+ bayIndex, pos\)/, "the keyboard's ring")
+  assert.match(board, /hub\.wdPressKey\(\)/, "the NORMAL key")
+  assert.match(board, /WheelHandler \{/)
+  assert.match(board, /board\.hub\.wdPage\(acc < 0 \? 1 : -1\)/)
+  assert.match(board, /active: index >= board\.firstBay && index < board\.firstBay \+ board\.shownCount/, "only the bays in view are built")
+  const lamps = read("components/LampRow.qml")
+  assert.match(lamps, /row\.hub\.wdOpenLamp\(win\.modelData\.kind\)/)
+  assert.match(lamps, /row\.hub\.hoverCursor\(area, mouse, "lamps", win\.litIndex\)/)
+  const view = read("components/WatchdogView.qml")
+  assert.match(view, /page\.hub\.wdPage\(pb\.modelData\)/)
+  assert.match(view, /hoverCursor\(pbArea, mouse, "pager", pb\.index\)/)
+  assert.match(view, /page\.hub\.wdConfirmFlip\(\)/)
+  assert.match(view, /page\.hub\.wdCancelFlip\(\)/)
+  assert.match(view, /page\.hub\.wdPressKey\(\)/, "Flip ›")
+  assert.match(view, /h\.strings\.tn\("wd\.flipQ", n\)\.arg\(n\)/, "the confirm counts the devices")
+  assert.match(view, /readonly property string readoutMac: board\.hoverMac !== "" \? board\.hoverMac : Model\.bayCursorMac/, "hover first, then the keyboard cursor")
+})
+
+test("the route's Pi-hole node says where it goes", () => {
+  assert.match(read("components/HeroViz.qml"), /if \(n\.open === "watchdog"\) return tr\("route\.tip\.watchdog"\)/)
+  const cat = JSON.parse(fs.readFileSync(path.join(ROOT, "i18n", "en.json"), "utf8"))
+  assert.equal(cat["route.tip.watchdog"], "Watchdog")
+})
+
 test("Model.js has no QML imports and loads in node", () => {
   const src = read("Model.js")
   assert.doesNotMatch(src, /^\s*import\s/m)
@@ -259,7 +360,7 @@ function usedKeys() {
   const exact = new Set()
   const prefixes = new Set()
   // the model names the words of the route by key
-  for (const m of read("Model.js").matchAll(/"((?:route|hero|fallback|chain|card)\.[A-Za-z0-9.]+)"(\s*\+)?/g)) {
+  for (const m of read("Model.js").matchAll(/"((?:route|hero|fallback|chain|card|wd)\.[A-Za-z0-9.]+)"(\s*\+)?/g)) {
     if (m[2]) prefixes.add(m[1])
     else exact.add(m[1])
   }

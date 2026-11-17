@@ -812,3 +812,87 @@ test("the dns and wifi views' rows are as they were", () => {
   assert.deepEqual(ids(Model.focusRows(view("watchdog-rest"), { view: "dns" })).slice(0, 3), ["back", "choice:pihole", "choice:auto"])
   assert.deepEqual(ids(Model.focusRows(view("watchdog-rest"), { view: "main" })).slice(0, 2), ["header", "route"])
 })
+
+// ---- the board's words (components/PatchBay.qml, WatchdogView.qml) -----------
+
+test("jackWord: BLOCKED, PASS, ALWAYS, FIXED, and a gate's time left only on a blocked jack", () => {
+  const word = (n, tail, nowS) => Model.jackWord(jackOf(n, tail), nowS === undefined ? NOW_S : nowS)
+  assert.deepEqual(word("rest", "·23"), { kind: "gate", left: 872, text: "14:32" })
+  assert.deepEqual(word("rest", "·23", NOW_S + 100), { kind: "gate", left: 772, text: "12:52" })
+  assert.deepEqual(word("rest", "·23", NOW_S + 872), { kind: "blocked", left: 0, text: "" }, "a gate that has run out is shut")
+  assert.equal(word("rest", "·40").kind, "pass")
+  assert.equal(word("rest", "·51").kind, "blocked")
+  assert.equal(word("rest", "·1").kind, "always")
+  assert.equal(word("n30", "·31").kind, "fixed")
+  // a gate that rides on a jack that passes is not drawn: ADS PASS needs no gate
+  assert.equal(Model.jackWord({ patch: "pass", gateUntil: NOW_S + 60 }, NOW_S).kind, "pass")
+  assert.equal(Model.jackWord(null, NOW_S).kind, "blocked")
+})
+
+test("jackReadout: the name and the state of a jack, as the mockup's line under the board says them", () => {
+  const read = (n, tail, nowS) => Model.jackReadout(jackOf(n, tail), nowS === undefined ? NOW_S : nowS)
+  const how = (r) => [r.how.key, r.how.args]
+  assert.deepEqual(read("rest", "·23").name, "Sam's phone")
+  assert.deepEqual(how(read("rest", "·23")), ["wd.how.gate", ["14:32"]], "gate open, 14:32 left")
+  assert.deepEqual(how(read("rest", "·1")), ["wd.how.always", []], "router: ALWAYS, never ADS PASS")
+  assert.deepEqual(how(read("rest", "·40")), ["wd.how.passCord", []], "the TV is a cord to ADS PASS")
+  assert.deepEqual(how(read("rest", "·51")), ["wd.how.blockedNormal", []])
+  assert.deepEqual(how(read("mode", "·10")), ["wd.how.blockedCord", []], "in the other mode a cord is to BLOCKED")
+  assert.deepEqual(how(read("mode", "·51")), ["wd.how.passNormal", []])
+  assert.equal(read("n30", "·31").how.key, "wd.how.fixedPass")
+  const fixedBlocked = Model.jackReadout(Object.assign({}, jackOf("n30", "·31"), { row: "blocked" }), NOW_S)
+  assert.equal(fixedBlocked.how.key, "wd.how.fixedBlocked")
+  const fresh = read("rest", "·216")
+  assert.deepEqual([fresh.name, fresh.tail, fresh.isNew, fresh.offline], ["", "·216", true, false], "no name: the caller shows the address")
+  const off = read("n30", ":0f")
+  assert.deepEqual([off.tail, off.offline], [":0f", true])
+  assert.equal(read("rest", "·51").isNew, false)
+})
+
+test("strong and sentenceRuns: a sentence as words, the strong ones marked, no space lost", () => {
+  const runs = Model.sentenceRuns("Normal is " + Model.strong("ADS PASS") + ": no cord, ads allowed.")
+  assert.deepEqual(runs.map((r) => r.text), ["Normal ", "is ", "ADS ", "PASS", ": ", "no ", "cord, ", "ads ", "allowed."])
+  assert.deepEqual(runs.filter((r) => r.strong).map((r) => r.text), ["ADS ", "PASS"])
+  assert.equal(runs.map((r) => r.text).join(""), "Normal is ADS PASS: no cord, ads allowed.", "the runs say the sentence")
+  const jack = Model.sentenceRuns(Model.strong("Sam's phone") + " ·23 · gate open, 14:32 left")
+  assert.equal(jack.map((r) => r.text).join(""), "Sam's phone ·23 · gate open, 14:32 left", "the space after the name stays")
+  assert.deepEqual(jack.filter((r) => r.strong).map((r) => r.text.trim()), ["Sam's", "phone"])
+  assert.deepEqual(Model.sentenceRuns(""), [])
+  assert.deepEqual(Model.sentenceRuns(null), [])
+  assert.deepEqual(Model.sentenceRuns("one"), [{ text: "one", strong: false }])
+  assert.equal(Model.strong("a\u0001b\u0002c"), "\u0001abc\u0002", "the markers cannot be forged from inside")
+  assert.equal(Model.sentenceRuns(Model.strong("x\u0002 y") + " z").filter((r) => r.strong).length, 2)
+})
+
+test("boardHead: qbp's address, the devices on the board and how many are offline", () => {
+  assert.deepEqual(Model.boardHead(view("watchdog-rest")), { qbp: "·2", devices: 8, offline: 0 })
+  assert.deepEqual(Model.boardHead(view("watchdog-n30")), { qbp: "·2", devices: 30, offline: 2 })
+  assert.deepEqual(Model.boardHead(view("healthy")), { qbp: "·153", devices: 0, offline: 0 }, "a Pi-hole without a watchdog has no devices")
+  assert.equal(Model.boardHead(view("unconfigured")).qbp, "", "no Pi-hole, no address")
+})
+
+test("lampKey: the catalog's word for each lamp kind has no underscore", () => {
+  assert.deepEqual(wd("rest").bay.lamps.map((l) => Model.lampKey(l.kind)), ["threat", "newDevice", "arpSpoof", "rebind", "lookups"])
+  assert.equal(Model.lampKey("something else"), "threat")
+})
+
+test("bayCursorMac: the jack the keyboard cursor is on, nothing on any other row", () => {
+  const v = view("watchdog-n30")
+  const jacks = v.watchdog.bay.jacks
+  const order = Model.holdOrder([], jacks)
+  const layout = Model.bayLayout(order, { ticketMac: "", scroll: 2 }, jacks)
+  assert.equal(Model.bayCursorMac(layout, { row: "bay:2", item: 0 }), layout.bays[2][0])
+  assert.equal(Model.bayCursorMac(layout, { row: "bay:3", item: 5 }), layout.bays[3][5])
+  assert.equal(Model.bayCursorMac(layout, { row: "bay:3", item: 99 }), layout.bays[3][layout.bays[3].length - 1], "an item past the end is the last")
+  for (const row of ["back", "lamps", "normal", "pager", "bay:9", "bay:", "bay:x"]) assert.equal(Model.bayCursorMac(layout, { row, item: 0 }), "", row)
+  assert.equal(Model.bayCursorMac(layout, null), "")
+  assert.equal(Model.bayCursorMac(null, { row: "bay:0", item: 0 }), "")
+})
+
+test("jackOf and callOf find a jack by its mac and a call by its id", () => {
+  const v = view("watchdog-rest")
+  assert.equal(Model.jackOf(v, jackOf("rest", "·23").mac).tail, "·23")
+  assert.equal(Model.jackOf(v, "02:00:00:00:ff:ff"), null)
+  assert.equal(Model.callOf(v, 1).kind, "threat")
+  assert.equal(Model.callOf(v, 99), null)
+})

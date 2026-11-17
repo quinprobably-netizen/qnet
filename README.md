@@ -102,7 +102,7 @@ qnet watchdog pin clear      # take the PIN off the running Pi
 device; it is not `block`, which is the exempt-by-default mode's block list. In
 that mode the block list decides, so use `block` and `unblock` there.
 
-- IPC: `omarchy-shell qqq.qnet toggle | open | close | view <main|wifi|dns>`.
+- IPC: `omarchy-shell qqq.qnet toggle | open | close | view <main|wifi|dns|watchdog>`.
 - Keybinding: `SUPER + CTRL + N`, rebound in `~/.config/hypr/bindings.lua`.
 - Run cargo from inside `backend/`, or `.cargo/config.toml` is skipped and
   `backend/target` lands in the watched plugin tree.
@@ -119,11 +119,11 @@ software). `Panel.qml`, `QnetService.qml` and `components/` are the real ones;
 what the shell provides (`qs.Ui`, `qs.Commons`, `Quickshell`, `Quickshell.Io`)
 is a stub in `tools/harness/imports/`: the Amethyst colours, JetBrainsMono Nerd
 Font at the shell's `Style.font` sizes, `i18n/en.json` for the words, motion off
-(so a shot repeats byte for byte). The card is 520 px wide on the page colour
-with a 24 px margin: the 488 px content column, 16 px of padding. The real
-KeyboardPanel makes the card as wide as the width asked for (488), so its content
-is 456; `{"realWidth": true}` draws that. `--scale 2` gives the 2x of the mockup
-stills.
+(so a shot repeats byte for byte). The card is drawn as the real KeyboardPanel
+draws it, on the page colour with a 24 px margin: as wide as the panel asks for
+(488 px; 520 px on the watchdog view), minus 2 x (14 px of padding + 2 px of
+border) for its content column (456 px, and 488 px for the board). `--scale 2`
+gives the 2x of the mockup stills.
 
 - **Fixture:** a full state JSON. The fake `qnet watch` (the `Process` stub) says
   it as its one state line. Its unix times are moved by `now - 1794122700` (the
@@ -131,7 +131,7 @@ stills.
   number over 1e9 named `*Unix`, `*At`, `*Until`, `*Since`, `since`, `until` or
   `t`; `seq`, `lastScanAgeS`, `pauseRemainingS` and the like are relative and stay.
   Any other command (an action) is logged and answers `{"ok":true}`.
-- **ui.json:** `{"view": "main|dns|wifi|…", "call": [["functionName", arg, …], …]}`.
+- **ui.json:** `{"view": "main|dns|wifi|watchdog", "call": [["functionName", arg, …], …]}`.
   `view` runs `openView(view, false)` (as the IPC does, so the keyboard cursor
   shows); each `call` runs `functionName(args)` on the panel, in order. A view
   that does not open, or an unknown function, fails. `{"call": [["openView",
